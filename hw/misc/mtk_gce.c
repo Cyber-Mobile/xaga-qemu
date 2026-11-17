@@ -40,7 +40,8 @@
  *   POLL:   spin until (reg & ~mask) == (value & ~mask) - the model never
  *           blocks (a mismatch is logged and execution continues so a wrong
  *           assumption can never hang the guest)
- *   WFE:    event wait/set - recorded but never blocking
+ *   WFE:    wait for a CMDQ event, or set/clear one; a wait on an event a
+ *           modelled block raises parks the thread until that event fires
  *   JUMP:   absolute (arg_b == 1) or relative; EOC ends a task (IRQ if bit0)
  *
  * The subsystem id -> base address table comes from the vendor device tree
@@ -69,8 +70,10 @@
 #include "qemu/module.h"
 #include "qom/object.h"
 #include "system/address-spaces.h"
+#include "qemu/timer.h"
 #include "system/memory.h"
 #include "hw/misc/mtk_iommu.h"
+#include "hw/misc/mtk_gce.h"
 
 #define TYPE_MTK_GCE "mtk-gce"
 OBJECT_DECLARE_SIMPLE_TYPE(MtkGceState, MTK_GCE)
@@ -118,6 +121,39 @@ OBJECT_DECLARE_SIMPLE_TYPE(MtkGceState, MTK_GCE)
 #define CMDQ_CODE_WRITE_S_MASK  0x91
 #define CMDQ_CODE_LOGIC         0xa0
 
+/*
+ * Wait-for-event (WFE) option bits, as encoded by the vendor CMDQ helpers
+ * (cmdq_pkt_wfe / cmdq_pkt_set_event / cmdq_pkt_clear_event):
+ *
+ *   cmdq_pkt_wfe(ev, clear)  value = CMDQ_WFE_WAIT | CMDQ_WFE_WAIT_VALUE
+ *                                   | (clear ? CMDQ_WFE_UPDATE : 0)
+ *                            -> 0x80008001: wait for the event, then clear it
+ *   cmdq_pkt_set_event(ev)   value = CMDQ_WFE_UPDATE | CMDQ_WFE_UPDATE_VALUE
+ *                            -> 0x80010000: set the event
+ *   cmdq_pkt_clear_event(ev) value = CMDQ_WFE_UPDATE
+ *                            -> 0x80000000: clear the event
+ * Both 0x80008001 and 0x80000000 appear in the recorded display packet trace,
+ * so these bit assignments are what the guest actually emits.  The event id
+ * travels in arg_b (instruction bits 32..47).
+ */
+#define CMDQ_WFE_UPDATE         (1u << 31)
+#define CMDQ_WFE_UPDATE_VALUE   (1u << 16)
+#define CMDQ_WFE_WAIT           (1u << 15)
+#define CMDQ_WFE_WAIT_VALUE     (1u << 0)
+#define MTK_GCE_NUM_EVENTS      1024    /* CMDQ_EVENT_MAX is 0x3FF */
+
+/*
+ * CMDQ_CODE_EOC carries the IRQ flag in arg_c (instruction bits 0..15): the
+ * vendor helper's cmdq_pkt_eoc() writes CMDQ_EOC_IRQ_EN = BIT(0) there and
+ * puts the "do not increment the exec count" flag in s_op (bits 48..52), so
+ * only arg_c bit0 decides whether the done IRQ is raised.
+ */
+#define CMDQ_EOC_IRQ_EN         (1u << 0)
+/* One CMDQ instruction is 64 bits (vendor CMDQ_INST_SIZE). */
+#define CMDQ_INST_SIZE          8
+/* Raw words buffered before the first DISP-touching write of a packet. */
+#define MTK_GCE_RAW_RING        64
+
 typedef struct MtkGceThread {
     uint32_t curr_addr;
     uint32_t end_addr;
@@ -129,6 +165,8 @@ typedef struct MtkGceThread {
     uint32_t spr[MTK_GCE_SPR_NUM];
     uint32_t mask;
     uint32_t mask_valid;
+    uint32_t n_eoc;                 /* EOC instructions that raised the IRQ */
+    uint32_t n_jumps;               /* JUMP instructions executed           */
 } MtkGceThread;
 
 struct MtkGceState {
@@ -151,6 +189,30 @@ struct MtkGceState {
     uint32_t n_pollfail;
     uint32_t n_logged;
     uint32_t n_events;
+    uint64_t n_jumps;           /* JUMP instructions executed (all threads)  */
+    uint64_t n_eoc;             /* EOC instructions that raised the IRQ      */
+    uint32_t n_steplimit;       /* exec runs stopped by the instruction cap  */
+    uint32_t n_parked_log;      /* bounded "packet parked" trace lines       */
+    bool raw_log;               /* MTK_GCE_RAW=1: raw words of DISP packets  */
+    bool reg_log;               /* MTK_GCE_REGLOG=1: thread register traffic */
+    uint32_t n_reg_logged;      /* bounded register trace lines              */
+    /*
+     * CMDQ sync events.  Only events a modelled peripheral block actually
+     * raises (see mtk_gce_event_mark_generated) may block a WFE; for every
+     * other event the wait keeps the legacy "count and skip" behaviour, so a
+     * missing event model can never hang a guest commit packet.
+     */
+    uint32_t event_bits[MTK_GCE_NUM_EVENTS / 32];
+    uint32_t event_generated[MTK_GCE_NUM_EVENTS / 32];
+    uint8_t event_skip_logged[MTK_GCE_NUM_EVENTS / 8];
+    bool wfe_log;               /* log WFE block/resume and skipped ids   */
+    bool wfe_waiting[MTK_GCE_NUM_THREADS];
+    uint32_t wfe_event[MTK_GCE_NUM_THREADS];
+    bool wfe_clear[MTK_GCE_NUM_THREADS];
+    uint32_t n_wfe_blocked;
+    uint32_t n_wfe_resumed;
+    uint32_t n_wfe_skipped;
+    uint32_t n_wfe_logs;
     /*
      * GCE address space != guest physical address space (mminfra): the driver
      * programs CURR_ADDR/END_ADDR with cmdq_convert_gce_addr(pa) =
@@ -164,16 +226,6 @@ struct MtkGceState {
     bool xlate_post;         /* gce = (dma + off) >> shift (vendor mt6895) */
     bool xlate_done;
     bool xlate_fixed;
-    /*
-     * Value-mask semantics for opcode 0x90 with arg_b bit1 set:
-     *   0 = MTK_GCE_MASK_NONE  do not apply the MASK register
-     *   1 = forward (default, hardware-correct): new = (old & arg_a) | (val & ~arg_a)
-     *   2 = MTK_GCE_MASK_INV   inverted:          new = (old & ~arg_a) | (val & arg_a)
-     * The forward form is what reproduces the vendor display driver's masked
-     * ROI write (0x14002020 -> 0x099c0209, 540x2460) on LineageOS; the
-     * inverted form is kept for the stock-kernel ADDR writes (env-protected).
-     */
-    int mask_mode;
 };
 
 /*
@@ -188,6 +240,124 @@ uint32_t mtk_gce_disp_epoch;
 static void mtk_gce_update_irq(MtkGceState *s)
 {
     qemu_set_irq(s->irq, s->pending != 0);
+}
+
+/*
+ * The GCE-level CURR_IRQ_STATUS register is the OR of the per-thread IRQ
+ * status bits that are enabled in THR_IRQ_ENABLE (bit 0 = done, bits 1/4 =
+ * error); it is not a separately latched register the driver writes.  Recompute
+ * it whenever a thread's status or enable mask changes, exactly as the
+ * hardware wires the two registers together.
+ */
+static void mtk_gce_refresh_pending(MtkGceState *s)
+{
+    uint32_t pending = 0;
+    unsigned idx;
+
+    for (idx = 0; idx < MTK_GCE_NUM_THREADS; idx++) {
+        MtkGceThread *t = &s->thr[idx];
+
+        if (t->irq_status & t->irq_enable & THR_IRQ_EN) {
+            pending |= 1u << idx;
+        }
+    }
+    if (pending != s->pending) {
+        s->pending = pending;
+        mtk_gce_update_irq(s);
+    }
+}
+
+/* EOC with CMDQ_EOC_IRQ_EN: latch THR_IRQ_STATUS.DONE and raise the SPI. */
+static void mtk_gce_eoc_irq(MtkGceState *s, unsigned idx)
+{
+    MtkGceThread *t = &s->thr[idx];
+
+    t->irq_status |= THR_IRQ_DONE;
+    mtk_gce_refresh_pending(s);
+}
+
+/* Invalid fetch / misaligned jump: latch the error status bits like the GCE. */
+static void mtk_gce_error_irq(MtkGceState *s, unsigned idx)
+{
+    MtkGceThread *t = &s->thr[idx];
+
+    t->irq_status |= THR_IRQ_ERROR;
+    mtk_gce_refresh_pending(s);
+}
+
+/*
+ * Display windows a CMDQ packet can touch: DISP0 (0x1400xxxx, mmsys/Ovl0) and
+ * DISP1 (0x1440xxxx, the second display path).  MTK_GCE_RAW dumps the raw
+ * instruction words of packets that write one of them so the model can be
+ * compared word for word with the driver's cmdq_log output.
+ */
+static bool mtk_gce_pa_is_disp(uint32_t pa)
+{
+    return (pa >= 0x14000000u && pa < 0x14100000u) ||
+           (pa >= 0x14400000u && pa < 0x14500000u);
+}
+
+/* Flush the buffered prefix of a packet that has just written DISP. */
+static void mtk_gce_raw_disp(unsigned idx, const uint64_t *words,
+                             const uint32_t *pcs, unsigned n, bool *active)
+{
+    unsigned i;
+    unsigned first;
+
+    if (*active) {
+        return;
+    }
+    *active = true;
+    first = n > MTK_GCE_RAW_RING ? n - MTK_GCE_RAW_RING : 0;
+    for (i = first; i < n; i++) {
+        fprintf(stderr, "MTK-GCE-RAW thr%u pc=%08x inst=%016" PRIx64 "\n",
+                idx, pcs[i & (MTK_GCE_RAW_RING - 1)],
+                words[i & (MTK_GCE_RAW_RING - 1)]);
+    }
+}
+
+/* Guest time in seconds, for the event trace messages. */
+static double mtk_gce_guest_seconds(void)
+{
+    return (double)qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) / 1e9;
+}
+
+static bool mtk_gce_event_isset(MtkGceState *s, unsigned event)
+{
+    if (event >= MTK_GCE_NUM_EVENTS) {
+        return false;
+    }
+    return (s->event_bits[event >> 5] >> (event & 31)) & 1u;
+}
+
+static void mtk_gce_event_put(MtkGceState *s, unsigned event, bool set)
+{
+    uint32_t *word;
+
+    if (event >= MTK_GCE_NUM_EVENTS) {
+        return;
+    }
+    word = &s->event_bits[event >> 5];
+    if (set) {
+        *word |= 1u << (event & 31);
+    } else {
+        *word &= ~(1u << (event & 31));
+    }
+}
+
+static bool mtk_gce_event_is_generated(MtkGceState *s, unsigned event)
+{
+    if (event >= MTK_GCE_NUM_EVENTS) {
+        return false;
+    }
+    return (s->event_generated[event >> 5] >> (event & 31)) & 1u;
+}
+
+static void mtk_gce_event_mark(MtkGceState *s, unsigned event)
+{
+    if (event < MTK_GCE_NUM_EVENTS) {
+        s->event_generated[event >> 5] |= 1u << (event & 31);
+    }
 }
 
 static bool mtk_gce_thread_lookup(hwaddr addr, unsigned *idx, unsigned *reg)
@@ -211,14 +381,15 @@ static void mtk_gce_dump_ops(MtkGceState *s)
     fprintf(stderr,
             "MTK-GCE ops: MASK=%u WRITE=%u POLL=%u JUMP=%u WFE=%u EOC=%u "
             "WR_S=%u RD_S=%u LOGIC=%u UNK=%u steps=%" PRIu64
-            " unknown=%u badfetch=%u pollfail=%u events=%u\n",
+            " unknown=%u badfetch=%u pollfail=%u events=%u"
+            " jumps=%" PRIu64 " eoc=%" PRIu64 "\n",
             s->opcnt[CMDQ_CODE_MASK], s->opcnt[CMDQ_CODE_WRITE],
             s->opcnt[CMDQ_CODE_POLL], s->opcnt[CMDQ_CODE_JUMP],
             s->opcnt[CMDQ_CODE_WFE], s->opcnt[CMDQ_CODE_EOC],
             s->opcnt[CMDQ_CODE_WRITE_S] + s->opcnt[CMDQ_CODE_WRITE_S_MASK],
             s->opcnt[CMDQ_CODE_READ_S], s->opcnt[CMDQ_CODE_LOGIC],
             s->opcnt[0], s->n_inst, s->n_unknown, s->n_badfetch,
-            s->n_pollfail, s->n_events);
+            s->n_pollfail, s->n_events, s->n_jumps, s->n_eoc);
 }
 
 static uint32_t mtk_gce_read32(MtkGceState *s, uint32_t pa)
@@ -331,6 +502,7 @@ static void mtk_gce_log_inst(MtkGceState *s, unsigned idx, uint32_t pc,
 static void mtk_gce_thread_reset(MtkGceState *s, unsigned idx)
 {
     memset(&s->thr[idx], 0, sizeof(s->thr[idx]));
+    s->wfe_waiting[idx] = false;
     if (s->pending & (1u << idx)) {
         s->pending &= ~(1u << idx);
         mtk_gce_update_irq(s);
@@ -344,10 +516,7 @@ static void mtk_gce_thread_complete(MtkGceState *s, unsigned idx)
 
     t->curr_addr = t->end_addr;
     t->irq_status |= THR_IRQ_DONE;
-    if (t->irq_enable & THR_IRQ_DONE) {
-        s->pending |= 1u << idx;
-        mtk_gce_update_irq(s);
-    }
+    mtk_gce_refresh_pending(s);
     s->n_started++;
     if (s->log && s->n_started <= 64) {
         fprintf(stderr,
@@ -401,6 +570,14 @@ static bool mtk_gce_xlate_to_pa(MtkGceState *s, uint32_t gce_addr, hwaddr *pa)
      * The command buffer is allocated with dma_alloc_coherent(): its DMA
      * address is a physical address without an IOMMU and an IOVA when the GCE
      * is behind the real M4U model (DT: gce@1e980000 iommus=<&mdp_iommu ...>).
+     */
+    /*
+     * mtk_iommu_translate_or_identity() covers both cases uniformly: the M4U
+     * page table is consulted first, an unmapped DMA address below 4 GiB that
+     * is backed by guest RAM (the bootloader/LK buffers, e.g. the logo
+     * framebuffer, which are plain physical addresses) is used as-is, and
+     * everything else is a real fault.  IOVAs are 34-bit on this SoC, so the
+     * full hwaddr must be passed - never truncated to 32 bits.
      */
     return mtk_iommu_translate_or_identity(MTK_IOMMU_DEV_MDP, dma, pa);
 }
@@ -551,18 +728,43 @@ static void mtk_gce_calibrate(MtkGceState *s, uint32_t addr)
 /*
  * Execute the command buffer queued on thread @idx.
  *
- * Never blocks: polls that do not match, unknown opcodes and wait-for-event
- * instructions are counted and skipped, so a wrong decoding assumption can
- * only lose a register update - it can never hang the guest.
+ * Architectural PC arithmetic: the GCE programs CURR_ADDR/END_ADDR as
+ * CMDQ_REG_SHIFT_ADDR(pa) = (pa + gce_mminfra) >> gce_shift_bit (the driver
+ * prints "cmdq thread:32 shift:3 mminfra:0x40000000"), so one GCE address unit
+ * is 1 << shift bytes and an instruction advances the PC by
+ * CMDQ_INST_SIZE >> shift (1 unit at shift 3, 8 units at shift 0).  The
+ * MTK_GCE_XLATE/MTK_GCE_SHIFT environment only selects how the PC is
+ * translated back to a guest physical address in mtk_gce_fetch().
+ *
+ * END_ADDR is the thread end bound: the thread stops (stays enabled, no IRQ)
+ * when the PC equals END_ADDR, which is what the driver's clear-event poll
+ * (CURR_ADDR == END_ADDR) and the trailing JUMP that cmdq_pkt_finalize()
+ * appends rely on.  The done IRQ is latched only by an EOC instruction that
+ * carries CMDQ_EOC_IRQ_EN; it is never synthesised when the PC reaches the end.
+ *
+ * A wait-for-event on an event the model actually generates parks the thread
+ * (hardware behaviour, resumed by mtk_gce_event_signal()); a POLL mismatch, an
+ * unknown opcode and a WFE on an event no modelled block raises are counted
+ * and skipped, so a wrong decoding assumption can only lose a register update,
+ * it can never hang the guest.
  */
 static void mtk_gce_exec(MtkGceState *s, unsigned idx)
 {
     MtkGceThread *t = &s->thr[idx];
     uint32_t pc = t->curr_addr;
     uint32_t end = t->end_addr;
+    const uint32_t step = s->xlate_shift >= 3 ?
+                          (uint32_t)(CMDQ_INST_SIZE >> 3) :
+                          (uint32_t)(CMDQ_INST_SIZE >> s->xlate_shift);
     unsigned steps = 0;
     unsigned logged = 0;
-    bool completed = false;
+    bool parked = false;
+    const char *fault = NULL;
+    uint64_t raw_ring[MTK_GCE_RAW_RING];
+    uint32_t raw_pc_ring[MTK_GCE_RAW_RING];
+    unsigned raw_n = 0;
+    bool raw_active = false;
+    unsigned raw_printed = 0;
 
     if (!pc) {
         return;
@@ -573,6 +775,15 @@ static void mtk_gce_exec(MtkGceState *s, unsigned idx)
         uint8_t op;
         unsigned sub, off;
 
+        if (end && pc == end) {
+            /* Hardware thread end: stay enabled and wait for the next task. */
+            parked = true;
+            break;
+        }
+        if (step > 1 && (pc & (step - 1))) {
+            fault = "misaligned PC after jump";
+            break;
+        }
         if (!mtk_gce_fetch(s, pc, &raw)) {
             s->n_badfetch++;
             if (s->log && s->n_badfetch <= 16) {
@@ -586,6 +797,19 @@ static void mtk_gce_exec(MtkGceState *s, unsigned idx)
                         "\n", idx, pc, (uint64_t)pa);
             }
             break;
+        }
+        if (s->raw_log) {
+            if (raw_active) {
+                if (raw_printed++ < 4096) {
+                    fprintf(stderr,
+                            "MTK-GCE-RAW thr%u pc=%08x inst=%016" PRIx64 "\n",
+                            idx, pc, raw);
+                }
+            } else {
+                raw_ring[raw_n & (MTK_GCE_RAW_RING - 1)] = raw;
+                raw_pc_ring[raw_n & (MTK_GCE_RAW_RING - 1)] = pc;
+                raw_n++;
+            }
         }
         op = raw >> 56;
         sub = (raw >> 48) & 0xff;
@@ -615,7 +839,7 @@ static void mtk_gce_exec(MtkGceState *s, unsigned idx)
                 t->mask = val;
                 t->mask_valid = 1;
             }
-            pc += 8;
+            pc += step;
             break;
         }
         case CMDQ_CODE_LOGIC: {
@@ -626,7 +850,7 @@ static void mtk_gce_exec(MtkGceState *s, unsigned idx)
             if (dst_t) {
                 t->spr[dst & (MTK_GCE_SPR_NUM - 1)] = val;
             }
-            pc += 8;
+            pc += step;
             break;
         }
         case CMDQ_CODE_WRITE: {
@@ -640,16 +864,20 @@ static void mtk_gce_exec(MtkGceState *s, unsigned idx)
             }
             if (s->exec_write && pa) {
                 mtk_gce_write32(s, pa, v);
-                if (pa >= 0x14000000u && pa < 0x14500000u) {
+                if (mtk_gce_pa_is_disp(pa)) {
                     mtk_gce_disp_epoch++;
+                    if (s->raw_log) {
+                        mtk_gce_raw_disp(idx, raw_ring, raw_pc_ring,
+                                         raw_n, &raw_active);
+                    }
                 }
-                if (pa >= 0x14000000u && pa < 0x14500000u && s->log) {
+                if (mtk_gce_pa_is_disp(pa) && s->log) {
                     fprintf(stderr,
                             "MTK-GCE-DISP thr%u pc=%08x W 0x%08x = 0x%08x\n",
                             idx, pc, pa, v);
                 }
             }
-            pc += 8;
+            pc += step;
             break;
         }
         case CMDQ_CODE_WRITE_S:
@@ -660,39 +888,33 @@ static void mtk_gce_exec(MtkGceState *s, unsigned idx)
             uint32_t v = src_t ? t->spr[src & (MTK_GCE_SPR_NUM - 1)] : val;
             uint32_t pa = mtk_gce_gpr_addr(t, sop, off);
             /*
-             * Masked write semantics: CMDQ_CODE_WRITE_S_MASK always uses the
-             * mask set by the preceding MASK instruction; a plain WRITE_S
-             * uses it when arg_b bit1 (the "write enable" flag) is set.
-             * reg = (reg & ~mask) | (value & mask), with the MASK
-             * instruction carrying ~mask in arg_a.
+             * Masked-write semantics, exactly as the hardware decodes the two
+             * opcodes: only CMDQ_CODE_WRITE_S_MASK (the instruction whose
+             * encoding carries the mask flag) applies the value mask set by
+             * the preceding MASK instruction; a plain WRITE_S always writes
+             * its value unmasked.  arg_b bit1 is an address/mode flag, not a
+             * mask enable (applying the mask to a plain write made the OVL
+             * layer ADDR write 0xc0900870 collapse to 0 under mask
+             * 0xfffffff8).  The MASK instruction carries ~mask in arg_a, so:
+             *   reg = (reg & mask) | (value & ~mask)
              */
-            /*
-             * Masked-write selection.  Vendor display packets use opcode
-             * 0x91 (WRITE_S_MASK) for bitfield updates and 0x90 for plain
-             * writes; arg_b bit1 is an address/mode flag, NOT a mask enable
-             * (masking 0x90 made the OVL ADDR write 0xc0900870 collapse to
-             * 0 under mask=0xfffffff8).  MTK_GCE_MASK_ALL=1 restores the
-             * over-eager semantics for A/B comparison.
-             */
-            bool use_mask = (op == CMDQ_CODE_WRITE_S_MASK) ||
-                            (s->mask_mode != 0 && ((off & 2) != 0));
+            bool use_mask = op == CMDQ_CODE_WRITE_S_MASK;
 
             if (use_mask && t->mask_valid) {
                 uint32_t cur = mtk_gce_read32(s, pa);
 
-                if (s->mask_mode == 2) {
-                    /* inverted: arg_a is the "update" mask */
-                    v = (cur & ~t->mask) | (v & t->mask);
-                } else {
-                    v = (cur & t->mask) | (v & ~t->mask);
-                }
+                v = (cur & t->mask) | (v & ~t->mask);
             }
             if (s->exec_write && pa) {
                 mtk_gce_write32(s, pa, v);
-                if (pa >= 0x14000000u && pa < 0x14500000u) {
+                if (mtk_gce_pa_is_disp(pa)) {
                     mtk_gce_disp_epoch++;
+                    if (s->raw_log) {
+                        mtk_gce_raw_disp(idx, raw_ring, raw_pc_ring,
+                                         raw_n, &raw_active);
+                    }
                 }
-                if (pa >= 0x14000000u && pa < 0x14500000u && s->log) {
+                if (mtk_gce_pa_is_disp(pa) && s->log) {
                     fprintf(stderr,
                             "MTK-GCE-DISP thr%u pc=%08x WS 0x%08x = 0x%08x "
                             "(spr[%u]=%08x arg_b=%04x masked=%d mask=%08x)\n",
@@ -702,7 +924,7 @@ static void mtk_gce_exec(MtkGceState *s, unsigned idx)
                             t->mask_valid ? t->mask : 0);
                 }
             }
-            pc += 8;
+            pc += step;
             break;
         }
         case CMDQ_CODE_READ_S: {
@@ -711,7 +933,7 @@ static void mtk_gce_exec(MtkGceState *s, unsigned idx)
             uint32_t pa = mtk_gce_gpr_addr(t, sop, (raw & 0xffff) & 0xfffcu);
 
             t->spr[dst & (MTK_GCE_SPR_NUM - 1)] = mtk_gce_read32(s, pa);
-            pc += 8;
+            pc += step;
             break;
         }
         case CMDQ_CODE_POLL: {
@@ -730,44 +952,130 @@ static void mtk_gce_exec(MtkGceState *s, unsigned idx)
                             known ? "" : " no-subsys");
                 }
             }
-            pc += 8;
+            pc += step;
             break;
         }
         case CMDQ_CODE_WFE: {
+            unsigned event = off;
+            bool update = (val & CMDQ_WFE_UPDATE) != 0;
+            bool update_value = (val & CMDQ_WFE_UPDATE_VALUE) != 0;
+            bool wait = (val & CMDQ_WFE_WAIT) != 0;
+            bool wait_value = (val & CMDQ_WFE_WAIT_VALUE) != 0;
+
             s->n_events++;
-            pc += 8;
+
+            if (!wait) {
+                /* set_event / clear_event: update the bit immediately. */
+                if (update) {
+                    mtk_gce_event_put(s, event, update_value);
+                }
+                pc += step;
+                break;
+            }
+
+            if (!mtk_gce_event_is_generated(s, event)) {
+                /*
+                 * No modelled block raises this event: skip the wait so a
+                 * missing event model cannot hang the commit path.  Each such
+                 * event id is logged once.
+                 */
+                s->n_wfe_skipped++;
+                if (s->wfe_log && event < MTK_GCE_NUM_EVENTS &&
+                    !(s->event_skip_logged[event >> 3] &
+                      (1u << (event & 7)))) {
+                    s->event_skip_logged[event >> 3] |= 1u << (event & 7);
+                    fprintf(stderr,
+                            "MTK-GCE thr%u: WFE event %u cannot be generated"
+                            " by the model (skip, guest=%0.3fs)\n",
+                            idx, event, mtk_gce_guest_seconds());
+                }
+                pc += step;
+                break;
+            }
+
+            if (mtk_gce_event_isset(s, event) != wait_value) {
+                /* Park the thread on the event, exactly like the GCE. */
+                t->curr_addr = pc + step;
+                s->wfe_waiting[idx] = true;
+                s->wfe_event[idx] = event;
+                s->wfe_clear[idx] = update && !update_value;
+                s->n_wfe_blocked++;
+                if (s->wfe_log &&
+                    (s->n_wfe_blocked <= 32 ||
+                     (s->n_wfe_blocked % 256) == 0)) {
+                    fprintf(stderr,
+                            "MTK-GCE thr%u: WFE block event %u clear=%d"
+                            " (n=%u guest=%0.3fs)\n",
+                            idx, event, s->wfe_clear[idx],
+                            s->n_wfe_blocked, mtk_gce_guest_seconds());
+                }
+                return;
+            }
+
+            /* The event was already set: consume it like hardware does. */
+            if (update) {
+                mtk_gce_event_put(s, event, update_value);
+            }
+            pc += step;
             break;
         }
         case CMDQ_CODE_JUMP: {
+            uint32_t from = pc;
+
+            /*
+             * The target type is arg_a (instruction bits 32..47):
+             *   1 -> absolute: arg_b:arg_c is the target GCE address, i.e.
+             *        CMDQ_REG_SHIFT_ADDR(pa) as written by cmdq_pkt_jump_addr()
+             *        and by cmdq_task_connect_buffer()'s
+             *        (CMDQ_JUMP_BY_PA << 32) | SHIFT_ADDR(next_pa) chunk link;
+             *   0 -> relative: arg_b:arg_c is a signed offset already shifted
+             *        to GCE address units by cmdq_pkt_jump(offset >> shift).
+             * The PC stays in GCE address space; mtk_gce_fetch() reverts it to
+             * (pc << shift) - gce_mminfra before reading guest memory, so an
+             * absolute jump lands exactly on CMDQ_REG_REVERT_ADDR(arg).
+             */
             if (off == 1) {
-                /* cmdq_pkt_jump_abs(): arg_a is the target PA >> shift_pa */
                 pc = val;
-            } else if (val & 0x10000000u) {
-                /* legacy CMDQ_JUMP_BY_OFFSET / CMDQ_JUMP_BY_PA encoding */
-                if (val & 1u) {
-                    pc = val & 0x0ffffffcu;
-                } else {
-                    pc += (int32_t)(val & 0x0ffffffcu);
-                }
             } else {
-                /* cmdq_pkt_jump_rel(): arg_a is a relative offset */
                 pc += (int32_t)val;
             }
+            s->n_jumps++;
+            t->n_jumps++;
             if (s->log && s->n_logged < 20000 && logged < 600) {
-                fprintf(stderr, "MTK-GCE-I thr%u pc=%08x JUMP -> %08x\n",
-                        idx, pc, pc);
+                fprintf(stderr,
+                        "MTK-GCE-I thr%u pc=%08x JUMP arg_a=%u %s -> %08x\n",
+                        idx, from, off, off == 1 ? "abs" : "rel", pc);
+                s->n_logged++;
                 logged++;
+            }
+            if (end && pc == end) {
+                /* The finalize() "JUMP pass" over END_ADDR parks here. */
+                parked = true;
+                goto out;
             }
             break;
         }
         case CMDQ_CODE_EOC: {
-            if (val & 1u) {
-                mtk_gce_thread_complete(s, idx);
-                completed = true;
-                goto out;
+            /* The IRQ flag is arg_c bit0 (CMDQ_EOC_IRQ_EN), not arg_a. */
+            if (val & CMDQ_EOC_IRQ_EN) {
+                mtk_gce_eoc_irq(s, idx);
+                t->n_eoc++;
+                s->n_eoc++;
+                if (s->log &&
+                    (s->n_eoc <= 4096 || (s->n_eoc % 4096) == 0)) {
+                    fprintf(stderr,
+                            "MTK-GCE EOC thr%u pc=%08x n_thr=%u n=%" PRIu64
+                            " guest=%.3fs\n",
+                            idx, pc, t->n_eoc, s->n_eoc,
+                            mtk_gce_guest_seconds());
+                }
             }
-            /* End of a command group without an interrupt: keep going. */
-            pc += 8;
+            /*
+             * EOC only marks the end of a command group: the thread keeps
+             * fetching the trailing JUMP that cmdq_pkt_finalize() appends and
+             * then parks on END_ADDR, exactly like the hardware.
+             */
+            pc += step;
             break;
         }
         default:
@@ -777,26 +1085,105 @@ static void mtk_gce_exec(MtkGceState *s, unsigned idx)
                         "MTK-GCE thr%u pc=%08x unknown opcode 0x%02x "
                         "inst=%016" PRIx64 " (skip)\n", idx, pc, op, raw);
             }
-            pc += 8;
-            break;
-        }
-
-        if (op != CMDQ_CODE_JUMP && end && pc > end) {
+            pc += step;
             break;
         }
     }
-
-    if (!completed) {
-        if (s->log && s->n_started < 64) {
-            fprintf(stderr,
-                    "MTK-GCE thr%u pc=0x%08x end=0x%08x reached end after %u "
-                    "steps (no EOC-irq)\n", idx, pc, end, steps);
-        }
-        mtk_gce_thread_complete(s, idx);
+    if (steps >= MTK_GCE_MAX_STEPS) {
+        s->n_steplimit++;
+        fault = "instruction step limit";
     }
+
 out:
-    /* The driver polls CURR_ADDR == END_ADDR after enabling a task. */
-    t->curr_addr = end;
+    /*
+     * The architectural PC is what the driver reads back through
+     * CMDQ_THR_CURR_ADDR and reverts with CMDQ_REG_REVERT_ADDR().  A thread
+     * that reached END_ADDR stays enabled and idle; it reports completion only
+     * through the EOC IRQ latched above.
+     */
+    t->curr_addr = pc;
+    if (parked) {
+        s->n_started++;
+        if (s->log && (t->irq_status & THR_IRQ_DONE) &&
+            s->n_parked_log < 64) {
+            s->n_parked_log++;
+            fprintf(stderr,
+                    "MTK-GCE thr%u packet parked at end pc=0x%08x"
+                    " end=0x%08x after %u steps eoc=%u guest=%.3fs\n",
+                    idx, pc, end, steps, t->n_eoc, mtk_gce_guest_seconds());
+        }
+    }
+    if (fault) {
+        if (s->log) {
+            fprintf(stderr,
+                    "MTK-GCE thr%u stopped: %s pc=0x%08x end=0x%08x\n",
+                    idx, fault, pc, end);
+        }
+        mtk_gce_error_irq(s, idx);
+    }
+}
+
+/*
+ * Wake every thread parked in a WFE on @event.  Hardware releases all waiters
+ * when the event bit becomes set; a wait-and-clear WFE consumes the bit once
+ * and every released thread continues at the instruction after its WFE.
+ */
+static void mtk_gce_wake_event_waiters(MtkGceState *s, unsigned event)
+{
+    unsigned idx;
+    uint32_t wake = 0;
+    bool clear = false;
+
+    if (event >= MTK_GCE_NUM_EVENTS) {
+        return;
+    }
+    for (idx = 0; idx < MTK_GCE_NUM_THREADS; idx++) {
+        if (!s->wfe_waiting[idx] || s->wfe_event[idx] != event) {
+            continue;
+        }
+        /*
+         * A suspended thread must not run: it keeps its wait until the driver
+         * resumes it (the event bit stays set for a wait-and-clear WFE).
+         */
+        if (s->thr[idx].suspended) {
+            continue;
+        }
+        wake |= 1u << idx;
+        clear |= s->wfe_clear[idx];
+    }
+    if (!wake) {
+        return;
+    }
+    if (clear) {
+        mtk_gce_event_put(s, event, false);
+    }
+    for (idx = 0; idx < MTK_GCE_NUM_THREADS; idx++) {
+        if (!(wake & (1u << idx))) {
+            continue;
+        }
+        s->wfe_waiting[idx] = false;
+        s->n_wfe_resumed++;
+        if (s->wfe_log &&
+            (s->n_wfe_resumed <= 32 || (s->n_wfe_resumed % 256) == 0)) {
+            fprintf(stderr,
+                    "MTK-GCE thr%u: WFE resume event %u (n=%u guest=%0.3fs)\n",
+                    idx, event, s->n_wfe_resumed, mtk_gce_guest_seconds());
+        }
+        mtk_gce_exec(s, idx);
+    }
+}
+
+void mtk_gce_event_signal(struct DeviceState *dev, unsigned event)
+{
+    MtkGceState *s = MTK_GCE(OBJECT(dev));
+
+    mtk_gce_event_put(s, event, true);
+    mtk_gce_wake_event_waiters(s, event);
+}
+
+void mtk_gce_event_mark_generated(struct DeviceState *dev, unsigned event)
+{
+    mtk_gce_event_mark(MTK_GCE(OBJECT(dev)), event);
 }
 
 static void mtk_gce_start(MtkGceState *s, unsigned idx)
@@ -821,6 +1208,22 @@ static void mtk_gce_start(MtkGceState *s, unsigned idx)
     }
 }
 
+/*
+ * MTK_GCE_REGLOG=1: trace the thread register traffic the driver performs.
+ * Used to see whether a CMDQ task submission reaches the GCE (CURR_ADDR /
+ * END_ADDR / IRQ_ENABLE / ENABLE_TASK writes) when the guest stalls.
+ */
+static void mtk_gce_reglog(MtkGceState *s, const char *rw, unsigned idx,
+                           unsigned reg, uint32_t val)
+{
+    if (!s->reg_log || s->n_reg_logged >= 4000) {
+        return;
+    }
+    s->n_reg_logged++;
+    fprintf(stderr, "MTK-GCE-REG %s thr%u off=%02x val=%08x guest=%.3fs\n",
+            rw, idx, reg, val, mtk_gce_guest_seconds());
+}
+
 static uint64_t mtk_gce_read(void *opaque, hwaddr addr, unsigned size)
 {
     MtkGceState *s = opaque;
@@ -832,22 +1235,34 @@ static uint64_t mtk_gce_read(void *opaque, hwaddr addr, unsigned size)
         t = &s->thr[idx];
         switch (reg) {
         case THR_WARM_RESET:
+            mtk_gce_reglog(s, "R", idx, reg, 0);
             return 0;   /* self-clearing */
         case THR_ENABLE_TASK:
+            mtk_gce_reglog(s, "R", idx, reg, t->enable);
             return t->enable;
         case THR_SUSPEND_TASK:
+            mtk_gce_reglog(s, "R", idx, reg, t->suspended);
             return t->suspended;
-        case THR_CURR_STATUS:
-            return t->suspended ? THR_STATUS_SUSPENDED : 0;
+        case THR_CURR_STATUS: {
+            uint32_t st = t->suspended ? THR_STATUS_SUSPENDED : 0;
+
+            mtk_gce_reglog(s, "R", idx, reg, st);
+            return st;
+        }
         case THR_IRQ_STATUS:
+            mtk_gce_reglog(s, "R", idx, reg, t->irq_status);
             return t->irq_status;
         case THR_IRQ_ENABLE:
+            mtk_gce_reglog(s, "R", idx, reg, t->irq_enable);
             return t->irq_enable;
         case THR_CURR_ADDR:
+            mtk_gce_reglog(s, "R", idx, reg, t->curr_addr);
             return t->curr_addr;
         case THR_END_ADDR:
+            mtk_gce_reglog(s, "R", idx, reg, t->end_addr);
             return t->end_addr;
         case THR_WAIT_TOKEN:
+            mtk_gce_reglog(s, "R", idx, reg, 0);
             return 0;   /* never blocked on a token */
         case THR_PRIORITY:
             return t->priority;
@@ -871,6 +1286,7 @@ static void mtk_gce_write(void *opaque, hwaddr addr, uint64_t val,
     addr &= MTK_GCE_SIZE - 1;
     if (mtk_gce_thread_lookup(addr, &idx, &reg)) {
         t = &s->thr[idx];
+        mtk_gce_reglog(s, "W", idx, reg, (uint32_t)val);
         switch (reg) {
         case THR_WARM_RESET:
             if (val & THR_DO_WARM_RESET) {
@@ -901,7 +1317,8 @@ static void mtk_gce_write(void *opaque, hwaddr addr, uint64_t val,
              * Treat a 1->0 resume on an enabled thread as "run the newly
              * queued task".
              */
-            if (was && !t->suspended && t->enable && t->end_addr &&
+            if (was && !t->suspended && !s->wfe_waiting[idx] &&
+                t->enable && t->end_addr &&
                 t->curr_addr && t->curr_addr != t->end_addr) {
                 mtk_gce_start(s, idx);
             }
@@ -910,14 +1327,20 @@ static void mtk_gce_write(void *opaque, hwaddr addr, uint64_t val,
         case THR_CURR_STATUS:
             return;     /* read-only */
         case THR_IRQ_STATUS:
-            t->irq_status &= ~(uint32_t)val;    /* write-1-to-clear */
-            if (s->pending & (1u << idx)) {
-                s->pending &= ~(1u << idx);
-                mtk_gce_update_irq(s);
-            }
+            /*
+             * Write-zero-to-clear status, exactly like the vendor GCE: the
+             * driver acknowledges with writel(~irq_flag), so every bit it saw
+             * is written 0 (cleared) and every other bit is written 1 (kept).
+             * Implementing this as write-1-to-clear leaves THR_IRQ_STATUS.DONE
+             * asserted forever: the level IRQ then storms and the guest
+             * livelocks in cmdq_thread_irq_handler().
+             */
+            t->irq_status &= (uint32_t)val;
+            mtk_gce_refresh_pending(s);
             return;
         case THR_IRQ_ENABLE:
             t->irq_enable = val;
+            mtk_gce_refresh_pending(s);
             return;
         case THR_CURR_ADDR:
             t->curr_addr = val;
@@ -953,6 +1376,8 @@ static void mtk_gce_reset(DeviceState *dev)
 
     memset(s->regs, 0, sizeof(s->regs));
     memset(s->thr, 0, sizeof(s->thr));
+    memset(s->event_bits, 0, sizeof(s->event_bits));
+    memset(s->wfe_waiting, 0, sizeof(s->wfe_waiting));
     s->pending = 0;
     s->n_started = 0;
     mtk_gce_update_irq(s);
@@ -991,8 +1416,27 @@ static void mtk_gce_init(Object *obj)
     sysbus_init_irq(sbd, &s->irq);
     s->log = getenv("MTK_GCELOG") != NULL;
     s->instlog = s->log;
+    /*
+     * MTK_GCE_RAW=1: dump the raw 64-bit instruction words of every packet
+     * that writes a DISP register window, so the model's decoding can be
+     * compared 1:1 with the driver's cmdq_log output.
+     */
+    e = getenv("MTK_GCE_RAW");
+    s->raw_log = e != NULL && strcmp(e, "0") != 0;
+    s->reg_log = getenv("MTK_GCE_REGLOG") != NULL;
     s->exec = true;
     s->exec_write = true;
+    /*
+     * Blocking WFE: a wait-for-event parks the thread until a peripheral
+     * model raises the event (DSI0 EOF/SOF, DISP mutex0 EOF), exactly like
+     * the hardware.  A WFE on an event no modelled block can raise keeps the
+     * "count and skip" fallback in mtk_gce_exec(), so a missing event model
+     * can never hang a guest commit packet.  MTK_DSITRACE=1 additionally logs
+     * WFE block/resume, because those events gate the DRM page-flip
+     * completion.
+     */
+    s->wfe_log = getenv("MTK_DSITRACE") != NULL ||
+                 getenv("MTK_GCE_WFE_LOG") != NULL;
     e = getenv("MTK_GCE_EXEC");
     if (e && !strcmp(e, "off")) {
         s->exec = false;
@@ -1038,20 +1482,6 @@ static void mtk_gce_init(Object *obj)
         s->xlate_off = strtoul(e, NULL, 0);
         s->xlate_done = true;
         s->xlate_fixed = true;
-    }
-    /*
-     * Default = forward (vendor display masked-write semantics, verified with
-     * the LineageOS kernel's 0x14002020 ROI write in round M1.5).  The stock
-     * kernel's OVL ADDR writes need the inverted form, so those runs set
-     * MTK_GCE_MASK_INV=1; MTK_GCE_MASK_NONE=1 restores the old "do not mask
-     * opcode 0x90" behaviour for A/B testing.
-     */
-    s->mask_mode = 0;                      /* default: stock path unchanged */
-    if (getenv("MTK_GCE_MASK_ALL")) {
-        s->mask_mode = 1;                  /* forward: LOS/vendor masked writes */
-    }
-    if (getenv("MTK_GCE_MASK_INV")) {
-        s->mask_mode = 2;                  /* inverted: stock OVL ADDR writes */
     }
     e = getenv("MTK_GCE_SHIFT");
     if (e) {

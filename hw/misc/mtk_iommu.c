@@ -30,8 +30,10 @@
  * the display/GCE models can translate their DMA addresses through the same
  * page table Linux programs.
  *
- * MTK_IOMMU=1 enables translation (consumers then treat register values as
- * IOVAs); MTK_IOMMU_LOG=1 logs invalidations and translation faults.
+ * Translation is enabled by default (real hardware always has the M4U and
+ * every multimedia client is attached to an IOMMU domain); MTK_IOMMU=0 selects
+ * the legacy path where clients program physical addresses, and
+ * MTK_IOMMU_LOG=1 logs invalidations and translation faults.
  *
  * SPDX-License-Identifier: GPL-2.0-or-later
  */
@@ -139,11 +141,13 @@ bool mtk_iommu_enabled(void)
         const char *e = getenv("MTK_IOMMU");
 
         /*
-         * MTK_DT_NOIOMMU=1 keeps the old bring-up hack (device tree iommus
-         * properties NOPed out, clients program physical addresses), so it
-         * wins over MTK_IOMMU=1: the two settings are mutually exclusive.
+         * Default on: the M4U is always present on real hardware.  MTK_IOMMU=0
+         * (or an empty value) selects the legacy bring-up path where clients
+         * program physical addresses.  MTK_DT_NOIOMMU=1 keeps the old device
+         * tree hack (iommus properties NOPed out) and therefore also disables
+         * translation; it wins, since the two settings are mutually exclusive.
          */
-        mtk_iommu_configured = e != NULL && strcmp(e, "0") != 0 &&
+        mtk_iommu_configured = !(e && (!*e || !strcmp(e, "0"))) &&
                                getenv("MTK_DT_NOIOMMU") == NULL;
     }
     return mtk_iommu_configured;
@@ -246,10 +250,17 @@ static bool mtk_iommu_walk(MtkIommuState *s, uint64_t iova, hwaddr *pa,
             *pa = mtk_iommu_pte_pa(l2e, ARM_V7S_LVL2_PA_MASK) |
                   ((uint32_t)iova & 0xfff);
         } else {
-            /* 64 KiB contiguous page: 16 repeated small page entries */
+            /*
+             * 64 KiB contiguous page: 16 repeated small page entries.
+             * The offset inside the block comes from IOVA bits below the
+             * block size only; keeping the high IOVA bits (mask is a 32-bit
+             * leaf mask, so ~mask covers bits 32..63) would leak IOVA[33:32]
+             * into PA[33:32] for a 34-bit IOVA.
+             */
             uint32_t mask = (uint32_t)(ARM_V7S_LVL2_PA_MASK *
                                        ARM_V7S_CONT_PAGES);
-            *pa = mtk_iommu_pte_pa(l2e, mask) | (iova & ~(hwaddr)mask);
+            *pa = mtk_iommu_pte_pa(l2e, mask) |
+                  ((uint32_t)iova & ~mask);
         }
         return true;
     }
@@ -258,7 +269,9 @@ static bool mtk_iommu_walk(MtkIommuState *s, uint64_t iova, hwaddr *pa,
     if (l1e & ARM_V7S_CONT_SECTION) {
         uint32_t mask = (uint32_t)(ARM_V7S_LVL1_PA_MASK * ARM_V7S_CONT_PAGES);
 
-        *pa = mtk_iommu_pte_pa(l1e, mask) | (iova & ~(hwaddr)mask);
+        /* Same rule as the contiguous page: only the low IOVA bits below the
+         * 16 MiB block select the offset inside it. */
+        *pa = mtk_iommu_pte_pa(l1e, mask) | ((uint32_t)iova & ~mask);
     } else {
         *pa = mtk_iommu_pte_pa(l1e, ARM_V7S_LVL1_PA_MASK) |
               ((uint32_t)iova & 0xfffff);
@@ -327,6 +340,32 @@ bool mtk_iommu_translate_or_identity(uint16_t dev_id, uint64_t dma,
         return true;
     }
     return mtk_iommu_translate(dev_id, dma, pa);
+}
+
+void mtk_iommu_dump_walk(uint16_t dev_id, uint64_t iova)
+{
+    MtkIommuState *s;
+    hwaddr pa = 0;
+    uint32_t l1e = 0, l2e = 0, pt, l1_idx, l2_idx = 0;
+    bool ok;
+
+    if (dev_id >= MTK_IOMMU_DEV_NUM) {
+        return;
+    }
+    s = mtk_iommu_bank0[dev_id];
+    if (!s) {
+        fprintf(stderr, "MTK-IOMMU-DBG dev%u: no bank-0 instance\n", dev_id);
+        return;
+    }
+    pt = s->regs[REG_MMU_PT_BASE_ADDR >> 2] & MMU_PT_ADDR_MASK;
+    l1_idx = (iova >> ARM_V7S_LVL1_IDX_SHIFT) & ARM_V7S_LVL1_IDX_MASK;
+    l2_idx = (iova >> ARM_V7S_LVL2_IDX_SHIFT) & ARM_V7S_LVL2_IDX_MASK;
+    ok = pt && mtk_iommu_walk(s, iova, &pa, &l1e, &l2e);
+    fprintf(stderr,
+            "MTK-IOMMU-DBG dev%u iova=%#" PRIx64 " pt=%#x l1[%u]=%#x "
+            "l2[%u]=%#x walk_ok=%d pa=%#" HWADDR_PRIx " backed=%d\n",
+            dev_id, iova, pt, l1_idx, l1e, l2_idx, l2e, ok, pa,
+            ok ? memory_region_present(get_system_memory(), pa) : 0);
 }
 
 static uint64_t mtk_iommu_read(void *opaque, hwaddr addr, unsigned size)
@@ -400,7 +439,7 @@ static void mtk_iommu_realize(DeviceState *dev, Error **errp)
         mtk_iommu_bank0[s->iommu_id] = s;
         if (mtk_iommu_enabled()) {
             fprintf(stderr, "MTK-IOMMU: dev%u bank0 translation enabled "
-                    "(MTK_IOMMU=1)\n", s->iommu_id);
+                    "(default; MTK_IOMMU=0 disables)\n", s->iommu_id);
         }
     }
 }

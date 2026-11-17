@@ -5,13 +5,14 @@
  * clients into guest physical addresses using ARMv7 short-descriptor page
  * tables with the MediaTek 34-bit IOVA / 35-bit PA extension.
  *
- * Two environments select which DMA path the machine models:
+ * Translation is on by default (the hardware behaviour: every client is
+ * attached to an IOMMU domain and programs IOVAs).  Environment overrides:
  *
- *   MTK_IOMMU=1     real translation (the hardware behaviour: clients are
- *                   attached to an IOMMU domain and program IOVAs);
- *   (unset/0)       no translation: clients program physical addresses, as
- *                   in the earlier bring-up setup where the device tree
- *                   iommus properties were NOPed out (MTK_DT_NOIOMMU=1).
+ *   (unset) / MTK_IOMMU=1   real translation (default);
+ *   MTK_IOMMU=0             no translation: clients program physical
+ *                           addresses (the legacy bring-up setup where the
+ *                           device tree iommus properties were NOPed out);
+ *   MTK_DT_NOIOMMU=1        deprecated legacy hack, also disables translation.
  *
  * SPDX-License-Identifier: GPL-2.0-or-later
  */
@@ -57,12 +58,21 @@ bool mtk_iommu_enabled(void);
 bool mtk_iommu_translate(uint16_t dev_id, uint64_t iova, hwaddr *pa);
 
 /*
- * Consumer helper: with MTK_IOMMU=1 translate (with the identity fallback
- * above), otherwise treat @dma as a physical address.  Every model that reads
+ * Consumer helper: translate (with the identity fallback above) unless
+ * MTK_IOMMU=0, in which case @dma is a physical address.  Every model that reads
  * guest memory on behalf of an M4U client uses this so the rule is defined in
  * one place.
  */
 bool mtk_iommu_translate_or_identity(uint16_t dev_id, uint64_t dma,
                                      hwaddr *pa);
+
+/*
+ * Diagnostic: log the page-table entries and decoded physical address for
+ * @iova on the bank-0 instance of @dev_id.  Called by consumer models when a
+ * translated read fails, so the log shows whether the translation produced a
+ * valid physical address that is simply not backed (model/consumer bug) or
+ * whether the page-table walk itself is suspect.
+ */
+void mtk_iommu_dump_walk(uint16_t dev_id, uint64_t iova);
 
 #endif /* HW_MISC_MTK_IOMMU_H */

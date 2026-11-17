@@ -44,6 +44,37 @@ OBJECT_DECLARE_SIMPLE_TYPE(MtkDispState, MTK_DISP)
 
 #define MTK_DISP_MAX_OVL 6
 
+/*
+ * Register map, from the vendor driver this kernel actually runs
+ * (drivers/gpu/drm/mediatek/mediatek_v2/mtk_disp_ovl.c and
+ * mt6895_ovl_driver_data): four normal layers plus four extension layers per
+ * OVL.  On mt6895 is_support_34bits is true, so every layer address is a
+ * 34-bit value split over L*_ADDR (bits 31:0) and L*_ADDR_MSB (bits 33:32),
+ * and the pitch is 20 bits split over L*_PITCH[15:0] and L*_PITCH_MSB[3:0].
+ * The display blocks are M4U (disp_iommu) clients: kernel-programmed
+ * addresses are IOVAs, bootloader-programmed ones (LK splash) are physical.
+ */
+#define OVL_EN              0x000c
+#define OVL_ROI_SIZE        0x0020
+#define OVL_SRC_CON         0x002c
+#define OVL_CON(n)          (0x0030 + 0x20 * (n))
+#define OVL_SRC_SIZE(n)     (0x0038 + 0x20 * (n))
+#define OVL_OFFSET(n)       (0x003c + 0x20 * (n))
+#define OVL_PITCH_MSB(n)    (0x0040 + 0x20 * (n))
+#define OVL_PITCH(n)        (0x0044 + 0x20 * (n))
+#define OVL_ADDR(n)         (0x0f40 + 0x20 * (n))
+#define OVL_ADDR_MSB(n)     (0x0f4c + 0x20 * (n))
+#define OVL_DATAPATH_EXT_CON 0x0324
+#define OVL_EL_CON(n)       (0x0330 + 0x20 * (n))
+#define OVL_EL_SRC_SIZE(n)  (0x0338 + 0x20 * (n))
+#define OVL_EL_OFFSET(n)    (0x033c + 0x20 * (n))
+#define OVL_EL_PITCH_MSB(n) (0x0340 + 0x20 * (n))
+#define OVL_EL_PITCH(n)     (0x0344 + 0x20 * (n))
+#define OVL_EL_ADDR(n)      (0x0fb0 + 0x10 * (n))   /* el_addr_offset 0x10 */
+#define OVL_EL_ADDR_MSB(n)  (0x0fbc + 0x10 * (n))
+#define OVL_NUM_LAYERS      4
+#define OVL_NUM_EXT_LAYERS  4
+
 struct MtkDispState {
     DeviceState parent_obj;
 
@@ -77,6 +108,20 @@ static uint32_t rd32(hwaddr a)
                                 MEMTXATTRS_UNSPECIFIED, NULL);
 }
 
+/* Layer DMA address: L*_ADDR[31:0] | L*_ADDR_MSB[1:0] << 32 (34-bit IOVA). */
+static uint64_t ovl_layer_addr(hwaddr base, unsigned n)
+{
+    return (uint64_t)rd32(base + OVL_ADDR(n)) |
+           ((uint64_t)(rd32(base + OVL_ADDR_MSB(n)) & 0xf) << 32);
+}
+
+/* Layer pitch: L*_PITCH[15:0] | L*_PITCH_MSB[3:0] << 16 (bytes per line). */
+static uint32_t ovl_layer_pitch(hwaddr base, unsigned n)
+{
+    return (rd32(base + OVL_PITCH(n)) & 0xffff) |
+           ((rd32(base + OVL_PITCH_MSB(n)) & 0xf) << 16);
+}
+
 /*
  * Read scan-out data.  With MTK_IOMMU=1 the OVL layer address is an IOVA and
  * every 4 KiB page has to be translated through the disp_iommu page table;
@@ -91,19 +136,40 @@ static bool mtk_disp_read(MtkDispState *s, uint64_t addr, void *buf,
                                   MEMTXATTRS_UNSPECIFIED, buf, len) == MEMTX_OK;
     }
     while (len) {
-        hwaddr pa;
+        hwaddr pa = 0;
         size_t chunk = MIN(len, (size_t)(0x1000 - (addr & 0xfff)));
+        const char *why;
 
-        if (!mtk_iommu_translate_or_identity(MTK_IOMMU_DEV_DISP, addr, &pa) ||
-            address_space_read(&address_space_memory, pa,
-                               MEMTXATTRS_UNSPECIFIED, buf, chunk) != MEMTX_OK) {
-            s->n_xlate_fail++;
-            return false;
+        if (!mtk_iommu_translate_or_identity(MTK_IOMMU_DEV_DISP, addr, &pa)) {
+            why = "unmapped IOVA";
+        } else if (address_space_read(&address_space_memory, pa,
+                                      MEMTXATTRS_UNSPECIFIED, buf,
+                                      chunk) != MEMTX_OK) {
+            why = "guest memory read failed";
+        } else {
+            s->n_xlate_ok++;
+            buf = (uint8_t *)buf + chunk;
+            addr += chunk;
+            len -= chunk;
+            continue;
         }
-        s->n_xlate_ok++;
-        buf = (uint8_t *)buf + chunk;
-        addr += chunk;
-        len -= chunk;
+        /*
+         * Report the exact page that could not be scanned out: the failing
+         * address is the 4 KiB-aligned IOVA chunk, not necessarily the layer
+         * base address the compose loop started from.
+         */
+        s->n_xlate_fail++;
+        if (s->xlate_logged < 32) {
+            s->xlate_logged++;
+            fprintf(stderr,
+                    "MTK-DISP: scan-out %s: iova=%#" PRIx64
+                    " pa=%#" HWADDR_PRIx " chunk=%zu\n",
+                    why, addr, pa, chunk);
+            if (iommu) {
+                mtk_iommu_dump_walk(MTK_IOMMU_DEV_DISP, addr);
+            }
+        }
+        return false;
     }
     return true;
 }
@@ -128,23 +194,39 @@ static uint32_t mtk_disp_px(const uint8_t *p, unsigned fmt, bool bswap,
         g = p[1];
         r = p[bswap ? 0 : 2];
         break;
-    case 2: /* RGBA8888 hw code: le32 = A<<24|R<<16|G<<8|B */
-        v = ldl_le_p(p);
-        if (bswap) {
-            v = bswap32(v);
+    /*
+     * CLRFMT 2 / 3 are byte-order-agnostic formats: the panel data is RGB in
+     * bytes 0..2 (CLRFMT 2) or 1..3 (CLRFMT 3), and the fourth byte is X/A.
+     * The vendor driver selects the byte order with OVL_CON_BYTE_SWAP
+     * (bit 24, ovl_fmt_convert()):
+     *   CLRFMT 2 no swap : DRM XRGB8888/ARGB8888, memory B,G,R,X
+     *   CLRFMT 2 byte swap: DRM XBGR8888/ABGR8888, memory R,G,B,X
+     *   CLRFMT 3 no swap : DRM RGBX8888/RGBA8888, memory X,B,G,R
+     *   CLRFMT 3 byte swap: DRM BGRX8888/BGRA8888, memory X,R,G,B
+     * Extracting from the little-endian word instead of the bytes made the
+     * alpha byte (0xff) land in the blue channel on recovery's XBGR buffer.
+     */
+    case 2:
+        if (!bswap) {          /* memory B,G,R,X */
+            b = p[0];
+            g = p[1];
+            r = p[2];
+        } else {               /* memory R,G,B,X */
+            r = p[0];
+            g = p[1];
+            b = p[2];
         }
-        r = (v >> 16) & 0xff;
-        g = (v >> 8) & 0xff;
-        b = v & 0xff;
         break;
-    case 3: /* ARGB8888 hw code: le32 = R<<24|G<<16|B<<8|A */
-        v = ldl_le_p(p);
-        if (bswap) {
-            v = bswap32(v);
+    case 3:
+        if (!bswap) {          /* memory X,B,G,R */
+            b = p[1];
+            g = p[2];
+            r = p[3];
+        } else {               /* memory X,R,G,B */
+            r = p[1];
+            g = p[2];
+            b = p[3];
         }
-        r = v >> 24;
-        g = (v >> 16) & 0xff;
-        b = (v >> 8) & 0xff;
         break;
     default: /* YUV: show luma only */
         r = g = b = p[(fmt == 4) ? 1 : 0];
@@ -185,11 +267,6 @@ static void mtk_disp_blit(MtkDispState *s, uint64_t addr, uint32_t pitch,
         if (!mtk_disp_read(s, addr + (uint64_t)y * pitch, s->line,
                            (size_t)w * bpp, iommu)) {
             memset(s->line, 0, (size_t)w * bpp);
-            if (s->xlate_logged < 8) {
-                s->xlate_logged++;
-                fprintf(stderr, "MTK-DISP: no IOMMU mapping for %#" PRIx64
-                        " (layer %ux%u fmt %u)\n", addr, w, h, fmt);
-            }
         }
         for (x = 0; x < w; x++) {
             s->canvas[(y0 + y) * s->width + x0 + x] =
@@ -239,7 +316,7 @@ extern uint32_t mtk_gce_disp_epoch;   /* hw/misc/mtk_gce.c */
 static bool mtk_disp_compose(MtkDispState *s, char *desc, size_t dlen)
 {
     bool any = false;
-    int o, n, pass;
+    int o, n;
     int mode = mtk_disp_src_mode();
     bool iommu = mtk_iommu_enabled();
 
@@ -272,116 +349,67 @@ static bool mtk_disp_compose(MtkDispState *s, char *desc, size_t dlen)
                  " iommu_ok=%u iommu_fail=%u", s->n_xlate_ok, s->n_xlate_fail);
     }
     /*
-     * Two passes:
-     *   pass 0 - normal OVL layers (enabled + CON/SIZE/ADDR valid);
-     *   pass 1 - ADDR-only fallback layers, drawn on top.  The kernel's
-     *            recovery minui commit only programs ADDR (and PITCH) of
-     *            OVL2 L1 (addr = 0xc0900870 / 0xc1400870 in the CMA pool)
-     *            and leaves CON/SIZE/SRC_CON at zero; scanning that buffer
-     *            out full-panel is what the hardware effectively does for
-     *            the recovery UI (verified in round 1,298: the dumped PPM
-     *            contains the Xiaomi HyperOS Recovery menu).
-     *            MTK_DISP_NO_ADDR_FALLBACK=1 disables the fallback.
-     *            MTK_DISP_ADDR_ONLY=1 forces it for any CMA-address layer
-     *            (diagnostic mode used to identify the minui frame).
+     * Scan out exactly the layers the guest enabled: a layer contributes only
+     * when its enable bit in SRC_CON is set and its CON/SIZE registers
+     * describe a valid rectangle.  A layer whose ADDR was written while
+     * CON/SIZE are still zero is not a scan-out configuration on the real
+     * hardware, so the model never invents one.
      */
-    for (pass = 0; pass < 2; pass++) {
-        for (o = 0; o < MTK_DISP_MAX_OVL; o++) {
-            hwaddr base = s->ovl_base[o];
-            uint32_t src_con, xbase = 0;
+    for (o = 0; o < MTK_DISP_MAX_OVL; o++) {
+        hwaddr base = s->ovl_base[o];
+        uint32_t src_con, xbase = 0;
 
-            if (!base) {
+        if (!base) {
+            continue;
+        }
+        /*
+         * Dual-pipe (left/right split) panels: each pipe's OVL chain
+         * renders its own ROI and the merge block places the right pipe
+         * after the left pipe's ROI width (OVL0 ROI_SIZE[15:0]).  Before any
+         * ROI width is programmed (LK hand-over and the first kernel
+         * commits) the panel is split in the middle.
+         */
+        if (s->pipe_split && o >= s->pipe_split && s->ovl_base[0]) {
+            uint32_t lw = rd32(s->ovl_base[0] + OVL_ROI_SIZE) & 0xffff;
+
+            xbase = (lw && lw < s->width) ? lw : s->width / 2;
+        }
+        src_con = rd32(base + OVL_SRC_CON);
+        for (n = 0; n < OVL_NUM_LAYERS; n++) {
+            uint64_t addr;
+            uint32_t con, size, off, pitch;
+
+            /*
+             * Layer DMA address as the hardware sees it: bits 31:0 from
+             * L*_ADDR, bits 33:32 from L*_ADDR_MSB.  The kernel (minui's
+             * framebuffer through disp_iommu) programs a 34-bit IOVA here;
+             * the LK splash was programmed before any IOMMU domain existed,
+             * with MSB == 0, and is picked up by the identity fallback in
+             * mtk_iommu_translate_or_identity().
+             */
+            addr = ovl_layer_addr(base, n);
+            con = rd32(base + OVL_CON(n));
+            size = rd32(base + OVL_SRC_SIZE(n));
+            off = rd32(base + OVL_OFFSET(n));
+            pitch = ovl_layer_pitch(base, n);
+            if (!(src_con & (1u << n)) || !addr ||
+                (size & 0xffff) == 0 || (size >> 16) == 0) {
                 continue;
             }
-            /*
-             * Dual-pipe (left/right split) panels: each pipe's OVL chain
-             * renders its own ROI and the DSC/DSI merge places the right
-             * pipe after the left pipe's ROI width (OVL0 ROI_SIZE[15:0]).
-             */
-            if (s->pipe_split && o >= s->pipe_split && s->ovl_base[0]) {
-                xbase = rd32(s->ovl_base[0] + 0x20) & 0xffff;
+            if (!pitch) {
+                pitch = (size & 0xffff) * mtk_disp_bpp((con >> 12) & 0xf);
             }
-            src_con = rd32(base + 0x2c);
-            for (n = 0; n < 4; n++) {
-                hwaddr lb = base + 0x20 * n;
-                uint32_t con, size, off, pitch, addr;
-                bool enabled, normal, fb_addr, cma;
-
-                addr = rd32(base + 0xf40 + 0x20 * n);
-                con = rd32(lb + 0x30);
-                size = rd32(lb + 0x38);
-                off = rd32(lb + 0x3c);
-                pitch = rd32(lb + 0x44) & 0xffff;
-                enabled = (src_con & (1u << n)) != 0 ||
-                          getenv("MTK_DISP_IGN_SRC_CON") != NULL;
-                normal = enabled && addr != 0 && (size & 0xffff) != 0 &&
-                         (size >> 16) != 0;
-                if (iommu) {
-                    /*
-                     * The layer address is an IOVA: recovery's minui commits
-                     * only ADDR/PITCH of OVL2 L1, so an address that maps
-                     * through disp_iommu is the recovery framebuffer.
-                     */
-                    hwaddr pa;
-
-                    cma = addr != 0 &&
-                          mtk_iommu_translate_or_identity(MTK_IOMMU_DEV_DISP,
-                                                          addr, &pa);
-                } else {
-                    cma = addr >= 0xc0000000u && addr < 0xd0000000u;
-                }
-                fb_addr = cma && !getenv("MTK_DISP_NO_ADDR_FALLBACK") &&
-                          (getenv("MTK_DISP_ADDR_ONLY") != NULL || !normal);
-                if (pass == 0) {
-                    if (!normal || fb_addr) {
-                        continue;
-                    }
-                    if (!pitch) {
-                        pitch = (size & 0xffff) *
-                                mtk_disp_bpp((con >> 12) & 0xf);
-                    }
-                    mtk_disp_blit(s, addr, pitch, (con >> 12) & 0xf,
-                                  con & (1u << 24), con & (1u << 25),
-                                  xbase + (off & 0xffff), off >> 16,
-                                  size & 0xffff, size >> 16, true);
-                    snprintf(desc + strlen(desc), dlen - strlen(desc),
-                             "ovl%d.L%d(en=bit%d src_con=%#x) addr=%#x "
-                             "con=%#x size=%ux%u off=%u,%u pitch=%u; ",
-                             o, n, n, src_con, addr, con, size & 0xffff,
-                             size >> 16, off & 0xffff, off >> 16, pitch);
-                    any = true;
-                } else {
-                    uint32_t fp;
-
-                    if (!fb_addr || normal) {
-                        continue;
-                    }
-                    fp = pitch ? pitch : (uint32_t)s->width * 4;
-                    /*
-                     * Dual-pipe panels store the two 540-column halves
-                     * swapped inside one framebuffer row (verified in round
-                     * 1,298: swapping the halves turns the split recovery
-                     * splash into a perfect "Xiaomi HyperOS Recovery"
-                     * screen).  MTK_DISP_NO_FB_SWAP=1 restores the plain
-                     * linear scan-out.
-                     */
-                    if (s->pipe_split && !getenv("MTK_DISP_NO_FB_SWAP")) {
-                        uint32_t hw2 = (uint32_t)s->width / 2;
-
-                        mtk_disp_blit(s, addr + hw2 * 4, fp, 2, false, false,
-                                      0, 0, hw2, s->height, true);
-                        mtk_disp_blit(s, addr, fp, 2, false, false,
-                                      hw2, 0, s->width - hw2, s->height, true);
-                    } else {
-                        mtk_disp_blit(s, addr, fp, 2, false, false, 0, 0,
-                                      s->width, s->height, true);
-                    }
-                    snprintf(desc + strlen(desc), dlen - strlen(desc),
-                             "ovl%d.L%d(ADDR-FB) addr=%#x pitch=%u; ",
-                             o, n, addr, fp);
-                    any = true;
-                }
-            }
+            mtk_disp_blit(s, addr, pitch, (con >> 12) & 0xf,
+                          con & (1u << 24), con & (1u << 25),
+                          xbase + (off & 0xffff), off >> 16,
+                          size & 0xffff, size >> 16, iommu);
+            snprintf(desc + strlen(desc), dlen - strlen(desc),
+                     "ovl%d.L%d(en=bit%d src_con=%#x) "
+                     "addr=%#" PRIx64 " con=%#x size=%ux%u "
+                     "off=%u,%u pitch=%u; ",
+                     o, n, n, src_con, addr, con, size & 0xffff,
+                     size >> 16, off & 0xffff, off >> 16, pitch);
+            any = true;
         }
     }
     if (!any && s->fb_fallback && mode != MTK_DISP_SRC_DRM) {
@@ -421,9 +449,8 @@ static void mtk_disp_dump_ovl(MtkDispState *s, const char *why)
         fprintf(stderr,
                 "MTK-DISP-DBG %s ovl%d base=%#" PRIx64 " roi=%#x dp=%#x "
                 "src_con=%#x\n", why, o, (uint64_t)base, roi, dpcon, src_con);
-        for (n = 0; n < 4; n++) {
-            hwaddr lb = base + 0x20 * n;
-            uint32_t addr = rd32(base + 0xf40 + 0x20 * n);
+        for (n = 0; n < OVL_NUM_LAYERS; n++) {
+            uint64_t addr = ovl_layer_addr(base, n);
             char pabuf[48] = "";
 
             if (mtk_iommu_enabled() && addr) {
@@ -437,12 +464,35 @@ static void mtk_disp_dump_ovl(MtkDispState *s, const char *why)
                 }
             }
             fprintf(stderr,
-                    "MTK-DISP-DBG   L%d con=%#x size=%#x off=%#x pitch=%#x "
-                    "addr=%#x addr_ext=%#x%s\n",
-                    n, rd32(lb + 0x30), rd32(lb + 0x38), rd32(lb + 0x3c),
-                    rd32(lb + 0x44), addr,
-                    rd32(base + 0xf48 + 0x20 * n), pabuf);
+                    "MTK-DISP-DBG   L%d con=%#x size=%#x off=%#x "
+                    "pitch=%#x pitch_msb=%#x addr=%#" PRIx64
+                    " addr_msb=%#x%s\n",
+                    n, rd32(base + OVL_CON(n)), rd32(base + OVL_SRC_SIZE(n)),
+                    rd32(base + OVL_OFFSET(n)), rd32(base + OVL_PITCH(n)),
+                    rd32(base + OVL_PITCH_MSB(n)), addr,
+                    rd32(base + OVL_ADDR_MSB(n)), pabuf);
         }
+        for (n = 0; n < OVL_NUM_EXT_LAYERS; n++) {
+            uint64_t ea = (uint64_t)rd32(base + OVL_EL_ADDR(n)) |
+                          ((uint64_t)(rd32(base + OVL_EL_ADDR_MSB(n)) & 0xf)
+                           << 32);
+
+            if (!ea && !rd32(base + OVL_EL_CON(n))) {
+                continue;
+            }
+            fprintf(stderr,
+                    "MTK-DISP-DBG   EL%d con=%#x size=%#x off=%#x "
+                    "pitch=%#x addr=%#" PRIx64 " addr_msb=%#x\n",
+                    n, rd32(base + OVL_EL_CON(n)),
+                    rd32(base + OVL_EL_SRC_SIZE(n)),
+                    rd32(base + OVL_EL_OFFSET(n)),
+                    (rd32(base + OVL_EL_PITCH(n)) & 0xffff) |
+                        ((rd32(base + OVL_EL_PITCH_MSB(n)) & 0xf) << 16),
+                    ea, rd32(base + OVL_EL_ADDR_MSB(n)));
+        }
+        fprintf(stderr, "MTK-DISP-DBG   ovl%d en=%#x ext_con=%#x roi=%#x\n",
+                o, rd32(base + OVL_EN), rd32(base + OVL_DATAPATH_EXT_CON),
+                rd32(base + OVL_ROI_SIZE));
     }
 }
 
@@ -553,9 +603,11 @@ static void mtk_disp_tick(void *opaque)
                     mtk_disp_write_ppm(s, p);
                 }
                 fprintf(stderr,
-                        "MTK-DISP: frame %u t=%" PRId64 "ms crc=%08x %s -> %s (%s)\n",
+                        "MTK-DISP: frame %u t=%" PRId64 "ms guest=%.3fs "
+                        "crc=%08x %s -> %s (%s)\n",
                         s->dumps,
                         qemu_clock_get_ms(QEMU_CLOCK_REALTIME),
+                        qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) / 1e9,
                         crc, nonzero ? "non-zero" : "all-black",
                         s->dump_path, desc);
                 s->dumps++;

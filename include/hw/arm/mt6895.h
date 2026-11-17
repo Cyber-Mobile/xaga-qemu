@@ -986,6 +986,38 @@ struct Mt6895MachineState {
     MemoryRegion atfctx_mr;
     MemoryRegion atfflag_mr;
     MemoryRegion bl33flag_mr;
+    /* DISP mutex register block (0x14001000): EN/MUTEX/RST state machine so
+     * the vendor DRM driver's hardware mutex acquire (poll MUTEXn bit1) and
+     * release succeed instead of timing out. */
+    MemoryRegion disp_mutex[2];          /* disp0 @0x14001000, disp1 @0x14401000 */
+    uint32_t disp_mutex_regs[2][0x1000 / 4];
+    uint32_t disp_mutex_locked[2];       /* one bit per mutex id, per instance */
+    QEMUTimer *disp_vblank_timer;        /* MTK_DISP_VBLANK=1: fake frame EOF IRQ */
+    qemu_irq disp_mutex_irq[2];          /* GIC SPI 300 (disp0) / 344 (disp1) */
+    bool disp_mutex_irq_level[2];        /* line currently held high */
+    /* DSI0 (0x14017000): behavioural MIPI DSI controller.
+     *
+     * One register file (dsi_regs) holds INTEN/INTSTA/CON_CTRL/MODE_CTRL/...
+     * exactly as the guest writes it.  INTSTA latches status independently of
+     * INTEN; GIC SPI 323 is level-high while (INTSTA & INTEN) != 0.  While
+     * the controller streams (video mode, DSI_EN and START bit0) a frame
+     * timer latches FRAME_DONE once per frame and raises the GCE events
+     * disp_dsi0_eof (313) / disp_dsi0_sof0 (278). */
+    MemoryRegion dsi_mr;
+    uint32_t dsi_regs[0x1000 / 4];
+    qemu_irq dsi_irq;
+    bool dsi_irq_level;
+    QEMUTimer *dsi_frame_timer;  /* video-mode frame cadence (60 Hz default) */
+    bool dsi_streaming;          /* frame timer currently armed             */
+    bool dsi_cmdq_ready;         /* CMDQ words programmed since last START  */
+    uint64_t dsi_frame_count;    /* frames transmitted since reset          */
+    uint32_t dsi_irq_count;      /* SPI 323 line asserts                    */
+    /* Panel state, derived only from the DCS writes the guest queues. */
+    bool dsi_ulps_done;          /* PHY in ULPS (INTSTA bit15)              */
+    bool dsi_sleep_out;
+    bool dsi_display_on;
+    uint32_t dsi_rx[4];          /* DCS read response words (RX_DATA0..3)   */
+    DeviceState *gce;            /* main GCE: CMDQ event signalling         */
     MemoryRegion diagg_mr;
     QEMUTimer *dtb_timer;
     QEMUTimer *scan_timer;   /* write-protected fake console node     */
