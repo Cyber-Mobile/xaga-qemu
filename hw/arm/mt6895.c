@@ -10043,6 +10043,182 @@ static void mtk_usb_hostmode_init(Mt6895MachineState *s)
 }
 
 /*
+ * ===== USB gadget mode DT injection (env MTK_USB_GADGET=1) =====
+ *
+ * The vendor DT declares mtu3 as dual-role ("dr_mode = otg") with a
+ * "usb-role-switch"; without the typec/tcpc chain the driver ends up in
+ * host mode (or defers) and no UDC is registered, so recovery's adbd cannot
+ * bind.  For the kernel gadget path we rewrite the usb0 node's dr_mode
+ * string in the LK-produced FDT to "peripheral".  The new string does not
+ * fit in place (4 -> 11 bytes), so the structure block is grown by 8 bytes
+ * (12-byte aligned property slot), with totalsize / off_dt_strings /
+ * size_dt_struct patched accordingly.  The 4 MiB mb_dtb mblock leaves
+ * plenty of room.  Model-level only; firmware files are untouched.
+ *
+ * Knobs: MTK_USB_GADGET=1, MTK_GADGET_ADDR=<mb_dtb phys>, MTK_GADGET_MS=<poll>.
+ */
+static QEMUTimer *mtk_usb_gadget_timer;
+static int mtk_usb_gadget_state;
+static int64_t mtk_usb_gadget_period = 20;
+static int64_t mtk_usb_gadget_deadline;
+
+static int mtk_usbg_patch_fdt(uint8_t *fdt, uint32_t avail)
+{
+    uint32_t total = ldl_be_p(fdt + 4);
+    uint32_t off_struct = ldl_be_p(fdt + 8);
+    uint32_t off_strings = ldl_be_p(fdt + 12);
+    uint32_t size_struct = ldl_be_p(fdt + 36);
+    uint32_t end = off_struct + size_struct;
+    const char *node = "";
+    uint32_t i;
+
+    if (ldl_be_p(fdt) != 0xd00dfeed || total > avail || total < 0x100 ||
+        off_struct < 0x28 || off_struct >= total || end > total ||
+        off_strings >= total) {
+        return 0;
+    }
+
+    for (i = off_struct; i + 4 <= end; ) {
+        uint32_t tok = ldl_be_p(fdt + i);
+
+        if (tok == 1) {
+            const char *nm = (const char *)fdt + i + 4;
+            size_t len = strnlen(nm, end - (i + 4));
+
+            node = nm;
+            i = (i + 4 + (uint32_t)len + 1 + 3) & ~3u;
+        } else if (tok == 3) {
+            uint32_t len = ldl_be_p(fdt + i + 4);
+            uint32_t nameoff = ldl_be_p(fdt + i + 8);
+            const char *pn = mtk_usbhm_str(fdt, total, off_strings, nameoff);
+            uint32_t next = (i + 12 + len + 3) & ~3u;
+
+            if (pn && (!strncmp(node, "usb0@", 5) || !strcmp(node, "usb0")) &&
+                !strcmp(pn, "dr_mode") && len == 4) {
+                const char *v = (const char *)fdt + i + 12;
+                uint32_t delta = 8;         /* 4 -> 12 padded bytes */
+
+                if (!strcmp(v, "peripheral")) {
+                    return 2;               /* already patched */
+                }
+                if (strcmp(v, "otg") != 0) {
+                    return 0;               /* host/other: leave alone */
+                }
+                if (total + delta > avail) {
+                    return 0;
+                }
+                memmove(fdt + next + delta, fdt + next, total - next);
+                stl_be_p(fdt + 4, total + delta);
+                stl_be_p(fdt + 36, size_struct + delta);
+                if (off_strings >= next) {
+                    stl_be_p(fdt + 12, off_strings + delta);
+                }
+                stl_be_p(fdt + i + 4, 11);  /* sizeof("peripheral") */
+                memset(fdt + i + 12, 0, 12);
+                memcpy(fdt + i + 12, "peripheral", 11);
+                return 1;
+            }
+            i = next;
+        } else if (tok == 2 || tok == 4) {
+            i += 4;
+        } else if (tok == 9) {
+            break;
+        } else {
+            return 0;
+        }
+    }
+    return 0;
+}
+
+static void mtk_usb_gadget_tick(void *opaque)
+{
+    Mt6895MachineState *s = opaque;
+    const char *as = getenv("MTK_GADGET_ADDR");
+    const uint64_t win = 4 * MiB;
+    uint64_t phys = as ? strtoull(as, NULL, 0) : 0x47c80000ULL;
+    int64_t now = qemu_clock_get_ms(QEMU_CLOCK_REALTIME);
+    uint8_t *ram;
+    uint32_t off;
+
+    if (mtk_usb_gadget_state) {
+        return;
+    }
+    if (phys < MT6895_DRAM_BASE ||
+        phys - MT6895_DRAM_BASE > MACHINE(s)->ram_size - win) {
+        mtk_usb_gadget_state = 2;
+        fprintf(stderr, "mt6895: MTK_USB_GADGET: mb_dtb outside guest RAM\n");
+        return;
+    }
+    ram = memory_region_get_ram_ptr(s->ddr) + (phys - MT6895_DRAM_BASE);
+    for (off = 0; off + 0x40 <= win; off += 8) {
+        uint32_t total;
+
+        if (ldl_be_p(ram + off) != 0xd00dfeed) {
+            continue;
+        }
+        total = ldl_be_p(ram + off + 4);
+        if (total < 0x1000 || total > win - off) {
+            continue;
+        }
+        {
+            int r = mtk_usbg_patch_fdt(ram + off, win - off);
+
+            if (r == 1) {
+                if (mtk_usb_gadget_state == 0) {
+                    fprintf(stderr, "mt6895: MTK_USB_GADGET: usb0 dr_mode -> "
+                            "peripheral in FDT at %#" PRIx64 " (grown +8)\n",
+                            phys + off);
+                } else {
+                    fprintf(stderr, "mt6895: MTK_USB_GADGET: re-patched FDT at "
+                            "%#" PRIx64 "\n", phys + off);
+                }
+                mtk_usb_gadget_state = 1;
+            } else if (r == 2 && mtk_usb_gadget_state == 0) {
+                fprintf(stderr, "mt6895: MTK_USB_GADGET: usb0 dr_mode already "
+                        "peripheral\n");
+                mtk_usb_gadget_state = 1;
+            }
+        }
+    }
+    if (now > mtk_usb_gadget_deadline) {
+        if (mtk_usb_gadget_state == 0) {
+            mtk_usb_gadget_state = 2;
+            fprintf(stderr, "mt6895: MTK_USB_GADGET: gave up\n");
+        }
+        return;
+    }
+    /* Keep watching for a while: LK may rewrite the final FDT after our first
+     * successful patch, and a later copy must be patched as well. */
+    timer_mod(mtk_usb_gadget_timer,
+              now + (mtk_usb_gadget_state ? 100 : mtk_usb_gadget_period));
+}
+
+static void mtk_usb_gadget_init(Mt6895MachineState *s)
+{
+    const char *e = getenv("MTK_USB_GADGET");
+    const char *ms = getenv("MTK_GADGET_MS");
+
+    if (!e || !*e || !strcmp(e, "0")) {
+        return;
+    }
+    if (ms) {
+        mtk_usb_gadget_period = strtoll(ms, NULL, 0);
+        if (mtk_usb_gadget_period < 2) {
+            mtk_usb_gadget_period = 2;
+        }
+        if (mtk_usb_gadget_period > 1000) {
+            mtk_usb_gadget_period = 1000;
+        }
+    }
+    mtk_usb_gadget_deadline = qemu_clock_get_ms(QEMU_CLOCK_REALTIME) + 180000;
+    mtk_usb_gadget_timer = timer_new_ms(QEMU_CLOCK_REALTIME,
+                                        mtk_usb_gadget_tick, s);
+    timer_mod(mtk_usb_gadget_timer,
+              qemu_clock_get_ms(QEMU_CLOCK_REALTIME) + 100);
+    fprintf(stderr, "mt6895: MTK_USB_GADGET: watching mb_dtb for usb0 dr_mode\n");
+}
+
+/*
  * ===== DMA-address mode: strip the display/cmdq "iommus" properties =====
  *
  * (env MTK_DT_NOIOMMU=1)
@@ -10742,6 +10918,7 @@ static void mt6895_create_syscons(Mt6895MachineState *s, Error **errp)
                                         &s->peri_fill_mr, -1);
 
     mtk_usb_hostmode_init(s);
+    mtk_usb_gadget_init(s);
     mtk_dtnoiommu_init(s);
     mtk_cmdline_init(s);
     mtk_smpdbg_init(s);
@@ -10779,8 +10956,10 @@ static void mt6895_create_syscons(Mt6895MachineState *s, Error **errp)
      */
     {
         const char *ud = getenv("MTK_USBDEV");
+        const char *gd = getenv("MTK_USB_GADGET");
+        bool gadget_mode = gd && *gd && strcmp(gd, "0") != 0;
 
-        if (ud && *ud && strcmp(ud, "0") != 0) {
+        if (gadget_mode || (ud && *ud && strcmp(ud, "0") != 0)) {
             Chardev *chr = NULL;
             const char *cid = getenv("MTK_USBDEV_CHR");
 
@@ -10812,7 +10991,8 @@ static void mt6895_create_syscons(Mt6895MachineState *s, Error **errp)
                     sysbus_mmio_get_region(SYS_BUS_DEVICE(udev), 0), 2);
                 {
                     const char *ie = getenv("MTK_USBDEV_IRQ");
-                    unsigned usb_irq = (ie && *ie) ? strtoul(ie, NULL, 0) : 128;
+                    unsigned usb_irq = (ie && *ie) ? strtoul(ie, NULL, 0) :
+                                       (gadget_mode ? 179 : 128);
 
                     sysbus_connect_irq(SYS_BUS_DEVICE(udev), 0,
                                        qdev_get_gpio_in(s->gic, usb_irq));

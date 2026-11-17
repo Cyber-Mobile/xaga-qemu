@@ -88,6 +88,17 @@ OBJECT_DECLARE_SIMPLE_TYPE(MtkUsbDevState, MTK_USBDEV)
 /* EPCTL CSR (base 0x11201800) -> offset 0x0800 */
 #define R_DEVICE_CONF          0x0800
 #define R_EP_RST               0x0804
+/* Capability registers (read-only).  FIFO sizes are in units of
+ * MTU3_EP_FIFO_UNIT (512 B); EPINFO packs the TX/RX non-EP0 endpoint counts
+ * as CAP_TX_EP_NUM = bits[4:0], CAP_RX_EP_NUM = bits[12:8].  LK fastboot and
+ * the kernel gadget share one FIFO layout: 64 B fixed for EP0 plus a modeled
+ * non-EP0 FIFO split evenly between TX and RX. */
+#define R_CAP_EP0FFSZ          0x0c04
+#define R_CAP_EPNTXFFSZ        0x0c08
+#define R_CAP_EPNRXFFSZ        0x0c0c
+#define R_CAP_EPINFO           0x0c10
+#define MTK_USBDEV_EP_PAIRS    7        /* non-EP0 IN/OUT endpoint pairs */
+#define MTK_USBDEV_EP_FIFO_SZ  0x2000   /* total non-EP0 FIFO, 4 KiB per direction */
 #define R_DEV_LINK_INTR_EN     0x0850
 #define R_DEV_LINK_INTR        0x0854
 /* USB2 CSR (base 0x11203400) -> offset 0x2400 */
@@ -111,7 +122,7 @@ OBJECT_DECLARE_SIMPLE_TYPE(MtkUsbDevState, MTK_USBDEV)
 #define EP0CSR_DATAEND         (1u << 19)
 #define EP0CSR_SENTSTALL       (1u << 22)
 #define EP0CSR_SENDSTALL       (1u << 25)
-#define PM_SOFT_CONN           (1u << 0)
+#define PM_SOFT_CONN           (1u << 6)   /* U3D_POWER_MANAGEMENT.SOFT_CONN */
 #define COMMON_INTR_RESET      (1u << 2)
 #define COMMON_INTR_SUSPEND    (1u << 0)
 #define COMMON_INTR_RESUME     (1u << 1)
@@ -165,6 +176,8 @@ struct MtkUsbDevState {
     uint64_t rx_wait_since_ms;
     uint32_t rx_armed_addr;
     uint64_t rx_armed_ms;
+    uint64_t start_ms;
+    uint32_t soft_conn_min_ms;
     bool connected;
     bool soft_conn_applied;
     uint32_t gpd_stride;
@@ -710,6 +723,16 @@ static uint64_t usbdev_read(void *opaque, hwaddr off, unsigned size)
     case R_DEV_LINK_INTR_EN:
         val = s->dev_link_intr_en;
         break;
+    case R_CAP_EP0FFSZ:
+        val = 64;                       /* EP0 FIFO is fixed at 64 B */
+        break;
+    case R_CAP_EPNTXFFSZ:
+    case R_CAP_EPNRXFFSZ:
+        val = MTK_USBDEV_EP_FIFO_SZ;
+        break;
+    case R_CAP_EPINFO:
+        val = ((uint32_t)MTK_USBDEV_EP_PAIRS << 8) | MTK_USBDEV_EP_PAIRS;
+        break;
     default:
         val = s->regs[idx];
         break;
@@ -809,7 +832,9 @@ static void usbdev_write(void *opaque, hwaddr off, uint64_t value,
             }
             if (v & EP0CSR_DATAEND) {
                 csr &= ~(EP0CSR_RXPKTRDY | EP0CSR_SETUPPKTRDY);
-                s->ep_isr |= EP0_ISR;
+                /* LK completes on EP0ISR; the kernel gadget driver also needs
+                 * SETUPENDISR to move its ep0 state machine back to SETUP. */
+                s->ep_isr |= EP0_ISR | EP0_SETUP_ISR;
                 s->ep0_in_flight = false;
                 if (s->setup_pending) {
                     s->setup_pending = false;
@@ -845,6 +870,11 @@ static void usbdev_write(void *opaque, hwaddr off, uint64_t value,
     case R_POWER_MGMT:
         s->regs[idx] = v;
         if ((v & PM_SOFT_CONN) && !s->soft_conn_applied) {
+            if (s->soft_conn_min_ms &&
+                qemu_clock_get_ms(QEMU_CLOCK_REALTIME) - s->start_ms <
+                    s->soft_conn_min_ms) {
+                return;
+            }
             s->soft_conn_applied = true;
             usbdev_log(s, "SOFT_CONN");
         } else if (!(v & PM_SOFT_CONN) && s->soft_conn_applied) {
@@ -1001,6 +1031,12 @@ static void usbdev_realize(DeviceState *dev, Error **errp)
     }
     s->rxq = g_byte_array_new();
     s->rxraw = g_byte_array_new();
+    s->start_ms = qemu_clock_get_ms(QEMU_CLOCK_REALTIME);
+    {
+        const char *m = getenv("MTK_USBDEV_SOFT_CONN_MIN_MS");
+
+        s->soft_conn_min_ms = (m && *m) ? (uint32_t)strtoul(m, NULL, 0) : 0;
+    }
     s->rx_timer = timer_new_ms(QEMU_CLOCK_REALTIME, usbdev_rx_timer, s);
     s->have_chr = qemu_chr_fe_backend_connected(&s->chr_be);
     if (s->have_chr) {
