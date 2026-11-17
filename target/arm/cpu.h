@@ -237,6 +237,20 @@ typedef enum {
     HALT_WFE
 } ARMHaltReason;
 
+/*
+ * MT6895 (EXPERIMENT): the preloader reads/writes RMR from AArch32 EL1 and
+ * expects the reset request to hand over to the AArch64 BL2_EXT image.  The
+ * machine model exposes the state through these globals.
+ */
+extern uint32_t arm_mt6895_rmr_value;
+extern bool arm_mt6895_warm_reset;
+/*
+ * RMR.RR only requests the warm reset; it is taken when the core next executes
+ * WFI (HELPER(wfi)), with r0..r3 at that moment kept for the AArch64 entry.
+ */
+extern bool arm_mt6895_rmr_pending;
+extern uint64_t arm_mt6895_rmr_regs[4];
+
 typedef struct CPUArchState {
     /* Regs for current mode.  */
     uint32_t regs[16];

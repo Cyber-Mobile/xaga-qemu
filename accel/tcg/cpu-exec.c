@@ -18,6 +18,25 @@
  */
 
 #include "qemu/osdep.h"
+/* MTK_PC_HIST ring buffer (see the dump in hw/char/mtk_uart.c). */
+#define MTK_PC_HIST_LEN 96
+uint64_t mtk_pc_hist[MTK_PC_HIST_LEN];
+unsigned mtk_pc_hist_idx;
+static int mtk_pc_hist_on = -1;
+
+/*
+ * MTK_PCHIT: count how many times specific guest PCs are reached.  Set up by
+ * hw/arm/mt6895.c from the MTK_PCHIT env var and dumped by a machine timer,
+ * so "does this firmware function ever run" can be answered without the
+ * enormous overhead of -d exec logging.
+ */
+#define MTK_PCHIT_MAX 8
+unsigned long long mtk_pchit_cnt[MTK_PCHIT_MAX];
+uint64_t mtk_pchit_tgt[MTK_PCHIT_MAX];
+unsigned mtk_pchit_n;
+static int mtk_pchit_on = -1;
+static int mtk_pchit_seen;
+
 #include "qemu/qemu-print.h"
 #include "qapi/error.h"
 #include "qapi/type-helpers.h"
@@ -889,6 +908,38 @@ static inline void cpu_loop_exec_tb(CPUState *cpu, TranslationBlock *tb,
                                     int *tb_exit)
 {
     trace_exec_tb(tb, pc);
+
+    /*
+     * MTK telemetry lives here, not in cpu_exec_step_atomic(): with -icount
+     * the machine runs through cpu_loop_exec_tb(), so probes placed in the
+     * single-step path never fire (this is why MTK_PC_HIST looked dead).
+     */
+    if (mtk_pc_hist_on < 0) {
+        mtk_pc_hist_on = getenv("MTK_PC_HIST") != NULL;
+    }
+    if (mtk_pc_hist_on) {
+        mtk_pc_hist[mtk_pc_hist_idx % MTK_PC_HIST_LEN] = pc;
+        mtk_pc_hist_idx++;
+    }
+    if (mtk_pchit_on < 0) {
+        mtk_pchit_on = getenv("MTK_PCHIT") != NULL;
+    }
+    if (mtk_pchit_on) {
+        unsigned hi;
+
+        if (!mtk_pchit_seen) {
+            mtk_pchit_seen = 1;
+            fprintf(stderr, "MTK-PCHIT hook active (first tb pc=%#" PRIx64
+                    ", targets=%u)\n", (uint64_t)pc, mtk_pchit_n);
+        }
+        for (hi = 0; hi < mtk_pchit_n && hi < MTK_PCHIT_MAX; hi++) {
+            /* AArch32 TB entry addresses carry bit0 (Thumb state). */
+            if (((uint64_t)pc & ~1ULL) == (mtk_pchit_tgt[hi] & ~1ULL)) {
+                mtk_pchit_cnt[hi]++;
+            }
+        }
+    }
+
     tb = cpu_tb_exec(cpu, tb, tb_exit);
     if (*tb_exit != TB_EXIT_REQUESTED) {
         *last_tb = tb;

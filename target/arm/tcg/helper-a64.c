@@ -28,6 +28,14 @@
 #include "qemu/main-loop.h"
 #include "qemu/bitops.h"
 #include "internals.h"
+
+/*
+ * Provided by the mt6895 machine model: BL31's parameter block, and the flag
+ * that marks the BL33 (LK) handover so the UFS model switches block size.
+ */
+extern uint64_t mtk_bl_params_ptr;
+extern bool mtk_ufs_lk_stage;
+extern bool mtk_gz_skip_active;
 #include "qemu/crc32c.h"
 #include "exec/cpu-common.h"
 #include "accel/tcg/cpu-ldst.h"
@@ -623,11 +631,192 @@ static int el_from_spsr(uint32_t spsr)
 void HELPER(exception_return)(CPUARMState *env, uint64_t new_pc)
 {
     ARMCPU *cpu = env_archcpu(env);
+
+    /*
+     * MT6895 machine model: BL31 is entered from a warm reset without the
+     * bl_params image list BL2 would normally pass (ATF logs "atfarg is
+     * NULL!"), so at hand-off time it has no BL33 entry point and ends up
+     * ereting to address 0 -- which lands in the AArch32 BootROM stub and
+     * kills the chain. Redirect that single case to the LK entry point.
+     * The machine also substitutes a zero write to ELR_EL3, but this path
+     * catches the return itself, which is what actually executes.
+     */
+    if (arm_current_el(env) >= 2) {
+        static int logged;
+        int el = arm_current_el(env);
+
+        if (logged < 40) {
+            logged++;
+            fprintf(stderr, "MT6895-ERET#%d el%d pc=%#" PRIx64 " spsr=%#x"
+                    " x0=%#" PRIx64 " x1=%#" PRIx64 " x2=%#" PRIx64
+                    " x3=%#" PRIx64 "\n",
+                    logged, el, (uint64_t)new_pc,
+                    (unsigned)env->banked_spsr[aarch64_banked_spsr_index(el)],
+                    env->xregs[0], env->xregs[1], env->xregs[2],
+                    env->xregs[3]);
+        }
+    }
+    if (new_pc == 0 && arm_current_el(env) == 3) {
+        new_pc = 0x50f00000ULL;
+    }
+    /*
+     * MTK_GZ_SKIP=1: the gz_a payload is ciphertext in DRAM , so ATF's BL33 entry into GenieZone at the VMID1
+     * remap address would run garbage.  Stand-in: send that one hand-off to
+     * LK instead, through the EL3 -> LK fix-up below.  Off by default.
+     */
+    if (new_pc == 0x87f800000ULL && arm_current_el(env) == 3 &&
+        getenv("MTK_GZ_SKIP")) {
+        static int gz_logged;
+
+        if (!gz_logged) {
+            gz_logged = 1;
+            fprintf(stderr, "MT6895-ERET: MTK_GZ_SKIP -- GZ entry %#" PRIx64
+                    " redirected to LK 0x50f00000\n", (uint64_t)new_pc);
+        }
+        mtk_gz_skip_active = true;
+        new_pc = 0x50f00000ULL;
+    }
     int cur_el = arm_current_el(env);
     unsigned int spsr_idx = aarch64_banked_spsr_index(cur_el);
     uint64_t spsr = env->banked_spsr[spsr_idx];
     int new_el;
     bool return_to_aa64 = (spsr & PSTATE_nRW) == 0;
+
+    /*
+     * The MT6895 model hands BL31 a synthetic next-image descriptor, and the
+     * SPSR it derives for the hand-off comes out as AArch32 SVC (0x1d3).
+     * BL33 (LK) is an AArch64 image that expects EL1h with DAIF masked, so
+     * fix the state up for exactly that entry point.
+     */
+    if (new_pc == 0x50f00000ULL && cur_el != 3) {
+        /*
+         * GenieZone (EL2) entering LK: a real hand-off with GZ's own SPSR,
+         * EL1 state and boot arguments in x0..x3.  Only note the stage.
+         */
+        mtk_ufs_lk_stage = true;
+    } else if (new_pc == 0x50f00000ULL) {
+        static int logged;
+
+        if (logged < 2) {
+            logged++;
+            fprintf(stderr, "MT6895-ERET: forcing SPSR 0x%x -> 0x3c5 for "
+                    "LK hand-off\n", (unsigned)spsr);
+        }
+        spsr = getenv("MTK_LK_DAIF_OPEN") ? 0x305ULL : 0x3c5ULL;
+        return_to_aa64 = true;
+        env->banked_spsr[spsr_idx] = spsr;
+
+        /*
+         * BL33 is entered with the EL1 MMU off (TF-A turns it off before the
+         * hand-off). This model's BL31 has no real EL1 context to restore, so
+         * make that explicit: otherwise LK's very first instruction fetch is
+         * translated with BL31's tables and aborts.
+         */
+        env->cp15.sctlr_el[1] &= ~1ULL;
+        env->cp15.ttbr0_el[1] = 0;
+        env->cp15.ttbr1_el[1] = 0;
+
+        /*
+         * SCR_EL3.RW selects the register width of the lower EL. It is 0
+         * here (EL1 configured as AArch32), so returning to BL33 in AArch64
+         * fails the "new_el width matches return_to_aa64" check and QEMU
+         * takes the illegal-exception-return path -- which is what the
+         * MTK-EXC trace showed as a fetch at 0x50f00000 with cur_el still 3.
+         * BL33 is an AArch64 image, so set RW=1.
+         */
+        env->cp15.scr_el3 |= (1ULL << 10);
+        /*
+         * SCR_EL3.NS selects the security state of the lower EL. MediaTek's
+         * modern LK (v2.0) runs in S-EL1 -- Secure EL1 -- on ARMv8, not in
+         * the normal world (see the public reverse-engineering notes on MTK
+         * bootloaders, and its load address 0xffff000050f00000). Keep NS=0
+         * so BL33 is entered secure; BL31's SiP dispatcher then takes its
+         * secure path, which is where the LK crypto/SiP services live.
+         */
+        /*
+         * MediaTek's modern LK (v2.0) runs in S-EL1 -- Secure EL1 -- on
+         * ARMv8 devices (public MTK bootloader reverse-engineering notes).
+         * The faithful S-EL1 hand-off is available with MTK_LK_SEL1=1; it is
+         * not the default yet because QEMU's GIC does not re-latch the
+         * level-triggered UFS completion for the secure SPI (see
+         * earlier bring-up notes), which stalls LK's UFS init. The normal-world
+         * hand-off keeps the boot chain moving.
+         */
+        if (getenv("MTK_LK_SEL1")) {
+            env->cp15.scr_el3 &= ~1ULL;   /* S-EL1 (real device) */
+        } else {
+            env->cp15.scr_el3 |= 1ULL;    /* NS EL1 (working path) */
+        }
+
+        /*
+         * BL33 (LK) is entered with x0 = boot tag pointer. BL31 would
+         * normally pass the bl_params/boot-tag it received; this model has no
+         * such list, so LK was parsing whatever x0 happened to hold, which is
+         * why "lk_main_dtb image name found" was followed by
+         * "Error load main dtb (-19)". Point it at the boot tag the preloader
+         * built in the pl-boottag mblock.
+         */
+        /*
+         * BL33 receives the device tree pointer in x0. The machine's data
+         * window maps the image at 0x80000000, so the lk_main_dtb component
+         * (image offset 0x37B656B0) appears at 0xB7B656B0.
+         */
+        /*
+         * BL2 already loaded and overlaid the device tree ("after overlay,
+         * fdt size(408549)") at 0x630f8020, but LK re-does the lookup and
+         * fails with -19. Hand LK the DTB BL2 prepared.
+         */
+        /*
+         * Reproduce BL31's el3_exit(): walk the bl_params BL2 handed to BL31
+         * and load BL33's entry_point_info from it. On hardware this is what
+         * delivers the device tree pointer (args[0]) to LK; without it LK's
+         * fdt stays NULL.
+         */
+        {
+            env->xregs[0] = 0;
+            if (mtk_bl_params_ptr) {
+                uint32_t bp_type = cpu_ldl_data_ra(env, mtk_bl_params_ptr, 0);
+                uint32_t bp_size = cpu_ldl_data_ra(env, mtk_bl_params_ptr + 8, 0);
+                uint64_t node = 0;
+
+                if (bp_type >= 1 && bp_type <= 8 &&
+                    bp_size >= 24 && bp_size <= 0x1000) {
+                    node = cpu_ldq_data_ra(env, mtk_bl_params_ptr + 16, 0);
+                }
+
+                while (node) {
+                    uint64_t ep = cpu_ldq_data_ra(env, node + 8, 0);
+
+                    if (ep) {
+                        uint64_t pc = cpu_ldq_data_ra(env, ep + 16, 0);
+                        uint32_t espsr = cpu_ldl_data_ra(env, ep + 24, 0);
+                        uint64_t a0 = cpu_ldq_data_ra(env, ep + 32, 0);
+
+                        fprintf(stderr, "MTK-BLP: node=%#" PRIx64
+                                " ep=%#" PRIx64 " pc=%#" PRIx64
+                                " spsr=%#x args0=%#" PRIx64 "\n",
+                                node, ep, pc, espsr, a0);
+                        if (pc >= 0x50f00000ULL && pc < 0x51000000ULL) {
+                            new_pc = pc;
+                            spsr = espsr;
+                            return_to_aa64 = true;
+                            env->banked_spsr[spsr_idx] = spsr;
+                            env->xregs[0] = a0;
+                            env->xregs[1] = cpu_ldq_data_ra(env, ep + 40, 0);
+                            env->xregs[2] = cpu_ldq_data_ra(env, ep + 48, 0);
+                            env->xregs[3] = cpu_ldq_data_ra(env, ep + 56, 0);
+                            break;
+                        }
+                    }
+                    node = cpu_ldq_data_ra(env, node + 16, 0);
+                }
+            }
+        }
+        /* From here on the UFS device is read by BL33 (LK). */
+        {
+            mtk_ufs_lk_stage = true;
+        }
+    }
 
     aarch64_save_sp(env, cur_el);
 
@@ -645,6 +834,11 @@ void HELPER(exception_return)(CPUARMState *env, uint64_t new_pc)
     }
 
     new_el = el_from_spsr(spsr);
+    if (new_pc == 0x50f00000ULL) {
+        fprintf(stderr, "MT6895-ERET: handoff spsr=%#x -> new_el=%d cur_el=%d"
+                " scr_el3=%#" PRIx64 "\n",
+                (unsigned)spsr, new_el, cur_el, env->cp15.scr_el3);
+    }
     if (new_el == -1) {
         goto illegal_return;
     }

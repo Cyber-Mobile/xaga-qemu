@@ -25,6 +25,7 @@
 #include "exec/icount.h"
 #include "system/kvm.h"
 #include "system/tcg.h"
+#include "system/runstate.h"
 #include "qapi/error.h"
 #include "qemu/guest-random.h"
 #ifdef CONFIG_TCG
@@ -35,6 +36,221 @@
 #include "cpregs.h"
 #include "target/arm/gtimer.h"
 #include "qemu/plugin.h"
+
+/*
+ * MT6895 (EXPERIMENT): RMR access from AArch32 EL1.  The preloader writes
+ * RMR.AA64 then RMR.RR to request a warm reset into the AArch64 BL2_EXT.
+ */
+uint32_t arm_mt6895_rmr_value;
+bool arm_mt6895_warm_reset;
+bool arm_mt6895_rmr_pending;
+uint64_t arm_mt6895_rmr_regs[4];
+
+static uint64_t mtk_rmr_read(CPUARMState *env, const ARMCPRegInfo *ri)
+{
+    return arm_mt6895_rmr_value;
+}
+
+static void mtk_rmr_write(CPUARMState *env, const ARMCPRegInfo *ri,
+                          uint64_t value)
+{
+    arm_mt6895_rmr_value = value;
+    fprintf(stderr, "MT6895-DBG rmr write value=%#" PRIx64 "\n", value);
+    if (value & 2) {
+        /*
+         * RMR.RR requests a warm reset; the core takes it once it is
+         * quiescent.  The preloader's jumparch64 relies on that: after
+         * setting RR it moves the hand-off arguments back into r0/r1 and
+         * only then executes WFI, and the AArch64 image (BL2_EXT) reads them
+         * from x0/x1 because a warm reset does not clear the register file.
+         * Taking the reset right here, at the MCR, would drop them, so the
+         * request is parked and taken in HELPER(wfi).
+         */
+        arm_mt6895_rmr_pending = true;
+        fprintf(stderr, "MT6895-DBG rmr warm reset requested (taken at WFI)\n");
+    }
+}
+
+/*
+ * MT6895 (EXPERIMENT): implementation-defined AArch64 registers the ATF
+ * BL2_EXT reads/writes.  S3_0_C15_C3_5 looks like a control word and
+ * S3_0_C15_C3_7 a handshake status: BL2 sets bits[7:4] in the control and
+ * then polls the status until the same bits read back as ones.
+ */
+static uint32_t mtk_imp_ctrl;
+static uint32_t mtk_imp_sta;
+
+static uint64_t mtk_imp_ctrl_read(CPUARMState *env, const ARMCPRegInfo *ri)
+{
+    return mtk_imp_ctrl;
+}
+
+static void mtk_imp_ctrl_write(CPUARMState *env, const ARMCPRegInfo *ri,
+                               uint64_t value)
+{
+    mtk_imp_ctrl = value;
+}
+
+static uint64_t mtk_imp_sta_read(CPUARMState *env, const ARMCPRegInfo *ri)
+{
+    return mtk_imp_sta | 0xf0;
+}
+
+static void mtk_imp_sta_write(CPUARMState *env, const ARMCPRegInfo *ri,
+                              uint64_t value)
+{
+    mtk_imp_sta = value;
+}
+
+static const ARMCPRegInfo mtk_imp_cp_reginfo[] = {
+    { .name = "MTK_IMP_CTRL", .state = ARM_CP_STATE_AA64,
+      .opc0 = 3, .opc1 = 0, .crn = 15, .crm = 3, .opc2 = 5,
+      .access = PL1_RW, .type = ARM_CP_IO,
+      .readfn = mtk_imp_ctrl_read, .writefn = mtk_imp_ctrl_write },
+    { .name = "MTK_IMP_STA", .state = ARM_CP_STATE_AA64,
+      .opc0 = 3, .opc1 = 0, .crn = 15, .crm = 3, .opc2 = 7,
+      .access = PL1_RW, .type = ARM_CP_IO,
+      .readfn = mtk_imp_sta_read, .writefn = mtk_imp_sta_write },
+};
+
+/*
+ * ARMv8.2-RAS error-record registers, modelled as flat storage.
+ *
+ * The MTK ATF's platform init programs these (0x48205030: msr errselr_el1;
+ * 0x48205038: mrs erxctlr_el1; ... and 0x48205638: msr erxstatus_el1).
+ * Real Cortex-A55/A78 implement RAS, but this QEMU has no RAS support at
+ * all, so the first MSR was undefined and ATF took an "Unhandled Exception
+ * in EL3" (esr_el3=0x02000000, elr_el3=0x48205034) and spun in its panic
+ * loop -- which is what blocked the whole boot chain after BL32.
+ *
+ * There is no error-record hardware behind them here, so they are plain
+ * read/write storage: enough for the firmware's init to complete and for
+ * its "is RAS present" probe to see a coherent register file.
+ */
+static uint64_t mtk_ras_store[12];
+
+static unsigned mtk_ras_index(const ARMCPRegInfo *ri)
+{
+    if (ri->crn == 5 && ri->crm == 4) {
+        return ri->opc2;                    /* ERXFR..ERXADDR */
+    }
+    if (ri->crn == 5 && ri->crm == 3) {
+        return 4;                           /* ERRSELR */
+    }
+    if (ri->crn == 5 && ri->crm == 5) {
+        return 5 + ri->opc2;                /* ERXMISC0..3 */
+    }
+    if (ri->crn == 15 && ri->crm == 1) {
+        return 10;                          /* MTK s3_0_c15_c1_4 */
+    }
+    if (ri->crn == 15 && ri->crm == 2) {
+        return 11;                          /* MTK s3_0_c15_c2_7 */
+    }
+    return 9;                               /* DISR */
+}
+
+/*
+ * Hand-off hook for the MT6895 machine model.
+ *
+ * This machine enters BL31 from a warm reset without the bl_params image
+ * list that BL2 would normally pass (ATF logs "atfarg is NULL!"), so when
+ * BL31 prepares the next image it has no BL33 entry point and ends up
+ * ereting to address 0. Substitute the LK entry point for that zero write so
+ * the chain continues into BL33 instead of dying at PC=0.
+ */
+static bool mt6895_elr3_seen_nonzero;
+
+static uint64_t mt6895_elr3_read(CPUARMState *env, const ARMCPRegInfo *ri)
+{
+    return env->elr_el[3];
+}
+
+static void mt6895_elr3_write(CPUARMState *env, const ARMCPRegInfo *ri,
+                              uint64_t value)
+{
+    if (value) {
+        mt6895_elr3_seen_nonzero = true;
+    } else if (mt6895_elr3_seen_nonzero) {
+        fprintf(stderr, "MT6895-ELR3: replacing hand-off target 0 with "
+                "LK entry 0x50f00000\n");
+        value = 0x50f00000ULL;
+    }
+    env->elr_el[3] = value;
+}
+
+static uint64_t mtk_ras_read(CPUARMState *env, const ARMCPRegInfo *ri)
+{
+    return mtk_ras_store[mtk_ras_index(ri)];
+}
+
+static void mtk_ras_write(CPUARMState *env, const ARMCPRegInfo *ri,
+                          uint64_t value)
+{
+    mtk_ras_store[mtk_ras_index(ri)] = value;
+}
+
+static const ARMCPRegInfo mtk_ras_cp_reginfo[] = {
+    { .name = "ERXFR_EL1", .state = ARM_CP_STATE_AA64,
+      .opc0 = 3, .opc1 = 0, .crn = 5, .crm = 4, .opc2 = 0,
+      .access = PL1_RW, .type = ARM_CP_IO | ARM_CP_OVERRIDE,
+      .readfn = mtk_ras_read, .writefn = mtk_ras_write },
+    { .name = "ERXCTLR_EL1", .state = ARM_CP_STATE_AA64,
+      .opc0 = 3, .opc1 = 0, .crn = 5, .crm = 4, .opc2 = 1,
+      .access = PL1_RW, .type = ARM_CP_IO | ARM_CP_OVERRIDE,
+      .readfn = mtk_ras_read, .writefn = mtk_ras_write },
+    { .name = "ERXSTATUS_EL1", .state = ARM_CP_STATE_AA64,
+      .opc0 = 3, .opc1 = 0, .crn = 5, .crm = 4, .opc2 = 2,
+      .access = PL1_RW, .type = ARM_CP_IO | ARM_CP_OVERRIDE,
+      .readfn = mtk_ras_read, .writefn = mtk_ras_write },
+    { .name = "ERXADDR_EL1", .state = ARM_CP_STATE_AA64,
+      .opc0 = 3, .opc1 = 0, .crn = 5, .crm = 4, .opc2 = 3,
+      .access = PL1_RW, .type = ARM_CP_IO | ARM_CP_OVERRIDE,
+      .readfn = mtk_ras_read, .writefn = mtk_ras_write },
+    { .name = "ERRSELR_EL1", .state = ARM_CP_STATE_AA64,
+      .opc0 = 3, .opc1 = 0, .crn = 5, .crm = 3, .opc2 = 1,
+      .access = PL1_RW, .type = ARM_CP_IO | ARM_CP_OVERRIDE,
+      .readfn = mtk_ras_read, .writefn = mtk_ras_write },
+    { .name = "ERXMISC0_EL1", .state = ARM_CP_STATE_AA64,
+      .opc0 = 3, .opc1 = 0, .crn = 5, .crm = 5, .opc2 = 0,
+      .access = PL1_RW, .type = ARM_CP_IO | ARM_CP_OVERRIDE,
+      .readfn = mtk_ras_read, .writefn = mtk_ras_write },
+    { .name = "ERXMISC1_EL1", .state = ARM_CP_STATE_AA64,
+      .opc0 = 3, .opc1 = 0, .crn = 5, .crm = 5, .opc2 = 1,
+      .access = PL1_RW, .type = ARM_CP_IO | ARM_CP_OVERRIDE,
+      .readfn = mtk_ras_read, .writefn = mtk_ras_write },
+    { .name = "ERXMISC2_EL1", .state = ARM_CP_STATE_AA64,
+      .opc0 = 3, .opc1 = 0, .crn = 5, .crm = 5, .opc2 = 2,
+      .access = PL1_RW, .type = ARM_CP_IO | ARM_CP_OVERRIDE,
+      .readfn = mtk_ras_read, .writefn = mtk_ras_write },
+    { .name = "ERXMISC3_EL1", .state = ARM_CP_STATE_AA64,
+      .opc0 = 3, .opc1 = 0, .crn = 5, .crm = 5, .opc2 = 3,
+      .access = PL1_RW, .type = ARM_CP_IO | ARM_CP_OVERRIDE,
+      .readfn = mtk_ras_read, .writefn = mtk_ras_write },
+    { .name = "DISR_EL1", .state = ARM_CP_STATE_AA64,
+      .opc0 = 3, .opc1 = 0, .crn = 12, .crm = 1, .opc2 = 1,
+      .access = PL1_RW, .type = ARM_CP_IO | ARM_CP_OVERRIDE,
+      .readfn = mtk_ras_read, .writefn = mtk_ras_write },
+    /*
+     * MediaTek implementation-defined sysregs the ATF touches while bringing
+     * the console driver up (0x48204fa4: mrs s3_0_c15_c1_4; 0x48204f8c:
+     * mrs/msr s3_0_c15_c2_7). Undefined in a generic CPU model, so the MRS
+     * raised "Unknown reason" (EC=0) and panicked ATF before its console
+     * handlers were registered -- which then left putc walking a garbage
+     * list and taking data aborts at 0x482057ec.
+     */
+    { .name = "ELR_EL3_MTK", .state = ARM_CP_STATE_AA64,
+      .opc0 = 3, .opc1 = 6, .crn = 4, .crm = 0, .opc2 = 1,
+      .access = PL3_RW, .type = ARM_CP_IO | ARM_CP_OVERRIDE,
+      .readfn = mt6895_elr3_read, .writefn = mt6895_elr3_write },
+    { .name = "MTK_S3_0_C15_C1_4", .state = ARM_CP_STATE_AA64,
+      .opc0 = 3, .opc1 = 0, .crn = 15, .crm = 1, .opc2 = 4,
+      .access = PL1_RW, .type = ARM_CP_IO | ARM_CP_OVERRIDE,
+      .readfn = mtk_ras_read, .writefn = mtk_ras_write },
+    { .name = "MTK_S3_0_C15_C2_7", .state = ARM_CP_STATE_AA64,
+      .opc0 = 3, .opc1 = 0, .crn = 15, .crm = 2, .opc2 = 7,
+      .access = PL1_RW, .type = ARM_CP_IO | ARM_CP_OVERRIDE,
+      .readfn = mtk_ras_read, .writefn = mtk_ras_write },
+};
 
 static void switch_mode(CPUARMState *env, int mode);
 #ifndef CONFIG_USER_ONLY
@@ -6343,6 +6559,7 @@ void register_cp_regs_for_features(ARMCPU *cpu)
     }
 
     define_arm_cp_regs(cpu, cp_reginfo);
+    define_arm_cp_regs(cpu, mtk_ras_cp_reginfo);
     if (!arm_feature(env, ARM_FEATURE_V8)) {
         /*
          * Must go early as it is full of wildcards that may be
@@ -6907,6 +7124,7 @@ void register_cp_regs_for_features(ARMCPU *cpu)
         }
         define_arm_cp_regs(cpu, v8_idregs);
         define_arm_cp_regs(cpu, v8_cp_reginfo);
+        define_arm_cp_regs(cpu, mtk_imp_cp_reginfo);
         if (cpu_isar_feature(aa64_aa32_el1, cpu)) {
             define_arm_cp_regs(cpu, v8_aa32_el1_reginfo);
         }
@@ -7025,10 +7243,16 @@ void register_cp_regs_for_features(ARMCPU *cpu)
             { .name = "RMR_EL3", .state = ARM_CP_STATE_AA64,
               .opc0 = 3, .opc1 = 6, .crn = 12, .crm = 0, .opc2 = 2,
               .access = PL3_RW, .type = ARM_CP_CONST, .resetvalue = 1 },
+            /*
+             * MT6895 (EXPERIMENT): the preloader reads/writes RMR from
+             * AArch32 EL1 and expects a warm reset to hand over to the
+             * AArch64 BL2_EXT image.  Expose it at EL1 and record the
+             * request so the machine model can redirect the boot ROM.
+             */
             { .name = "RMR", .state = ARM_CP_STATE_AA32,
               .cp = 15, .opc1 = 0, .crn = 12, .crm = 0, .opc2 = 2,
-              .access = PL3_RW, .type = ARM_CP_CONST,
-              .resetvalue = arm_feature(env, ARM_FEATURE_AARCH64) },
+              .access = PL1_RW, .type = ARM_CP_IO,
+              .readfn = mtk_rmr_read, .writefn = mtk_rmr_write },
             { .name = "SCTLR_EL3", .state = ARM_CP_STATE_AA64,
               .opc0 = 3, .opc1 = 6, .crn = 1, .crm = 0, .opc2 = 0,
               .access = PL3_RW,
@@ -9347,11 +9571,397 @@ static bool syndrome_is_sync_extabt(uint32_t syndrome)
 }
 
 /* Handle exception entry to a target EL which is using AArch64 */
+/*
+ * Pointer to the bl_params structure BL2 passes to BL31 in x0 on an SMC.
+ *
+ * On real hardware BL31 walks this list at el3_exit() to load BL33's
+ * entry_point_info (pc/spsr/args). The MT6895 model has to reproduce that
+ * hand-off so BL33 receives the device tree pointer BL2 prepared; without it
+ * LK's x0 is stale and its fdt ends up NULL.
+ */
+uint64_t mtk_bl_params_ptr;
+/* Set by HELPER(exception_return) when MTK_GZ_SKIP redirects BL31's GZ entry
+ * to LK: from then on BL31 is live and LK is "a GZ guest without GZ". */
+bool mtk_gz_skip_active;
+
+/*
+ * Self-contained SHA-256 for the MT6895 ATF crypto SiP emulation.
+ *
+ * The model substitutes the BL31 crypto service (MTK_SIP_LK_CRYPTO_SHA256_*)
+ * because BL31 is not executed on this machine.  The LK/BL2_EXT side reaches
+ * it through crypto_hw_tfa and expects real SHA-256 digests, so the algorithm
+ * lives here rather than being delegated to a guest stub.
+ */
+typedef struct MTKSha256 {
+    uint32_t h[8];
+    uint64_t total;
+    uint8_t  buf[64];
+    unsigned buflen;
+} MTKSha256;
+
+static const uint32_t mtk_sha256_k[64] = {
+    0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5,
+    0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
+    0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3,
+    0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174,
+    0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc,
+    0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da,
+    0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7,
+    0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967,
+    0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13,
+    0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85,
+    0xa2bfe8a1, 0xa81a664b, 0xc24b8b70, 0xc76c51a3,
+    0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070,
+    0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5,
+    0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
+    0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208,
+    0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2,
+};
+
+static inline uint32_t mtk_rotr32(uint32_t x, unsigned n)
+{
+    return (x >> n) | (x << (32 - n));
+}
+
+static void mtk_sha256_block(MTKSha256 *s, const uint8_t *p)
+{
+    uint32_t w[64], a, b, c, d, e, f, g, h;
+    unsigned i;
+
+    for (i = 0; i < 16; i++) {
+        w[i] = ((uint32_t)p[i * 4] << 24) | ((uint32_t)p[i * 4 + 1] << 16) |
+               ((uint32_t)p[i * 4 + 2] << 8) | (uint32_t)p[i * 4 + 3];
+    }
+    for (i = 16; i < 64; i++) {
+        uint32_t s0 = mtk_rotr32(w[i - 15], 7) ^ mtk_rotr32(w[i - 15], 18) ^
+                      (w[i - 15] >> 3);
+        uint32_t s1 = mtk_rotr32(w[i - 2], 17) ^ mtk_rotr32(w[i - 2], 19) ^
+                      (w[i - 2] >> 10);
+        w[i] = w[i - 16] + s0 + w[i - 7] + s1;
+    }
+    a = s->h[0]; b = s->h[1]; c = s->h[2]; d = s->h[3];
+    e = s->h[4]; f = s->h[5]; g = s->h[6]; h = s->h[7];
+    for (i = 0; i < 64; i++) {
+        uint32_t S1 = mtk_rotr32(e, 6) ^ mtk_rotr32(e, 11) ^ mtk_rotr32(e, 25);
+        uint32_t ch = (e & f) ^ (~e & g);
+        uint32_t t1 = h + S1 + ch + mtk_sha256_k[i] + w[i];
+        uint32_t S0 = mtk_rotr32(a, 2) ^ mtk_rotr32(a, 13) ^ mtk_rotr32(a, 22);
+        uint32_t maj = (a & b) ^ (a & c) ^ (b & c);
+        uint32_t t2 = S0 + maj;
+
+        h = g; g = f; f = e; e = d + t1;
+        d = c; c = b; b = a; a = t1 + t2;
+    }
+    s->h[0] += a; s->h[1] += b; s->h[2] += c; s->h[3] += d;
+    s->h[4] += e; s->h[5] += f; s->h[6] += g; s->h[7] += h;
+}
+
+static void mtk_sha256_init(MTKSha256 *s)
+{
+    s->h[0] = 0x6a09e667; s->h[1] = 0xbb67ae85;
+    s->h[2] = 0x3c6ef372; s->h[3] = 0xa54ff53a;
+    s->h[4] = 0x510e527f; s->h[5] = 0x9b05688c;
+    s->h[6] = 0x1f83d9ab; s->h[7] = 0x5be0cd19;
+    s->total = 0;
+    s->buflen = 0;
+}
+
+static void mtk_sha256_update(MTKSha256 *s, const uint8_t *p, size_t len)
+{
+    s->total += len;
+    if (s->buflen) {
+        size_t want = 64 - s->buflen;
+
+        if (len < want) {
+            memcpy(s->buf + s->buflen, p, len);
+            s->buflen += len;
+            return;
+        }
+        memcpy(s->buf + s->buflen, p, want);
+        mtk_sha256_block(s, s->buf);
+        s->buflen = 0;
+        p += want;
+        len -= want;
+    }
+    while (len >= 64) {
+        mtk_sha256_block(s, p);
+        p += 64;
+        len -= 64;
+    }
+    if (len) {
+        memcpy(s->buf, p, len);
+        s->buflen = len;
+    }
+}
+
+static void mtk_sha256_final(MTKSha256 *s, uint8_t out[32])
+{
+    uint64_t bits = s->total * 8;
+    uint8_t pad[72];
+    size_t padlen;
+    unsigned i;
+
+    pad[0] = 0x80;
+    padlen = (s->buflen < 56) ? (56 - s->buflen) : (120 - s->buflen);
+    memset(pad + 1, 0, padlen - 1);
+    for (i = 0; i < 8; i++) {
+        pad[padlen + i] = (uint8_t)(bits >> (56 - 8 * i));
+    }
+    mtk_sha256_update(s, pad, padlen + 8);
+    for (i = 0; i < 8; i++) {
+        out[i * 4]     = (uint8_t)(s->h[i] >> 24);
+        out[i * 4 + 1] = (uint8_t)(s->h[i] >> 16);
+        out[i * 4 + 2] = (uint8_t)(s->h[i] >> 8);
+        out[i * 4 + 3] = (uint8_t)(s->h[i]);
+    }
+}
+
+/* ATF crypto-SiP state the model keeps on behalf of BL31. */
+static MTKSha256 mtk_atf_sha256;
+static bool mtk_atf_sha256_active;
+/* The digest lands in the crypto mailbox, which is where the LK driver reads
+ * it from (0xFFFF000048401000, size 0x1000). */
+#define MTK_ATF_CRYPTO_MB   0x48401000ULL
+
+
 static void arm_cpu_do_interrupt_aarch64(CPUState *cs)
 {
     ARMCPU *cpu = ARM_CPU(cs);
     CPUARMState *env = &cpu->env;
     unsigned int new_el = env->exception.target_el;
+
+    if (cs->exception_index == EXCP_SMC && new_el == 3) {
+        uint64_t p = env->xregs[0];
+
+        /*
+         * Only keep pointers that plausibly describe a bl_params structure in
+         * DRAM: type in 1..8, a sane size, and a DRAM address. Everything else
+         * is an ordinary PSCI/SMC argument.
+         */
+        {
+            static int nsmc;
+
+            if (nsmc < 200) {
+                nsmc++;
+                fprintf(stderr, "MTK-SMC x0=%#" PRIx64 " x1=%#" PRIx64
+                        " x2=%#" PRIx64 " x3=%#" PRIx64 " pc=%#" PRIx64
+                        " el=%d\n", p, env->xregs[1], env->xregs[2],
+                        env->xregs[3], env->pc, arm_current_el(env));
+            }
+        }
+        /*
+         * Keep the first one only: that is BL2_EXT's hand-off to BL31.  Once
+         * BL32/TEE really runs, its SMCCC function IDs (0xb2000000,
+         * 0xb2000008, ...) fall inside the same window and used to overwrite
+         * it, so the LK hand-off fix-up dereferenced 0xb2000000 at EL3 and
+         * aborted .
+         */
+        if (!mtk_bl_params_ptr && p >= 0x40000000ULL && p < 0xc0000000ULL) {
+            mtk_bl_params_ptr = p;
+        }
+
+        /*
+         * MTK SiP crypto service (typedef of ATF's
+         * MTK_SIP_LK_CRYPTO_SHA256_{INIT,PROCESS,DONE} and the engine
+         * enable/disable pair).  BL31 is not executed on this machine, so the
+         * model supplies the service itself with a real SHA-256 -- the
+         * firmware validates the seccfg digest through it and refuses to boot
+         * when the result is wrong.
+         *
+         *   x0 = SiP id, w1..: arguments, x0 = 0 on success on return
+         *   PROCESS: x0 = physical buffer, x1 = length
+         *   DONE:    digest is published in the crypto mailbox at 0x48401000,
+         *            which is where the LK driver reads it from
+         */
+        /*
+         * MTK_GZ_SKIP stand-in for GenieZone's SMC forwarding.  Once BL31
+         * really runs and its BL33 hand-off into GZ was redirected to LK
+         * (mtk_gz_skip_active), LK's SMCs reach BL31 directly.  On hardware
+         * LK is a GZ guest: GZ traps its SMCs and re-issues them to BL31 with
+         * the origin field fid[15:14] = 1 ("forwarded from a VM").  BL31's
+         * mtk_smc_handler (0x48215360) refuses non-secure SiP calls whose
+         * origin is 0 while the preloader's gz_info boot tag (0x88610023,
+         * = 2 here) says GZ is present -- "Forbidden SMC call".  Tag the
+         * origin the way GZ would; BL31 masks fid with 0xffff3fff before
+         * matching, so the call itself is unchanged.  See earlier bring-up notes
+         * rounds 1,284-1,285.
+         *
+         * The model's own SiP crypto substitute below dates from when BL31
+         * was never executed; it rewrites x0 before BL31 sees the SMC, so
+         * with a live BL31 it turns the call into fid 0.  Skip it then.
+         */
+        if (mtk_gz_skip_active) {
+            uint32_t fid = (uint32_t)p;
+
+            /*
+             * LK's boot-to-kernel call (MTK_SIP_KERNEL_BOOT, x1 = kernel,
+             * x2 = dtb).  On hardware GZ traps it and starts the kernel
+             * itself; BL31 has no such path, so forwarding it just returned
+             * to LK with the MMU already off and LK faulted on its own
+             * vectors .  With GZ skipped, do GZ's
+             * part: enter the kernel at EL1h with DAIF masked and the arm64
+             * boot arguments (x0 = dtb, x1..x3 = 0), no EL3 round trip.
+             */
+            if (fid == 0xc2000115u && arm_current_el(env) == 1 &&
+                !getenv("MTK_NO_GZKBOOT")) {
+                uint64_t kentry = env->xregs[1], dtb = env->xregs[2];
+
+                fprintf(stderr, "MTK-GZKBOOT kernel=%#" PRIx64 " dtb=%#"
+                        PRIx64 " sctlr1=%#" PRIx64 "\n", kentry, dtb,
+                        (uint64_t)env->cp15.sctlr_el[1]);
+                env->xregs[0] = dtb;
+                env->xregs[1] = 0;
+                env->xregs[2] = 0;
+                env->xregs[3] = 0;
+                env->daif = PSTATE_D | PSTATE_A | PSTATE_I | PSTATE_F;
+                env->pc = kentry;
+                arm_rebuild_hflags(env);
+                return;
+            }
+            if (arm_current_el(env) == 1 && (env->cp15.scr_el3 & SCR_NS) &&
+                (fid & 0x80000000u) && ((fid >> 24) & 0x3f) == 2 &&
+                ((fid >> 14) & 3) == 0) {
+                static int nfwd;
+
+                env->xregs[0] = p | (1u << 14);
+                if (nfwd < 16) {
+                    nfwd++;
+                    fprintf(stderr, "MTK-GZFWD SiP SMC %#x forwarded as %#x\n",
+                            fid, (uint32_t)env->xregs[0]);
+                }
+            }
+            goto mtk_smc_done;
+        }
+
+        switch ((uint32_t)p) {
+        case 0xc200010b:            /* HW_ENGINE_INIT */
+        case 0xc200010c:            /* HW_ENGINE_DISABLE */
+            env->xregs[0] = 0;
+            break;
+        case 0xc200010d:            /* SHA256_INIT */
+            mtk_sha256_init(&mtk_atf_sha256);
+            mtk_atf_sha256_active = true;
+            env->xregs[0] = 0;
+            break;
+        case 0xc200010e: {          /* SHA256_PROCESS */
+            uint64_t pa = env->xregs[1];
+            uint64_t len = env->xregs[2];
+            uint8_t *src = (uint8_t *)(uintptr_t)pa;
+
+            if (!mtk_atf_sha256_active) {
+                env->xregs[0] = (uint64_t)-4;
+                break;
+            }
+            /*
+             * The firmware hands the SiP a physical address, which on this
+             * machine is identity-mapped into the flat system address space,
+             * so the pointer can be used directly after checking the range.
+             */
+            if (pa >= 0x40000000ULL && pa < 0xc0000000ULL && len <= 0x100000ULL) {
+                mtk_sha256_update(&mtk_atf_sha256, src, (size_t)len);
+                env->xregs[0] = 0;
+            } else {
+                env->xregs[0] = (uint64_t)-3;
+            }
+            break;
+        }
+        case 0xc200010f: {          /* SHA256_DONE */
+            uint8_t digest[32];
+            uint8_t *mb;
+
+            if (!mtk_atf_sha256_active) {
+                env->xregs[0] = (uint64_t)-4;
+                break;
+            }
+            mtk_sha256_final(&mtk_atf_sha256, digest);
+            mtk_atf_sha256_active = false;
+            mb = (uint8_t *)(uintptr_t)MTK_ATF_CRYPTO_MB;
+            memset(mb, 0, 0x1000);
+            memcpy(mb, digest, sizeof(digest));
+            {
+                static int ndone;
+                unsigned bi;
+
+                if (ndone < 8) {
+                    ndone++;
+                    fprintf(stderr, "MTK-SHADONE digest=");
+                    for (bi = 0; bi < 32; bi++) {
+                        fprintf(stderr, "%02x", digest[bi]);
+                    }
+                    fprintf(stderr, "\n");
+                }
+            }
+            env->xregs[0] = 0;
+            break;
+        }
+        default:
+            break;
+        }
+    mtk_smc_done:
+        ;
+    }
+
+    /*
+     * Diagnostic for the MT6895 model: the full "-d int" stream is dominated
+     * by BL2's IRQ loop, so only report exceptions that matter for the
+     * BL31 -> BL33 hand-off (taken at EL3, or involving LK's address range).
+     */
+    {
+        static int n;
+
+        if (n < 40 && (arm_current_el(env) == 3 ||
+                       ((uint64_t)env->pc >= 0x50f00000ULL &&
+                        (uint64_t)env->pc < 0x51000000ULL))) {
+            n++;
+            fprintf(stderr,
+                    "MTK-EXC#%d idx=%d cur_el=%d new_el=%d pc=%#" PRIx64
+                    " vaddr=%#" PRIx64 " x0=%#" PRIx64 " x1=%#" PRIx64
+                    " x2=%#" PRIx64 " x3=%#" PRIx64 " syn=%#x\n",
+                    n, cs->exception_index, arm_current_el(env), new_el,
+                    (uint64_t)env->pc, (uint64_t)env->exception.vaddress,
+                    (uint64_t)env->xregs[0], (uint64_t)env->xregs[1],
+                    (uint64_t)env->xregs[2], (uint64_t)env->xregs[3],
+                    (unsigned)env->exception.syndrome);
+        }
+    }
+    /*
+     * MTK_EXC_KERN=1: also report exceptions taken from the kernel after
+     * LK's hand-off (PA image range, kernel VA space, or LK's own vector
+     * page once VBAR_EL1 is left pointing at it).
+     */
+    {
+        static int on = -1, nk;
+        static bool armed;
+        uint64_t pc = env->pc;
+
+        if (on < 0) {
+            on = getenv("MTK_EXC_KERN") != NULL;
+        }
+        /* Arm on LK's boot-to-kernel SMC (0xc2000115, GZ-forwarded or not). */
+        if (on && cs->exception_index == EXCP_SMC &&
+            (env->xregs[0] & 0xffff3fffULL) == 0xc2000115ULL) {
+            armed = true;
+        }
+        if (on && nk < 60 &&
+            (armed ||
+             (pc >= 0x40000000ULL && pc < 0x48000000ULL) ||
+             pc >= 0xffffff8000000000ULL ||
+             (pc & ~0xfffULL) == 0xffff000050f01000ULL)) {
+            nk++;
+            fprintf(stderr,
+                    "MTK-KEXC#%d idx=%d cur_el=%d new_el=%d pc=%#" PRIx64
+                    " vaddr=%#" PRIx64 " syn=%#x x0=%#" PRIx64
+                    " x1=%#" PRIx64 " sctlr1=%#" PRIx64 " vbar1=%#" PRIx64
+                    " lr=%#" PRIx64 "\n",
+                    nk, cs->exception_index, arm_current_el(env), new_el, pc,
+                    (uint64_t)env->exception.vaddress,
+                    (unsigned)env->exception.syndrome,
+                    (uint64_t)env->xregs[0], (uint64_t)env->xregs[1],
+                    (uint64_t)env->cp15.sctlr_el[1],
+                    (uint64_t)env->cp15.vbar_el[1],
+                    (uint64_t)env->xregs[30]);
+        }
+    }
     vaddr addr = env->cp15.vbar_el[new_el];
     uint64_t new_mode = aarch64_pstate_mode(new_el, true);
     uint64_t old_mode;
@@ -9625,6 +10235,32 @@ void arm_cpu_do_interrupt(CPUState *cs)
     unsigned int new_el = env->exception.target_el;
     uint64_t last_pc = cs->cc->get_pc(cs);
 
+    /*
+     * Bring-up aid: report the faulting instruction of a data abort, which
+     * QEMU's -d int output does not include for AArch32.  Bounded so a
+     * faulting loop cannot flood stderr.
+     */
+    if (cs->exception_index == EXCP_DATA_ABORT && !is_a64(env)) {
+        static int mtk_abort_n;
+
+        if (mtk_abort_n < 8) {
+            mtk_abort_n++;
+            fprintf(stderr, "MTK-ABORT pc=%#x vaddr=%#" PRIx64
+                    " synd=%#" PRIx64 " dfar_s=%#x dfar_ns=%#x "
+                    "dfsr_s=%#" PRIx64 " dfsr_ns=%#" PRIx64
+                    " lr=%#x sp=%#x cpsr=%#x\n",
+                    (uint32_t)last_pc,
+                    env->exception.vaddress,
+                    env->exception.syndrome,
+                    (uint32_t)env->cp15.dfar_s,
+                    (uint32_t)env->cp15.dfar_ns,
+                    env->cp15.dfsr_s, env->cp15.dfsr_ns,
+                    (uint32_t)env->regs[14],
+                    (uint32_t)env->regs[13],
+                    (uint32_t)env->uncached_cpsr);
+        }
+    }
+
     assert(!arm_feature(env, ARM_FEATURE_M));
 
     arm_log_exception(cs);
@@ -9641,6 +10277,52 @@ void arm_cpu_do_interrupt(CPUState *cs)
         arm_handle_psci_call(cpu);
         qemu_log_mask(CPU_LOG_INT, "...handled as PSCI call\n");
         qemu_plugin_vcpu_hostcall_cb(cs, last_pc);
+        return;
+    }
+
+    if (tcg_enabled() && cs->exception_index == EXCP_SMC && cs->cpu_index != 0 &&
+        arm_psci_lazy_plant && !arm_is_psci_call(cpu, EXCP_SMC)) {
+        /*
+         * First non-PSCI SMC from a QEMU-started secondary: plant the EL3
+         * warm-boot state now (in this vCPU's thread, just before the
+         * exception is taken) and then let EL3 handle the call normally.
+         */
+        arm_psci_plant_secondary(cpu, cs->cpu_index);
+    }
+
+    if (tcg_enabled() && cs->exception_index == EXCP_SMC &&
+        arm_psci_skip_secondary_smc && cs->cpu_index != 0 &&
+        !arm_is_psci_call(cpu, EXCP_SMC)) {
+        /*
+         * mt6895: this core was started by QEMU directly and never executed
+         * the EL3 firmware's warm-boot entry, so its per-CPU EL3 state is in
+         * reset state.  Entering EL3 for a vendor SMC would fault there and
+         * wedge the whole system (observed as init stalling while loading
+         * sec-rng.ko).  Return NOT_SUPPORTED from the SMC instead; the boot
+         * core keeps its full EL3 SiP path.
+         */
+        /*
+         * For SMC the architectural return address (and therefore env->pc
+         * here, as set up by raise_exception's restore_state_to_opc) is the
+         * instruction following the SMC, so resuming at last_pc is exactly
+         * "skip the SMC"; do not add another 4 bytes.
+         */
+        uint64_t fid = is_a64(env) ? env->xregs[0] : env->regs[0];
+
+        if (is_a64(env)) {
+            env->xregs[0] = (uint64_t)-1;
+            env->pc = last_pc;
+        } else {
+            env->regs[0] = (uint32_t)-1;
+            env->regs[15] = last_pc;
+        }
+        if (arm_psci_smc_skip_debug) {
+            fprintf(stderr, "MTK-SMCSKIP cpu%u pc=%#" PRIx64 " fid=%#" PRIx64
+                    " x1=%#" PRIx64 " x2=%#" PRIx64 "\n",
+                    cs->cpu_index, (uint64_t)last_pc, fid,
+                    (uint64_t)(is_a64(env) ? env->xregs[1] : env->regs[1]),
+                    (uint64_t)(is_a64(env) ? env->xregs[2] : env->regs[2]));
+        }
         return;
     }
 

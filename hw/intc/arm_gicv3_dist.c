@@ -11,6 +11,7 @@
 
 #include "qemu/osdep.h"
 #include "qemu/log.h"
+#include "hw/core/cpu.h"
 #include "trace.h"
 #include "gicv3_internal.h"
 
@@ -229,6 +230,15 @@ static void gicd_write_ipriorityr(GICv3State *s, MemTxAttrs attrs, int irq,
         return;
     }
 
+    if (irq == 169) {
+        static int n169;
+
+        if (n169 < 20) {
+            n169++;
+            fprintf(stderr, "MT6895-PRI169 secure=%d ctlr=%#x val=%#x\n",
+                    (int)attrs.secure, s->gicd_ctlr, value);
+        }
+    }
     if (!attrs.secure && !(s->gicd_ctlr & GICD_CTLR_DS)) {
         if (!gicv3_gicd_group_test(s, irq)) {
             /* Fields for Group 0 or Secure Group 1 interrupts are RAZ/WI */
@@ -898,11 +908,73 @@ MemTxResult gicv3_dist_read(void *opaque, hwaddr offset, uint64_t *data,
     return MEMTX_OK;
 }
 
+/*
+ * MTK_GICTRACE=1: log GIC distributor writes (enables/configs) so the
+ * interrupt number used by LK's USB/UDC driver can be read off the trace.
+ */
+static void mtk_gic_trace(hwaddr offset, uint64_t data, unsigned size)
+{
+    static int on = -1;
+    static int n;
+    static int max;
+
+    if (on < 0) {
+        const char *m = getenv("MTK_GICTRACE_MAX");
+
+        on = getenv("MTK_GICTRACE") != NULL;
+        max = m ? atoi(m) : 4000;
+    }
+    if (!on) {
+        return;
+    }
+    /* Interesting registers only: ISENABLER (0x100..0x17c), ICFGR (0xc00..0xc7c). */
+    if (!((offset >= 0x100 && offset < 0x180) ||
+          (offset >= 0xc00 && offset < 0xc80))) {
+        return;
+    }
+    {
+        CPUState *cs = qemu_get_cpu(0);
+        uint64_t pc = cs ? (uint64_t)CPU_GET_CLASS(cs)->get_pc(cs) : 0;
+
+        /* LK/firmware only: the machine itself pre-configures every SPI. */
+        if (pc < 0xffff000050000000ULL || pc >= 0xffff000060000000ULL) {
+            return;
+        }
+        if (n >= max) {
+            if (n++ == max) {
+                fprintf(stderr, "GICDW ... (%d line limit reached)\n", max);
+            }
+            return;
+        }
+        n++;
+        if (offset >= 0x100 && offset < 0x180 && size == 4) {
+            unsigned base = 32 * (unsigned)((offset - 0x100) / 4);
+
+            fprintf(stderr, "GICEN intid=%u val=%#x pc=%#" PRIx64 "\n",
+                    base, (unsigned)data, pc);
+        } else {
+            fprintf(stderr, "GICCFG off=%#x val=%#x pc=%#" PRIx64 "\n",
+                    (unsigned)offset, (unsigned)data, pc);
+        }
+    }
+}
+
 MemTxResult gicv3_dist_write(void *opaque, hwaddr offset, uint64_t data,
                              unsigned size, MemTxAttrs attrs)
 {
     GICv3State *s = (GICv3State *)opaque;
     bool r;
+
+    mtk_gic_trace(offset, data, size);
+
+    if (offset == 0x114 || offset == 0x194) {
+        static int nen;
+        if (nen < 10) {
+            nen++;
+            fprintf(stderr, "MT6895-DBG gicd irq169 off=%#x val=%#x secure=%d\n",
+                    (unsigned)offset, (unsigned)data, (int)attrs.secure);
+        }
+    }
 
     switch (size) {
     case 1:
@@ -943,6 +1015,18 @@ void gicv3_dist_set_irq(GICv3State *s, int irq, int level)
     /* Update distributor state for a change in an external SPI input line */
     if (level == gicv3_gicd_level_test(s, irq)) {
         return;
+    }
+    if (irq == 169) {
+        static int n;
+        if (n < 8) {
+            n++;
+            fprintf(stderr, "MT6895-DBG gic dist irq=169 level=%d en=%d grp=%d"
+                    " prio=%#x ctlr=%#x\n", level,
+                    (int)((*gic_bmp_ptr32(s->enabled, 169) >> (169 % 32)) & 1),
+                    (int)((*gic_bmp_ptr32(s->group, 169) >> (169 % 32)) & 1),
+                    (unsigned)s->gicd_ipriority[169],
+                    (unsigned)s->gicd_ctlr);
+        }
     }
 
     trace_gicv3_dist_set_irq(irq, level);

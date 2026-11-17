@@ -233,9 +233,23 @@ bool arm_cpu_exec_interrupt(CPUState *cs, int interrupt_request)
     if (interrupt_request & CPU_INTERRUPT_HARD) {
         excp_idx = EXCP_IRQ;
         target_el = arm_phys_excp_target_el(cs, excp_idx, cur_el, secure);
-        if (arm_excp_unmasked(cs, excp_idx, target_el,
-                              cur_el, secure, hcr_el2)) {
-            goto found;
+        {
+            static int n;
+            bool un = arm_excp_unmasked(cs, excp_idx, target_el,
+                                        cur_el, secure, hcr_el2);
+
+            if (n < 60 && (uint64_t)env->pc >= 0xffff000050f00000ULL &&
+                (uint64_t)env->pc < 0xffff000051000000ULL) {
+                n++;
+                fprintf(stderr, "MT6895-IRQCHK cur_el=%d secure=%d target=%d"
+                        " daif=%#x scr=%#" PRIx64 " unmasked=%d pc=%#" PRIx64
+                        "\n", cur_el, (int)secure, target_el,
+                        (unsigned)env->daif, env->cp15.scr_el3, (int)un,
+                        (uint64_t)env->pc);
+            }
+            if (un) {
+                goto found;
+            }
         }
     }
     if (interrupt_request & CPU_INTERRUPT_VIRQ) {

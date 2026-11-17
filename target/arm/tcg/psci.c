@@ -27,6 +27,94 @@
 #include "target/arm/multiprocessing.h"
 #include "target/arm/trace.h"
 
+/*
+ * Set by a machine that virtualises EL3 itself (the guest runs its own
+ * firmware) and whose non-secure world is entered at EL1: the guest's PSCI
+ * CPU_ON then has to start secondaries at EL1, not at the highest NS EL this
+ * emulator implements (EL2).  Off by default so all other machines keep the
+ * upstream behaviour.
+ */
+static bool arm_psci_prefer_el1;
+void arm_psci_set_prefer_el1(bool enable)
+{
+    arm_psci_prefer_el1 = enable;
+}
+
+/*
+ * Optional machine hook run on a CPU right after QEMU has started it with
+ * CPU_ON.  Machines that hand their secondaries to a guest while non-PSCI
+ * SMCs are still served by an EL3 firmware use it to plant the EL3 world the
+ * core would otherwise have set up in the firmware's warm-boot entry.
+ * Runs in the target vCPU's thread, after its reset work.
+ */
+static void (*arm_psci_secondary_hook)(ARMCPU *cpu, unsigned core);
+
+void arm_psci_set_secondary_hook(void (*fn)(ARMCPU *cpu, unsigned core))
+{
+    arm_psci_secondary_hook = fn;
+}
+
+/*
+ * Machines whose non-PSCI SiP SMCs are served by a real EL3 firmware but
+ * whose secondary CPUs QEMU starts directly cannot have those SMCs serviced:
+ * the cores never ran the EL3 warm-boot entry, so EL3 faults on the first
+ * one and wedges.  Answer such SMCs from non-boot cores with the
+ * architectural NOT_SUPPORTED value so the guest driver degrades instead.
+ */
+bool arm_psci_skip_secondary_smc;
+bool arm_psci_smc_skip_debug;
+
+void arm_psci_set_skip_secondary_smc(bool enable)
+{
+    arm_psci_skip_secondary_smc = enable;
+}
+
+void arm_psci_set_smc_skip_debug(bool enable)
+{
+    arm_psci_smc_skip_debug = enable;
+}
+
+/*
+ * Lazy plant: instead of preparing EL3 state when a secondary is started
+ * (which perturbs its Linux startup), plant it right before its first
+ * non-PSCI SMC is delivered to EL3 -- the first moment it is actually needed.
+ */
+bool arm_psci_lazy_plant;
+bool arm_psci_eager_plant;
+
+void arm_psci_set_lazy_plant(bool enable)
+{
+    arm_psci_lazy_plant = enable;
+}
+
+void arm_psci_set_eager_plant(bool enable)
+{
+    arm_psci_eager_plant = enable;
+}
+
+void arm_psci_plant_secondary(ARMCPU *cpu, unsigned core)
+{
+    static bool planted[64];
+    if (core >= ARRAY_SIZE(planted) || planted[core]) {
+        return;
+    }
+    planted[core] = true;
+    if (arm_psci_secondary_hook) {
+        arm_psci_secondary_hook(cpu, core);
+        arm_rebuild_hflags(&cpu->env);
+    }
+}
+
+static void arm_psci_secondary_apply(CPUState *cs, run_on_cpu_data data)
+{
+    ARMCPU *cpu = ARM_CPU(cs);
+
+    if (arm_psci_secondary_hook) {
+        arm_psci_secondary_hook(cpu, data.host_ulong);
+        arm_rebuild_hflags(&cpu->env);
+    }
+}
+
 bool arm_is_psci_call(ARMCPU *cpu, int excp_type)
 {
     /*
@@ -39,13 +127,51 @@ bool arm_is_psci_call(ARMCPU *cpu, int excp_type)
 
     switch (excp_type) {
     case EXCP_HVC:
-        if (cpu->psci_conduit != QEMU_PSCI_CONDUIT_HVC) {
+        /*
+         * Host-PSCI mode also keeps swallowing HVCs even though the conduit
+         * is SMC: this machine's LK (BL33) itself issues PSCI-style HVCs
+         * (e.g. x0=0x84000003 with a vendor CPU id) while booting Linux.
+         * Upstream/QEMU behaviour on a HVC conduit is to hand every HVC to
+         * the PSCI dispatcher; doing the same here means those LK calls keep
+         * getting a PSCI error return instead of trapping to an EL2 that has
+         * no handler (which hangs right after "lk finished --> jump to linux
+         * kernel 64Bit").
+         */
+        if (cpu->psci_conduit != QEMU_PSCI_CONDUIT_HVC &&
+            !arm_psci_prefer_el1) {
             return false;
         }
+        /*
+         * Upstream behaviour on purpose: with a HVC conduit every HVC is
+         * handed to the PSCI dispatcher.  A real EL3 firmware (mt6895/ATF)
+         * shares that conduit with vendor "hypervisor calls" that are not
+         * PSCI at all; those used to come back as PSCI_RET_NOT_SUPPORTED
+         * (e.g. the guest's 0x820..../0xffffffff82000060 HVCs).  Filtering
+         * them here makes them trap to the (unimplemented) EL2 instead and
+         * hangs the vendor kernel at module load, so keep swallowing them
+         * unless host PSCI mode below explicitly changes the contract.
+         */
         break;
     case EXCP_SMC:
         if (cpu->psci_conduit != QEMU_PSCI_CONDUIT_SMC) {
             return false;
+        }
+        /*
+         * Host-PSCI mode only (a machine that asked QEMU to answer PSCI over
+         * SMC): the guest's EL1 SMCs are shared between PSCI and MTK SiP
+         * calls, so only the PSCI function-ID windows (0x8400_00xx /
+         * 0xC400_00xx) belong to QEMU; everything else must keep trapping to
+         * EL3 (ATF).  Outside that mode the upstream behaviour (any SMC on
+         * the conduit) is preserved exactly.
+         */
+        if (arm_psci_prefer_el1) {
+            uint64_t fid = is_a64(&cpu->env) ? cpu->env.xregs[0]
+                                             : cpu->env.regs[0];
+
+            if ((fid & 0xFF000000ULL) != 0x84000000ULL &&
+                (fid & 0xFF000000ULL) != 0xC4000000ULL) {
+                return false;
+            }
         }
         break;
     default:
@@ -145,7 +271,8 @@ void arm_handle_psci_call(ARMCPU *cpu)
          * The CPU should be started with the context_id value
          * in x0 (if AArch64) or r0 (if AArch32).
          */
-        int target_el = arm_feature(env, ARM_FEATURE_EL2) ? 2 : 1;
+        int target_el = (arm_feature(env, ARM_FEATURE_EL2) &&
+                         !arm_psci_prefer_el1) ? 2 : 1;
         bool target_aarch64 = arm_el_is_aa64(env, target_el);
 
         mpidr = param[1];
@@ -153,6 +280,15 @@ void arm_handle_psci_call(ARMCPU *cpu)
         context_id = param[3];
         ret = arm_set_cpu_on(mpidr, entry, context_id,
                              target_el, target_aarch64);
+        if (ret == QEMU_ARM_POWERCTL_RET_SUCCESS &&
+            arm_psci_secondary_hook && arm_psci_eager_plant) {
+            CPUState *tcpu = arm_get_cpu_by_id(mpidr);
+
+            if (tcpu) {
+                async_run_on_cpu(tcpu, arm_psci_secondary_apply,
+                                 RUN_ON_CPU_HOST_ULONG((mpidr >> 8) & 0xff));
+            }
+        }
         break;
     }
     case QEMU_PSCI_0_1_FN_CPU_OFF:

@@ -480,6 +480,27 @@ static void aarch64_a78ae_initfn(Object *obj)
     cpu->isar.reset_pmcr_el0 = 0x41223000;
 }
 
+/*
+ * Cortex-A78 (not the -AE automotive variant).
+ *
+ * The boot chain of an MT6895 handset reads MIDR_EL1 and dispatches on the
+ * primary part number, so the A78 cluster has to report 0xD41 rather than
+ * the 0xD42 of the A78AE model. Everything else is inherited from the A78AE
+ * model: the two cores share the same software-visible feature set, and ARM
+ * does not publish separate A78 ISAR reset values that differ from these.
+ * The PMU identification field in PMCR_EL0 is likewise carried over; nothing
+ * in the boot chain depends on it.
+ */
+static void aarch64_a78_initfn(Object *obj)
+{
+    ARMCPU *cpu = ARM_CPU(obj);
+
+    aarch64_a78ae_initfn(obj);
+
+    cpu->dtb_compatible = "arm,cortex-a78";
+    cpu->midr = 0x410fd410;          /* r0p0, part 0xD41 */
+}
+
 static void aarch64_a64fx_initfn(Object *obj)
 {
     ARMCPU *cpu = ARM_CPU(obj);
@@ -1455,6 +1476,7 @@ static const ARMCPUInfo aarch64_cpus[] = {
      * currently model the latter.
      */
     { .name = "cortex-a78ae",       .initfn = aarch64_a78ae_initfn },
+    { .name = "cortex-a78",         .initfn = aarch64_a78_initfn },
     { .name = "cortex-a710",        .initfn = aarch64_a710_initfn },
     { .name = "a64fx",              .initfn = aarch64_a64fx_initfn },
     { .name = "neoverse-n1",        .initfn = aarch64_neoverse_n1_initfn },

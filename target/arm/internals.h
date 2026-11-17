@@ -714,6 +714,13 @@ bool arm_is_psci_call(ARMCPU *cpu, int excp_type);
 /* Actually handle a PSCI call */
 void arm_handle_psci_call(ARMCPU *cpu);
 
+/* Set by machines whose secondary SMCs must not enter their EL3 firmware. */
+extern bool arm_psci_skip_secondary_smc;
+extern bool arm_psci_smc_skip_debug;
+extern bool arm_psci_lazy_plant;
+void arm_psci_plant_secondary(ARMCPU *cpu, unsigned core);
+extern bool arm_psci_eager_plant;
+
 /**
  * arm_clear_exclusive: clear the exclusive monitor
  * @env: CPU env

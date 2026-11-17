@@ -26,6 +26,9 @@
 #include "accel/tcg/cpu-loop.h"
 #include "accel/tcg/probe.h"
 #include "cpregs.h"
+#ifndef CONFIG_USER_ONLY
+#include "system/runstate.h"
+#endif
 
 #define SIGNBIT (uint32_t)0x80000000
 #define SIGNBIT64 ((uint64_t)1 << 63)
@@ -49,6 +52,45 @@ void raise_exception(CPUARMState *env, uint32_t excp,
                      uint64_t syndrome, uint32_t target_el)
 {
     CPUState *cs = env_cpu(env);
+
+    /* MT6895-DBG-BEGIN: bounded diagnostic */
+    if (excp == EXCP_DATA_ABORT) {
+        static int n;
+        if (n < 24) {
+            n++;
+            fprintf(stderr,
+                    "MT6895-DBG dabt#%d pc=%#x syndrome=%#llx "
+                    "r0=%#x r1=%#x r2=%#x r3=%#x r4=%#x r14=%#x sp=%#x\n",
+                    n, (unsigned)env->regs[15],
+                    (unsigned long long)syndrome,
+                    (unsigned)env->regs[0], (unsigned)env->regs[1],
+                    (unsigned)env->regs[2], (unsigned)env->regs[3],
+                    (unsigned)env->regs[4], (unsigned)env->regs[14],
+                    (unsigned)env->regs[13]);
+        }
+    }
+    if (excp == EXCP_UDEF) {
+        static int u;
+        if (u < 8) {
+            u++;
+            fprintf(stderr,
+                    "MT6895-DBG udef#%d pc=%#x cpsr=%#x r0=%#x r1=%#x r2=%#x "
+                    "r3=%#x r4=%#x r14=%#x sp=%#x el=%d thumb=%d "
+                    "aarch64=%d pstate=%#x vbar3=%#llx vbar1=%#llx "
+                    "syndrome=%#llx\n",
+                    u, (unsigned)env->regs[15], (unsigned)cpsr_read(env),
+                    (unsigned)env->regs[0], (unsigned)env->regs[1],
+                    (unsigned)env->regs[2], (unsigned)env->regs[3],
+                    (unsigned)env->regs[4], (unsigned)env->regs[14],
+                    (unsigned)env->regs[13], arm_current_el(env),
+                    (int)env->thumb, (int)env->aarch64,
+                    (unsigned)env->pstate,
+                    (unsigned long long)env->cp15.vbar_el[3],
+                    (unsigned long long)env->cp15.vbar_el[1],
+                    (unsigned long long)syndrome);
+        }
+    }
+    /* MT6895-DBG-END */
 
     if (target_el == 1 && (arm_hcr_el2_eff(env) & HCR_TGE)) {
         /*
@@ -383,7 +425,37 @@ void HELPER(wfi)(CPUARMState *env, uint32_t insn_len)
 #else
     CPUState *cs = env_cpu(env);
     uint32_t excp;
-    int target_el = check_wfx_trap(env, false, &excp);
+    int target_el;
+
+    /*
+     * MT6895: take a warm reset requested through RMR.RR (see mtk_rmr_write()
+     * in target/arm/helper.c).  The core is quiescent now, so the reset
+     * happens here, and r0..r3 are recorded as they stand: the register file
+     * survives a warm reset, which is how the preloader hands its
+     * mtk_bl_param pointer to BL2_EXT in x0.
+     */
+    if (arm_mt6895_rmr_pending) {
+        unsigned i;
+
+        arm_mt6895_rmr_pending = false;
+        for (i = 0; i < ARRAY_SIZE(arm_mt6895_rmr_regs); i++) {
+            arm_mt6895_rmr_regs[i] = env->aarch64 ? env->xregs[i]
+                                                  : env->regs[i];
+        }
+        fprintf(stderr, "MT6895-DBG rmr warm reset taken at WFI: "
+                "r0=%#" PRIx64 " r1=%#" PRIx64 " r2=%#" PRIx64
+                " r3=%#" PRIx64 "\n",
+                arm_mt6895_rmr_regs[0], arm_mt6895_rmr_regs[1],
+                arm_mt6895_rmr_regs[2], arm_mt6895_rmr_regs[3]);
+        arm_mt6895_warm_reset = true;
+        qemu_system_reset_request(SHUTDOWN_CAUSE_GUEST_RESET);
+        env->halt_reason = HALT_WFI;
+        cs->exception_index = EXCP_HLT;
+        cs->halted = 1;
+        cpu_loop_exit(cs);
+    }
+
+    target_el = check_wfx_trap(env, false, &excp);
 
     if (cpu_has_work(cs)) {
         /* Don't bother to go into our "low power state" if

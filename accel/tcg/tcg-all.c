@@ -31,6 +31,7 @@
 #include "qapi/error.h"
 #include "qemu/error-report.h"
 #include "qemu/accel.h"
+#include "qom/object.h"
 #include "qemu/atomic.h"
 #include "qapi/qapi-types-common.h"
 #include "qapi/qapi-builtin-visit.h"
@@ -142,6 +143,27 @@ static int tcg_init_machine(AccelState *as, MachineState *ms)
         break;
     default:
         g_assert_not_reached();
+    }
+
+    /*
+     * Board-specific opt-out from MTTCG: a machine can expose a boolean
+     * object property marking its device model as not MTTCG-safe (the
+     * mt6895 phone model does: its preloader/ATF/CPC stubs share state
+     * between vCPU threads).  Honour it here so the board works with a
+     * plain `-smp 8` and no extra -accel flag.
+     */
+    {
+        bool board_single =
+            object_property_get_bool(OBJECT(ms), "mtk-single-thread-tcg", NULL);
+
+        fprintf(stderr, "TCG-DBG: marker=%d mttcg=%d\n",
+                (int)board_single, (int)s->mttcg_enabled);
+        if (board_single && s->mttcg_enabled == ON_OFF_AUTO_ON) {
+            s->mttcg_enabled = ON_OFF_AUTO_OFF;
+            max_threads = 1;
+            fprintf(stderr, "TCG-DBG: forcing thread=single for this "
+                    "board\n");
+        }
     }
 
     qemu_add_vm_change_state_handler(tcg_vm_change_state, NULL);

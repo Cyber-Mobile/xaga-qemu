@@ -30,6 +30,48 @@
 CPUState *arm_get_cpu_by_id(uint64_t cpuid);
 
 /*
+ * arm_psci_set_prefer_el1:
+ * @enable: if true, PSCI CPU_ON starts the target at EL1 instead of the
+ *          highest non-secure exception level this emulator implements.
+ *
+ * For machines that run a real EL3 firmware (so the guest's non-secure world
+ * lives at EL1), while QEMU also provides a PSCI conduit for CPU_ON.
+ */
+void arm_psci_set_prefer_el1(bool enable);
+
+/*
+ * arm_psci_set_secondary_hook:
+ * @fn: callback invoked in the target vCPU's thread right after CPU_ON has
+ *      reset and started a secondary CPU (or NULL to disable)
+ *
+ * Lets a machine plant firmware (EL3) per-CPU state for cores whose guest is
+ * started directly by QEMU instead of through the firmware's warm-boot entry.
+ */
+void arm_psci_set_secondary_hook(void (*fn)(struct ArchCPU *cpu,
+                                               unsigned core));
+
+/*
+ * arm_psci_set_skip_secondary_smc:
+ * @enable: answer non-PSCI SMCs from non-boot CPUs with NOT_SUPPORTED instead
+ *          of entering the guest EL3 firmware (which those cores never
+ *          initialised because QEMU started them directly).
+ */
+void arm_psci_set_skip_secondary_smc(bool enable);
+
+/* Log each SMC answered by arm_psci_set_skip_secondary_smc() (diagnostics). */
+void arm_psci_set_smc_skip_debug(bool enable);
+
+/*
+ * arm_psci_set_lazy_plant:
+ * @enable: run the secondary hook right before a non-boot CPU's first non-PSCI
+ *          SMC is delivered to EL3, instead of when the CPU is started.
+ */
+void arm_psci_set_lazy_plant(bool enable);
+
+/* Run the secondary hook from the CPU_ON path (debug/experimental). */
+void arm_psci_set_eager_plant(bool enable);
+
+/*
  * arm_set_cpu_on:
  * @cpuid: the id of the CPU we want to start/wake up.
  * @entry: the address the CPU shall start from.
