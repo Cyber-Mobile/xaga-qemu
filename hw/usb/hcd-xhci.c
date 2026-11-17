@@ -47,11 +47,21 @@
 #define LEN_CAP         0x40
 #define LEN_OPER        (0x400 + 0x10 * XHCI_MAXPORTS)
 #define LEN_RUNTIME     ((XHCI_MAXINTRS + 1) * 0x20)
-#define LEN_DOORBELL    ((XHCI_MAXSLOTS + 1) * 0x20)
+/* 4 bytes per doorbell (slot 0 .. slot XHCI_MAXSLOTS) */
+#define LEN_DOORBELL    ((XHCI_MAXSLOTS + 1) * 0x4)
 
+/*
+ * The MT6895 model exposes each xHCI as a 4 KiB window (the vendor device
+ * tree gives xhci0@11200000 reg = 0x1000) and the guest driver ioremaps only
+ * that much.  The PC-style layout with RTSOFF 0x1000 / DBOFF 0x2000 would fall
+ * outside the mapping, so both register sets are moved down into the first
+ * page: cap 0x000..0x040, oper 0x040..0x620 (worst case 30 ports), runtime
+ * 0x800, doorbells 0xC00.  The guest learns the layout from the RTSOFF/DBOFF
+ * capability registers, it never assumes the PC offsets.
+ */
 #define OFF_OPER        LEN_CAP
-#define OFF_RUNTIME     0x1000
-#define OFF_DOORBELL    0x2000
+#define OFF_RUNTIME     0x800
+#define OFF_DOORBELL    0xC00
 
 #if (OFF_OPER + LEN_OPER) > OFF_RUNTIME
 #error Increase OFF_RUNTIME
