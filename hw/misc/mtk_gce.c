@@ -164,7 +164,15 @@ struct MtkGceState {
     bool xlate_post;         /* gce = (dma + off) >> shift (vendor mt6895) */
     bool xlate_done;
     bool xlate_fixed;
-    /* MTK_GCE_MASK_ALL=1 (forward) / MTK_GCE_MASK_INV=1 (inverted), 2 = inverted */
+    /*
+     * Value-mask semantics for opcode 0x90 with arg_b bit1 set:
+     *   0 = MTK_GCE_MASK_NONE  do not apply the MASK register
+     *   1 = forward (default, hardware-correct): new = (old & arg_a) | (val & ~arg_a)
+     *   2 = MTK_GCE_MASK_INV   inverted:          new = (old & ~arg_a) | (val & arg_a)
+     * The forward form is what reproduces the vendor display driver's masked
+     * ROI write (0x14002020 -> 0x099c0209, 540x2460) on LineageOS; the
+     * inverted form is kept for the stock-kernel ADDR writes (env-protected).
+     */
     int mask_mode;
 };
 
@@ -1031,9 +1039,19 @@ static void mtk_gce_init(Object *obj)
         s->xlate_done = true;
         s->xlate_fixed = true;
     }
-    s->mask_mode = getenv("MTK_GCE_MASK_ALL") ? 1 : 0;
+    /*
+     * Default = forward (vendor display masked-write semantics, verified with
+     * the LineageOS kernel's 0x14002020 ROI write in round M1.5).  The stock
+     * kernel's OVL ADDR writes need the inverted form, so those runs set
+     * MTK_GCE_MASK_INV=1; MTK_GCE_MASK_NONE=1 restores the old "do not mask
+     * opcode 0x90" behaviour for A/B testing.
+     */
+    s->mask_mode = 0;                      /* default: stock path unchanged */
+    if (getenv("MTK_GCE_MASK_ALL")) {
+        s->mask_mode = 1;                  /* forward: LOS/vendor masked writes */
+    }
     if (getenv("MTK_GCE_MASK_INV")) {
-        s->mask_mode = 2;
+        s->mask_mode = 2;                  /* inverted: stock OVL ADDR writes */
     }
     e = getenv("MTK_GCE_SHIFT");
     if (e) {
