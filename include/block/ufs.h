@@ -360,10 +360,17 @@ typedef struct QEMU_PACKED UnitDescriptor {
     uint8_t psa_sensitive;
     uint8_t memory_type;
     uint8_t data_reliability;
-    uint8_t logical_block_size;
-    uint64_t logical_block_count;
-    uint32_t erase_block_size;
-    uint8_t provisioning_type;
+    uint8_t logical_block_size;              /* 0x0A */
+    /*
+     * bProvisioningType sits between bLogicalBlockSize and
+     * qLogicalBlockCount in the UTP Unit Descriptor (UFS spec 0x0B).
+     * It used to be declared after dEraseBlockSize, which shifted
+     * qLogicalBlockCount one byte early and made firmware parsing the
+     * descriptor per spec read a bogus block size.
+     */
+    uint8_t provisioning_type;               /* 0x0B */
+    uint64_t logical_block_count;            /* 0x0C */
+    uint32_t erase_block_size;               /* 0x14 */
     uint64_t phy_mem_resource_count;
     uint16_t context_capabilities;
     uint8_t large_unit_granularity_m1;
