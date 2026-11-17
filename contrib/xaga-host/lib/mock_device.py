@@ -595,35 +595,117 @@ class MockFastbootDevice(MockDevice):
 # fake adb (USB ffs) device
 # ---------------------------------------------------------------------------
 class MockAdbDevice(MockDevice):
-    """Fake adb gadget skeleton: CNXN handshake + basic OPEN/WRTE/OKAY."""
+    """Fake adb (USB ffs) gadget: CNXN/AUTH handshake + adb service multiplexer.
+
+    Emulated services:
+      * shell,v2,raw:<cmd> and shell:<cmd> (stdout/stderr/exit packet v2)
+      * reboot:<target>
+      * sideload-host:<size>:<block>  (minadbd block protocol)
+      * sideload:<size>               (legacy push fallback)
+      * sync:                         (push SEND/DATA/DONE)
+
+    Failures can be injected with the attributes below, which makes the mock a
+    regression target for the host CLI without QEMU.
+    """
 
     device_descriptor = build_device_descriptor()
     config_descriptor = build_config_descriptor(
         interface_class=0xFF, interface_subclass=0x42, interface_protocol=0x01
     )
     strings = {0: "0x0409", 1: "Google", 2: "xaga", 3: "0123456789ABCDEF"}
-    banner = (
-        "device::ro.product.name=xaga;ro.product.model=Xaga;"
-        "ro.product.device=xaga;features=cmd,shell_v2,stat_v2"
-    )
-    #: "none" answers CNXN to an AUTH packet (adb keys already accepted);
-    #: "token" emulates a device that wants an RSA signature (TODO in adb.py).
+
+    # -- configurable behaviour (persists across connections) ---------------
+    banner_state = "device"
+    banner_props = {
+        "ro.product.name": "xaga",
+        "ro.product.model": "Xaga",
+        "ro.product.device": "xaga",
+    }
+    features = ("cmd", "shell_v2", "stat_v2")
+    #: "none": accept CNXN immediately.  "token": send AUTH(TOKEN) and verify
+    #: the RSA signature (or accept an AUTH(RSAPUBLICKEY) upload).
     auth_mode = "none"
+    accept_public_key_upload = True
+    #: Refuse sideload-host so the host must use the legacy push service.
+    legacy_only = False
+    #: Send FAILFAIL after the package was fully transferred.
+    sideload_fail = False
+    #: Optional Callable[[str], adb.ShellResult] used by the shell services.
+    shell_handler = None
 
     def __init__(self, server: MockChardevServer) -> None:
+        self.authorized_keys: List[Tuple[int, int]] = []
+        self.banner_props = dict(self.__class__.banner_props)
+        self.expected_sideload_sha256: Optional[str] = None
+        self.expected_sideload_size: Optional[int] = None
+        self.sync_files: Dict[str, bytes] = {}
+        self.shell_handler = None
         super().__init__(server)
 
+    # -- per-connection state ----------------------------------------------
     def _reset_state(self) -> None:
         self.packets: List[object] = []
         self.services: List[str] = []
         self.writes: List[bytes] = []
+        self.shell_commands: List[str] = []
+        self.auth_events: List[str] = []
+        self.authenticated = False
+        self.pending_token: Optional[bytes] = None
         self._reader = None
-        self._next_local_id = 1
         self._next_remote_id = 101
-        self._opens: Dict[int, int] = {}
+        self.streams: Dict[int, Dict[str, object]] = {}
+        self.reboot_target: Optional[str] = None
+        self.sideload_protocol: Optional[str] = None
+        self.sideload_bytes = 0
+        self.sideload_blocks = 0
+        self.sideload_sha256: Optional[str] = None
+        self.sideload_ok: Optional[bool] = None
+        self.sideload_error: Optional[str] = None
+        self._sideload: Optional[Dict[str, object]] = None
+        self._sync: Optional[Dict[str, object]] = None
+        self.sync_received: Dict[str, bytes] = {}
 
-    def on_bulk_out(self, payload: bytes) -> None:
+    # -- helpers ------------------------------------------------------------
+    def _banner_payload(self) -> bytes:
+        props = ";".join(
+            "%s=%s" % (key, value) for key, value in self.banner_props.items()
+        )
+        features = ",".join(self.features)
+        return ("%s::%s;features=%s" % (self.banner_state, props, features)).encode(
+            "latin-1"
+        )
+
+    def _send(self, packet) -> None:
+        self.send_ep1_in(packet.encode())
+
+    def _ack(self, stream: Dict[str, object]) -> None:
         from . import adb  # local import keeps module import order simple
+
+        self._send(adb.AdbPacket(adb.A_OKAY, int(stream["remote_id"]),
+                                 int(stream["host_id"])))
+
+    def _close_stream(self, stream: Dict[str, object]) -> None:
+        from . import adb
+
+        self._send(adb.AdbPacket(adb.A_CLSE, int(stream["remote_id"]),
+                                 int(stream["host_id"])))
+        stream["state"] = "closed"
+
+    def _send_stream_data(self, stream: Dict[str, object], data: bytes) -> None:
+        from . import adb
+
+        remote_id = int(stream["remote_id"])
+        host_id = int(stream["host_id"])
+        offset = 0
+        chunk_size = 1024
+        while offset < len(data):
+            chunk = data[offset:offset + chunk_size]
+            self._send(adb.AdbPacket(adb.A_WRTE, remote_id, host_id, chunk))
+            offset += len(chunk)
+
+    # -- packet dispatch ----------------------------------------------------
+    def on_bulk_out(self, payload: bytes) -> None:
+        from . import adb
 
         if self._reader is None:
             self._reader = adb.AdbPacketReader()
@@ -640,46 +722,383 @@ class MockAdbDevice(MockDevice):
         from . import adb
 
         command = packet.command
-        if command == adb.CMD_CNXN:
-            if self.auth_mode != "none":
-                # A device with key verification answers CNXN with AUTH(TOKEN).
-                self.send_packet(
-                    adb.AdbPacket(adb.CMD_AUTH, adb.AUTH_TOKEN, 0, bytes(range(20)))
-                )
-                return
-            version = packet.arg0 or adb.A_VERSION
-            maxdata = packet.arg1 or adb.A_MAXDATA
-            self.send_packet(adb.AdbPacket(adb.CMD_CNXN, version, maxdata, self.banner.encode("ascii")))
-        elif command == adb.CMD_AUTH:
-            if self.auth_mode == "none":
-                self.send_packet(
-                    adb.AdbPacket(adb.CMD_CNXN, adb.A_VERSION, adb.A_MAXDATA, self.banner.encode("ascii"))
-                )
-            else:
-                self.send_packet(
-                    adb.AdbPacket(adb.CMD_AUTH, adb.AUTH_TOKEN, 0, bytes(range(20)))
-                )
-        elif command == adb.CMD_OPEN:
-            service = packet.data.rstrip(b"\x00").decode("latin-1")
-            with self._cond:
-                local_id = self._next_local_id
-                self._next_local_id += 1
-                remote_id = self._next_remote_id
-                self._next_remote_id += 1
-                self._opens[local_id] = remote_id
-                self.services.append(service)
-            self.send_packet(adb.AdbPacket(adb.CMD_OKAY, local_id, remote_id))
-        elif command == adb.CMD_WRTE:
-            with self._cond:
-                self.writes.append(bytes(packet.data))
-            self.send_packet(adb.AdbPacket(adb.CMD_OKAY, packet.arg1, packet.arg0))
-        elif command == adb.CMD_CLSE:
-            self.send_packet(adb.AdbPacket(adb.CMD_CLSE, packet.arg1, packet.arg0))
+        if command == adb.A_CNXN:
+            self._on_cnxn(packet)
+        elif command == adb.A_AUTH:
+            self._on_auth(packet)
+        elif command == adb.A_OPEN:
+            self._on_open(packet)
+        elif command == adb.A_WRTE:
+            self._on_wrte(packet)
+        elif command == adb.A_CLSE:
+            self._on_clse(packet)
+        elif command == adb.A_OKAY:
+            return
         else:
-            self.send_packet(adb.AdbPacket(adb.CMD_CLSE, packet.arg1, packet.arg0))
+            LOG.warning("mock adb got unknown packet 0x%08x", command)
 
-    def send_packet(self, packet) -> None:
-        self.send_ep1_in(packet.encode())
+    # -- handshake ----------------------------------------------------------
+    def _accept(self) -> None:
+        from . import adb
+
+        maxdata = 4096
+        self.authenticated = True
+        self._send(adb.AdbPacket(adb.A_CNXN, adb.A_VERSION, maxdata,
+                                 self._banner_payload()))
+
+    def _new_token(self) -> bytes:
+        self.pending_token = bytes(((index * 7 + 3) & 0xFF) for index in range(20))
+        return self.pending_token
+
+    def _send_token(self) -> None:
+        from . import adb
+
+        token = self._new_token()
+        self.auth_events.append("auth_token")
+        self._send(adb.AdbPacket(adb.A_AUTH, adb.AUTH_TOKEN, 0, token))
+
+    def _on_cnxn(self, packet) -> None:
+        if self.auth_mode == "none" or self.authenticated:
+            self.auth_events.append("cnxn_accepted")
+            self._accept()
+        else:
+            self._send_token()
+
+    def _on_auth(self, packet) -> None:
+        from . import adb
+
+        if packet.arg0 == adb.AUTH_SIGNATURE:
+            signature = bytes(packet.data)
+            token = self.pending_token or b""
+            accepted = any(
+                adb.verify_sha1(n, e, token, signature)
+                for n, e in self.authorized_keys
+            )
+            self.auth_events.append(
+                "signature_ok" if accepted else "signature_rejected"
+            )
+            if accepted:
+                self._accept()
+            else:
+                self._send_token()
+            return
+        if packet.arg0 == adb.AUTH_RSAPUBLICKEY:
+            text = bytes(packet.data).rstrip(b"\x00").decode("latin-1")
+            try:
+                n, e = adb.decode_adb_public_key(text)
+            except adb.AdbProtocolError as exc:
+                self.auth_events.append("publickey_bad")
+                LOG.warning("mock adb bad public key: %s", exc)
+                self._send_token()
+                return
+            self.authorized_keys.append((n, e))
+            self.auth_events.append("publickey")
+            if self.accept_public_key_upload:
+                self._accept()
+            else:
+                self._send_token()
+            return
+        self.auth_events.append("auth_kind_%d" % packet.arg0)
+
+    # -- services -----------------------------------------------------------
+    def _on_open(self, packet) -> None:
+        from . import adb
+
+        service = bytes(packet.data).rstrip(b"\x00").decode("latin-1")
+        host_id = int(packet.arg0)
+        remote_id = self._next_remote_id
+        self._next_remote_id += 1
+        stream: Dict[str, object] = {
+            "host_id": host_id,
+            "remote_id": remote_id,
+            "service": service,
+            "state": "open",
+        }
+        self.streams[host_id] = stream
+        self.services.append(service)
+        if service.startswith("sideload-host:") and self.legacy_only:
+            # Old device: the service does not exist, adbd answers CLSE.
+            self._close_stream(stream)
+            return
+        self._send(adb.AdbPacket(adb.A_OKAY, remote_id, host_id))
+        self._start_service(stream)
+
+    def _start_service(self, stream: Dict[str, object]) -> None:
+        service = str(stream["service"])
+        if service.startswith("shell,v2,raw:"):
+            self._run_shell_v2(stream, service[len("shell,v2,raw:"):])
+        elif service.startswith("shell:"):
+            self._run_shell_legacy(stream, service[len("shell:"):])
+        elif service.startswith("reboot:"):
+            self.reboot_target = service[len("reboot:"):]
+            self._close_stream(stream)
+        elif service.startswith("sideload-host:"):
+            self._start_sideload_host(stream, service[len("sideload-host:"):])
+        elif service.startswith("sideload:"):
+            size_text = service[len("sideload:"):]
+            try:
+                size = int(size_text)
+            except ValueError:
+                self._close_stream(stream)
+                return
+            self.sideload_protocol = "sideload"
+            self._sideload = {
+                "mode": "legacy",
+                "stream": stream,
+                "size": size,
+                "received": 0,
+                "blocks": 0,
+                "hasher": __import__("hashlib").sha256(),
+                "error": None,
+            }
+        elif service == "sync:":
+            self._sync = {"path": None, "buffer": bytearray(), "rx": bytearray()}
+        else:
+            LOG.info("mock adb closing unsupported service %r", service)
+            self._close_stream(stream)
+
+    def _run_shell_legacy(self, stream: Dict[str, object], command: str) -> None:
+        result = self._shell_result(command)
+        self._send_stream_data(stream, result.output)
+        self._close_stream(stream)
+
+    def _run_shell_v2(self, stream: Dict[str, object], command: str) -> None:
+        import struct as _struct
+
+        result = self._shell_result(command)
+        payload = bytearray()
+        if result.stdout:
+            payload += bytes([1]) + _struct.pack("<I", len(result.stdout)) + result.stdout
+        if result.stderr:
+            payload += bytes([2]) + _struct.pack("<I", len(result.stderr)) + result.stderr
+        code = result.exit_code if result.exit_code is not None else 0
+        payload += bytes([3]) + _struct.pack("<I", 1) + bytes([code & 0xFF])
+        self._send_stream_data(stream, bytes(payload))
+        self._close_stream(stream)
+
+    def _shell_result(self, command: str):
+        from . import adb
+
+        self.shell_commands.append(command)
+        if self.shell_handler is not None:
+            return self.shell_handler(command)
+        if command.startswith("echo "):
+            return adb.ShellResult(command[5:].encode() + b"\n", b"", 0)
+        if command.startswith("getprop "):
+            prop = command[len("getprop "):].strip()
+            values = {
+                "ro.product.device": "xaga",
+                "ro.serialno": "TESTSERIAL",
+                "ro.build.version.release": "13",
+            }
+            value = values.get(prop, "")
+            return adb.ShellResult((value + "\n").encode(), b"", 0)
+        if command == "id":
+            return adb.ShellResult(b"uid=0(root) gid=0(root)\n", b"", 0)
+        return adb.ShellResult(b"", b"", 0)
+
+    # -- sideload-host ------------------------------------------------------
+    def _start_sideload_host(self, stream: Dict[str, object], args: str) -> None:
+        import hashlib as _hashlib
+
+        parts = args.split(":")
+        if len(parts) != 2:
+            self._close_stream(stream)
+            return
+        try:
+            file_size = int(parts[0])
+            block_size = int(parts[1])
+        except ValueError:
+            self._close_stream(stream)
+            return
+        if file_size <= 0 or block_size <= 0:
+            self._close_stream(stream)
+            return
+        self.sideload_protocol = "sideload-host"
+        self._sideload = {
+            "mode": "host",
+            "stream": stream,
+            "size": file_size,
+            "block": block_size,
+            "next_block": 0,
+            "received": 0,
+            "blocks": 0,
+            "hasher": _hashlib.sha256(),
+            "error": None,
+            "block_buf": bytearray(),
+        }
+        self._request_sideload_block(stream)
+
+    def _request_sideload_block(self, stream: Dict[str, object]) -> None:
+        state = self._sideload
+        assert state is not None
+        block = int(state["next_block"])
+        self._send_stream_data(stream, b"%08d" % block)
+
+    def _sideload_host_chunk(self, stream: Dict[str, object], data: bytes) -> None:
+        state = self._sideload
+        assert state is not None
+        size = int(state["size"])
+        block_size = int(state["block"])
+        block = int(state["next_block"])
+        offset = block * block_size
+        expected = min(block_size, size - offset)
+        buffer = state.get("block_buf")
+        if buffer is None:
+            buffer = bytearray()
+            state["block_buf"] = buffer
+        buffer.extend(data)
+        if len(buffer) < expected:
+            return
+        if len(buffer) > expected:
+            state["error"] = "block %d: got %d bytes, expected %d" % (
+                block, len(buffer), expected)
+            self._fail_sideload(stream)
+            return
+        payload = bytes(buffer)
+        state["block_buf"] = bytearray()
+        state["hasher"].update(payload)
+        state["received"] = int(state["received"]) + len(payload)
+        state["blocks"] = int(state["blocks"]) + 1
+        state["next_block"] = block + 1
+        total_blocks = (size + block_size - 1) // block_size
+        if int(state["next_block"]) < total_blocks:
+            self._request_sideload_block(stream)
+            return
+        self.sideload_bytes = int(state["received"])
+        self.sideload_blocks = int(state["blocks"])
+        self.sideload_sha256 = state["hasher"].hexdigest()
+        ok = True
+        if self.expected_sideload_size is not None and self.sideload_bytes != self.expected_sideload_size:
+            ok = False
+            self.sideload_error = "size mismatch: got %d expected %d" % (
+                self.sideload_bytes, self.expected_sideload_size)
+        if self.expected_sideload_sha256 is not None and self.sideload_sha256 != self.expected_sideload_sha256:
+            ok = False
+            self.sideload_error = "sha256 mismatch"
+        if self.sideload_fail:
+            ok = False
+            self.sideload_error = "injected sideload failure"
+        self.sideload_ok = ok
+        if ok:
+            self._send_stream_data(stream, b"DONEDONE")
+        else:
+            self._send_stream_data(stream, b"FAILFAIL")
+        self._close_stream(stream)
+
+    def _fail_sideload(self, stream: Dict[str, object]) -> None:
+        state = self._sideload or {}
+        self.sideload_bytes = int(state.get("received", 0))
+        self.sideload_blocks = int(state.get("blocks", 0))
+        hasher = state.get("hasher")
+        if hasher is not None:
+            self.sideload_sha256 = hasher.hexdigest()
+        self.sideload_ok = False
+        self._send_stream_data(stream, b"FAILFAIL")
+        self._close_stream(stream)
+
+    # -- legacy sideload ----------------------------------------------------
+    def _finish_legacy_sideload(self) -> None:
+        state = self._sideload or {}
+        hasher = state.get("hasher")
+        self.sideload_protocol = "sideload"
+        self.sideload_bytes = int(state.get("received", 0))
+        self.sideload_blocks = int(state.get("blocks", 0))
+        if hasher is not None:
+            self.sideload_sha256 = hasher.hexdigest()
+        ok = True
+        if self.expected_sideload_size is not None and self.sideload_bytes != self.expected_sideload_size:
+            ok = False
+            self.sideload_error = "size mismatch"
+        if self.expected_sideload_sha256 is not None and self.sideload_sha256 != self.expected_sideload_sha256:
+            ok = False
+            self.sideload_error = "sha256 mismatch"
+        if self.sideload_fail:
+            ok = False
+            self.sideload_error = "injected sideload failure"
+        self.sideload_ok = ok
+
+    # -- data / close -------------------------------------------------------
+    def _on_wrte(self, packet) -> None:
+        from . import adb
+
+        # host -> device WRTE carries (host local id, device remote id)
+        host_id = int(packet.arg0)
+        stream = self.streams.get(host_id)
+        data = bytes(packet.data)
+        with self._cond:
+            self.writes.append(data)
+        if stream is None:
+            LOG.warning("mock adb WRTE for unknown stream %d", host_id)
+            self._send(adb.AdbPacket(adb.A_CLSE, 0, host_id))
+            return
+        service = str(stream["service"])
+        self._ack(stream)
+        if service.startswith("sideload-host:") and self._sideload is not None:
+            self._sideload_host_chunk(stream, data)
+        elif service.startswith("sideload:") and self._sideload is not None:
+            state = self._sideload
+            state["hasher"].update(data)
+            state["received"] = int(state["received"]) + len(data)
+            state["blocks"] = int(state["blocks"]) + 1
+        elif service == "sync:":
+            self._sync_request(stream, data)
+
+    def _on_clse(self, packet) -> None:
+        from . import adb
+
+        # host -> device CLSE carries (host local id, device remote id)
+        host_id = int(packet.arg0)
+        stream = self.streams.get(host_id)
+        if stream is None:
+            return
+        service = str(stream["service"])
+        if service.startswith("sideload:") and self._sideload is not None \
+                and self.sideload_protocol == "sideload":
+            self._finish_legacy_sideload()
+        self._send(adb.AdbPacket(adb.A_CLSE, int(stream["remote_id"]), host_id))
+        stream["state"] = "closed"
+
+    # -- sync push ----------------------------------------------------------
+    def _sync_request(self, stream: Dict[str, object], data: bytes) -> None:
+        state = self._sync or {"path": None, "buffer": bytearray(), "rx": bytearray()}
+        self._sync = state
+        rx = state["rx"]
+        rx.extend(data)
+        while len(rx) >= 4:
+            command = bytes(rx[:4])
+            if command == b"DONE":
+                if len(rx) < 8:
+                    return
+                del rx[:8]  # DONE carries a 4-byte mtime, not a length
+                path = state.get("path") or ""
+                self.sync_received[str(path)] = bytes(state["buffer"])
+                self._send_stream_data(stream, b"OKAY" + struct.pack("<I", 0))
+                continue
+            if len(rx) < 8:
+                return
+            length = struct.unpack("<I", bytes(rx[4:8]))[0]
+            if len(rx) < 8 + length:
+                return
+            payload = bytes(rx[8:8 + length])
+            del rx[:8 + length]
+            if command == b"SEND":
+                state["path"] = payload.decode("utf-8", "replace")
+                state["buffer"] = bytearray()
+                self._send_stream_data(stream, b"OKAY" + struct.pack("<I", 0))
+            elif command == b"DATA":
+                state["buffer"].extend(payload)
+            else:
+                self._send_stream_data(stream, b"FAIL" + struct.pack("<I", 0))
+
+    # -- test helpers -------------------------------------------------------
+    def expect_sideload(self, data: bytes) -> None:
+        """Set the package the next sideload must match byte for byte."""
+        import hashlib as _hashlib
+
+        self.expected_sideload_size = len(data)
+        self.expected_sideload_sha256 = _hashlib.sha256(data).hexdigest()
+
 
 
 # ---------------------------------------------------------------------------
