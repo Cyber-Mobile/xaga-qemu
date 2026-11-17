@@ -51,6 +51,9 @@ struct MtkSysconState {
     char *name;
     /* Bus-protection request masks; see mtk_syscon_bp_decode(). */
     uint32_t bprot[16];
+    /* Hardware-voter clock-gate votes / done acks; see mtk_hwv_cg_decode(). */
+    uint32_t hwv_vote[256];
+    uint32_t hwv_done[256];
 };
 
 static bool mtk_infracfg_b4_ctl;
@@ -253,6 +256,66 @@ static bool mtk_syscon_bp_decode(MtkSysconState *s, hwaddr off,
     return false;
 }
 
+/*
+ * Hardware-voter clock gates (the "hwv" syscon at 0x10320000).
+ *
+ * The vendor clock framework routes every gated clock and every HWV mux
+ * through the hardware voter instead of touching the gate register itself:
+ * it writes a SET vote (or a CLR request), waits until the SET register
+ * reads back the vote it just wrote, and then waits for the voter's done
+ * bit.  mtk_clk_hwv_mux_disable()/__cg_enable_hwv() (clk-mux.c, clk-gate.c)
+ * describe the protocol; the register map is in clkchk-mt6895.c
+ * (HWV_CG_SET(id) = id*8, HWV_CG_SET_STA = 0x1a00 + id*4,
+ * HWV_CG_DONE(id) = 0x1c00 + id*4, HWV_CG_STA/EN at 0x1800/0x1900).
+ *
+ * A voter that acknowledges votes within microseconds is modelled as a
+ * state machine: the SET register reflects the votes software has driven
+ * (so a CLR request removes them), and the done word reports the transition
+ * as complete once the vote was written.  Without this the SET readback
+ * keeps the stale vote and clk-mux.c times out, which is exactly the
+ * CLK_EVT_HWV_CG_TIMEOUT that makes clkchk-mt6895.c BUG().
+ *
+ * MTK_PWR_STATE=1 selects the state machine, matching mtk-scpsys.c.
+ */
+enum {
+    MTK_HWV_CG_SET = 0,
+    MTK_HWV_CG_CLR,
+    MTK_HWV_CG_STA,
+    MTK_HWV_CG_EN,
+    MTK_HWV_CG_SET_STA,
+    MTK_HWV_CG_CLR_STA,
+    MTK_HWV_CG_DONE,
+};
+
+static bool mtk_hwv_cg_decode(hwaddr off, int *id, int *kind)
+{
+    unsigned idv;
+
+    if (off < 0x1000) {
+        idv = off / 8;
+        if (idv < 256) {
+            *id = idv;
+            *kind = (off & 4) ? MTK_HWV_CG_CLR : MTK_HWV_CG_SET;
+            return true;
+        }
+        return false;
+    }
+    if (off >= 0x1800 && off < 0x1d00 && ((off - 0x1800) & 3) == 0) {
+        idv = ((off - 0x1800) % 0x100) / 4;
+        if (idv < 256) {
+            *id = idv;
+            *kind = MTK_HWV_CG_STA + (off - 0x1800) / 0x100;
+            return true;
+        }
+    }
+    return false;
+}
+
+static bool mtk_hwv_cg_active(MtkSysconState *s)
+{
+    return s->name && !strcmp(s->name, "hwv") && getenv("MTK_PWR_STATE");
+}
+
 static uint64_t mtk_syscon_read(void *opaque, hwaddr offset, unsigned size)
 {
     {
@@ -384,6 +447,39 @@ static uint64_t mtk_syscon_read(void *opaque, hwaddr offset, unsigned size)
         if (mtk_syscon_bp_decode(s, offset, &is_set, &is_clr, &is_sta,
                                  &is_en, &grp) && (is_sta || is_en)) {
             val |= s->bprot[grp];
+            if (getenv("MTK_BPTRACE") && s->name &&
+                !strcmp(s->name, "infracfg_ao_clk") &&
+                offset >= 0xc10 && offset < 0xc30) {
+                static int nb;
+                if (nb++ < 200) {
+                    fprintf(stderr, "BPT-R %s off=%#x val=%#" PRIx64
+                            " bp=%#x\n", s->name, (unsigned)offset, val,
+                            s->bprot[grp]);
+                }
+            }
+        }
+    }
+    if (size == 4 && mtk_hwv_cg_active(s)) {
+        int id, kind;
+
+        if (mtk_hwv_cg_decode(offset, &id, &kind)) {
+            switch (kind) {
+            case MTK_HWV_CG_SET:
+            case MTK_HWV_CG_STA:
+            case MTK_HWV_CG_EN:
+            case MTK_HWV_CG_SET_STA:
+                val = s->hwv_vote[id];
+                break;
+            case MTK_HWV_CG_CLR:
+            case MTK_HWV_CG_CLR_STA:
+                val = 0;
+                break;
+            case MTK_HWV_CG_DONE:
+                val = s->hwv_done[id];
+                break;
+            default:
+                break;
+            }
         }
     }
     /*
@@ -538,6 +634,13 @@ static uint64_t mtk_syscon_read(void *opaque, hwaddr offset, unsigned size)
             }
         }
     }
+    if (getenv("MTK_BPTRACE") && size == 4 && offset >= 0xc10 && offset < 0xc30) {
+        static int n2r;
+        if (n2r++ < 150) {
+            fprintf(stderr, "BPT2-R name=%s off=%#x val=%#" PRIx64 "\n",
+                    s->name ? s->name : "(null)", (unsigned)offset, val);
+        }
+    }
     mtk_usbdevtrace(MTK_SYSCON(opaque)->name, 'R', offset, size, val);
     mtk_hwvlog(s->name, 'R', offset, val);
     trace_mtk_syscon_read(s->name, offset, val);
@@ -628,6 +731,39 @@ static void mtk_syscon_write(void *opaque, hwaddr offset, uint64_t value,
             } else if (is_en && !is_sta) {
                 s->bprot[grp] = (uint32_t)value;
             }
+            if (getenv("MTK_BPTRACE") && s->name &&
+                !strcmp(s->name, "infracfg_ao_clk") &&
+                offset >= 0xc10 && offset < 0xc30) {
+                static int nw;
+                if (nw++ < 200) {
+                    fprintf(stderr, "BPT-W %s off=%#x val=%#" PRIx64
+                            " set=%d clr=%d en=%d sta=%d bp=%#x\n",
+                            s->name, (unsigned)offset, value, is_set, is_clr,
+                            is_en, is_sta, s->bprot[grp]);
+                }
+            }
+        }
+    }
+    if (size == 4 && mtk_hwv_cg_active(s)) {
+        int id, kind;
+
+        if (mtk_hwv_cg_decode(offset, &id, &kind)) {
+            switch (kind) {
+            case MTK_HWV_CG_SET:
+                s->hwv_vote[id] |= (uint32_t)value;
+                s->hwv_done[id] |= (uint32_t)value;
+                break;
+            case MTK_HWV_CG_CLR:
+                s->hwv_vote[id] &= ~(uint32_t)value;
+                s->hwv_done[id] |= (uint32_t)value;
+                break;
+            case MTK_HWV_CG_EN:
+                s->hwv_vote[id] = (uint32_t)value;
+                s->hwv_done[id] |= (uint32_t)value;
+                break;
+            default:
+                break;
+            }
         }
     }
     if (s->name && !strcmp(s->name, "hwv") && !getenv("MTK_NO_HWVPLLEN") &&
@@ -642,6 +778,13 @@ static void mtk_syscon_write(void *opaque, hwaddr offset, uint64_t value,
             mtk_hwv_pll_on |= (uint32_t)value;
         } else {
             mtk_hwv_pll_on &= ~(uint32_t)value;
+        }
+    }
+    if (getenv("MTK_BPTRACE") && size == 4 && offset >= 0xc10 && offset < 0xc30) {
+        static int n2w;
+        if (n2w++ < 150) {
+            fprintf(stderr, "BPT2-W name=%s off=%#x val=%#" PRIx64 "\n",
+                    s->name ? s->name : "(null)", (unsigned)offset, value);
         }
     }
     mtk_usbdevtrace(s->name, 'W', offset, size, value);
@@ -668,12 +811,43 @@ static const MemoryRegionOps mtk_syscon_ops = {
     },
 };
 
+/*
+ * Bus-protection state left enabled when the boot chain hands over.
+ *
+ * The preloader/LK clkmgr flows poll these status bits without always writing
+ * the matching SET request first (they are the same bits the legacy
+ * constant-ack overlays used to report).  The kernel's
+ * clear_bus_protection() writes CLR before it polls, so a power-on transition
+ * that owns a mask clears the corresponding preset by itself.
+ *
+ *   infracfg_ao group 0xc40/0xc50/0xc60: MD protect masks (bit28 / bit9 /
+ *   bits 16,17 = MT6895_TOP_AXI_PROT_EN_INFRASYS0_MD / INFRASYS1_MD /
+ *   EMISYS0_MD);
+ *   vlpcfg: the VLP ack bits 10..13 the clkmgr flow polls at 0x1c00c220.
+ */
+static void mtk_syscon_bp_presets(MtkSysconState *s)
+{
+    memset(s->bprot, 0, sizeof(s->bprot));
+    if (!getenv("MTK_PWR_STATE") || !s->name) {
+        return;
+    }
+    if (!strcmp(s->name, "infracfg_ao_clk")) {
+        s->bprot[3] = 0x10000000u;
+        s->bprot[4] = 0x00000200u;
+        s->bprot[5] = 0x00030000u;
+    } else if (!strcmp(s->name, "vlpcfg_bus_clk")) {
+        s->bprot[0] = 0x00003c00u;
+    }
+}
+
 static void mtk_syscon_reset_hold(Object *obj, ResetType type)
 {
     MtkSysconState *s = MTK_SYSCON(obj);
 
     memset(s->regs, 0, s->size);
-    memset(s->bprot, 0, sizeof(s->bprot));
+    memset(s->hwv_vote, 0, sizeof(s->hwv_vote));
+    memset(s->hwv_done, 0, sizeof(s->hwv_done));
+    mtk_syscon_bp_presets(s);
 }
 
 /*
@@ -691,6 +865,7 @@ static void mtk_syscon_realize(DeviceState *dev, Error **errp)
                           TYPE_MTK_SYSCON, s->size);
     sysbus_init_mmio(SYS_BUS_DEVICE(dev), &s->iomem);
     s->regs = g_new0(uint32_t, s->size / 4);
+    mtk_syscon_bp_presets(s);
 }
 
 static void mtk_syscon_finalize(Object *obj)

@@ -87,6 +87,9 @@ OBJECT_DECLARE_SIMPLE_TYPE(MtkScpsysState, MTK_SCPSYS)
 /* SPM power-status words (mtk-scpsys-mt6895.c scp_soc_data.regs). */
 #define SCPSYS_PWR_STATUS_OFF   0x0f34
 #define SCPSYS_PWR_STATUS2_OFF  0x0f38
+/* XPU (GPU) power-status words, same SPM block. */
+#define SCPSYS_XPU_STATUS_OFF   0x0f3c
+#define SCPSYS_XPU_STATUS2_OFF  0x0f40
 #define MCUPM_HANDSHAKE_OFFSET  0x0eb4
 #define MCUPM_HANDSHAKE_MASK    0xc0002000      /* BIT(30) | BIT(31) | BIT(13) */
 
@@ -209,6 +212,36 @@ static uint32_t mtk_scpsys_pwr_status(const uint32_t *regs)
  * whole run as power-control words, so the state machine covers all of it
  * and the MCUPM case adds its own bits on top.
  */
+/*
+ * XPU_PWR_STATUS / XPU_PWR_STATUS_2ND: power state of the GPU rail controls.
+ * From the vendor register map (clkchk-mt6895.c REGNAME(spm, 0xEB8,
+ * MFG0_PWR_CON), REGNAME(spm, 0xF3C, XPU_PWR_STATUS)) and mt6983's pd_chk
+ * (MFG0_DORMANT -> XPU_PWR_STA bit 1, MFG1 -> bit 2 ...): bit 1 is
+ * mfg0_dormant and bits 2..13 are mfg1..mfg12.
+ *
+ * The BL2_EXT flow powers MFG0 through 0xEB8 (observed value 0xc000004d
+ * after its writes), and BL2's gpueb PLL init then reads XPU_PWR_STATUS and
+ * requires bit 1 before it releases the GPUEB partition; deriving the word
+ * from the rail controls keeps that handshake real instead of a constant.
+ */
+static uint32_t mtk_scpsys_xpu_status(const uint32_t *regs)
+{
+    uint32_t v = 0;
+    unsigned i;
+
+    if ((regs[0x0eb8 / 4] & (PWR_ON_BIT | PWR_ON_2ND_BIT)) != 0) {
+        v |= BIT(1);                    /* mfg0_dormant */
+    }
+    for (i = 0; i < 12; i++) {
+        uint32_t ctl = 0x0ebc + i * 4;  /* mfg1 .. mfg12 */
+
+        if (regs[ctl / 4] & (PWR_ON_BIT | PWR_ON_2ND_BIT)) {
+            v |= BIT(2 + i);
+        }
+    }
+    return v;
+}
+
 static bool mtk_scpsys_is_pwr_con(hwaddr o)
 {
     return o >= 0x0e00 && o < 0x0ef0 && (o & 3u) == 0;
@@ -224,8 +257,15 @@ static uint32_t mtk_scpsys_pwr_con_read(uint32_t reg)
 {
     uint32_t v = reg & SCPSYS_WRITABLE_MASK;
 
-    if ((v & (PWR_ON_BIT | PWR_ON_2ND_BIT)) ==
-        (PWR_ON_BIT | PWR_ON_2ND_BIT)) {
+    /*
+     * PWR_ACK follows the power-on request.  The BL2_EXT/LK clkmgr flows
+     * read-modify-write the word and expect the acknowledge after driving
+     * PWR_ON alone (they set PWR_ON_2ND in the next step), while the kernel
+     * driver only polls after writing both; deriving from the OR keeps both
+     * consistent, and the power-off sequence clears both request bits before
+     * its poll, so it still reads 0.
+     */
+    if (v & (PWR_ON_BIT | PWR_ON_2ND_BIT)) {
         v |= SCPSYS_STATUS_MASK;
     }
     if (v & SCPSYS_SRAM_PDN_BIT) {
@@ -325,6 +365,10 @@ static uint64_t mtk_scpsys_read(void *opaque, hwaddr offset, unsigned size)
                      * derive them from the PWR_CON state.
                      */
                     reg = mtk_scpsys_pwr_status(s->regs);
+                } else if ((o & ~3u) == SCPSYS_XPU_STATUS_OFF ||
+                           (o & ~3u) == SCPSYS_XPU_STATUS2_OFF) {
+                    /* XPU_PWR_STATUS / XPU_PWR_STATUS_2ND: GPU rail state. */
+                    reg = mtk_scpsys_xpu_status(s->regs);
                 }
             } else if ((o & ~3u) >= 0x0e10 && (o & ~3u) <= 0x0e74) {
                 /* Legacy constant PWR_ACK, kept for the pre-MTK_PWR_STATE model. */

@@ -8865,7 +8865,7 @@ static void mt6895_create_gic(Mt6895MachineState *s, Error **errp)
 }
 
 /*
- * ---- diagnostic block: kernel-stall diagnostics -------------------------
+ * ---- -dev block: kernel-stall diagnostics -------------------------
  * MTK_KSTALL_DUMP=<ms>: every <ms> of host (REALTIME) time print CPU0's PC,
  * PSTATE, the architected timer registers and the GICv3 redistributor /
  * CPU-interface state. Uses the realtime clock so it keeps reporting when
@@ -8922,7 +8922,7 @@ static void mt6895_kstall_dump(void *opaque)
             gs->gicd_ctlr);
     timer_mod(t, qemu_clock_get_ms(QEMU_CLOCK_REALTIME) + period_ms);
 }
-/* ---- end diagnostic block ---------------------------------------------- */
+/* ---- end -dev block ---------------------------------------------- */
 
 
 /*
@@ -11698,10 +11698,25 @@ static const struct {
 
     for (size_t i = 0; i < ARRAY_SIZE(blocks); i++) {
         /*
+         * Two DCM entries map exactly the same windows as earlier entries:
+         * mt6895.dcm-infracfg-ao == infracfg_ao_clk (0x10001000) and
+         * mt6895.dcm-infracfg-ao-mem == nemi_bus (0x10270000).  With two
+         * plain syscon regions on one address QEMU keeps the later one, so
+         * the DCM entry used to shadow the window that owns the infracfg_ao
+         * bus-protection/clock-gate registers (MTK_BPTRACE showed the
+         * kernel's scpsys writes landing in mt6895.dcm-infracfg-ao).  The
+         * DCM driver only needs MMIO backing, which the earlier window
+         * already provides, so the duplicate is skipped.
+         */
+        if (!strcmp(blocks[i].name, "mt6895.dcm-infracfg-ao") ||
+            !strcmp(blocks[i].name, "mt6895.dcm-infracfg-ao-mem")) {
+            continue;
+        }
+        /*
          * M4U/IOMMU banks: real TLB-invalidate completion (CPE_DONE) semantics,
          * see hw/misc/mtk_iommu.c.  On a plain register window the kernel's
          * mtk_iommu_tlb_flush_all polls REG_MMU_CPE_DONE forever ("TLB flush
-         * All timed out", earlier bring-up notes,290 kstall3).  MTK_NO_IOMMU=1 reverts.
+         * All timed out", earlier bring-up notes,290 ).  MTK_NO_IOMMU=1 reverts.
          */
         /*
          * GCE/CMDQ: the CMDQ driver polls thread registers directly, so a
@@ -11993,7 +12008,7 @@ static void mt6895_pc_sample(void *opaque)
         uint64_t pc = env->aarch64 ? env->pc : env->regs[15];
 
         /*
-         * MTK_PCTIME (diagnostic, bring-up): host wall-clock time series
+         * MTK_PCTIME (diagnostic, ): host wall-clock time series
          * with the guest PC. 5 ms period; t=0 at the first sample. Lets the
          * sample stream be aligned with the serial-byte timeline so a slow LK
          * phase can be split into guest spin/poll vs guest CPU work.
@@ -12439,8 +12454,8 @@ static const MemoryRegionOps mt6895_dsi_ops = {
 /*
  * LK display RDMA frame-done status latch.
  *
- * Evidence (bring-up, 2026-11-16, MTK_PCTIME PC+register wall-clock sampling of
- * qemu-bring-up.exe at MTK_ICOUNT=off): LK spends ~1.0 s in one burst inside the
+ * Evidence (, 2026-11-16, MTK_PCTIME PC+register wall-clock sampling of
+ * qemu-.exe at MTK_ICOUNT=off): LK spends ~1.0 s in one burst inside the
  * display RDMA wait path, disassembled from parts/lk_a.img as
  *
  *   0x50f4c36c  wait_rdma(id, mask, timeout):
