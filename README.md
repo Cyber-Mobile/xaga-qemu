@@ -25,14 +25,15 @@ the emulator is the project.**
 | USB host: xHCI with keyboard / network / audio enumeration | ✅ |
 | USB device mode: mtu3-style UDC + QMU, bridged to a host fastboot client (`getvar`, `download`, `flash`) | ✅ |
 | KPD, RTC, PMIC/SPMI, regulators, clocks | ✅ partial (strict vendor power/clock checks WIP) |
-| LineageOS: flash `boot`/`vendor_boot`/`dtbo`/`vbmeta`, kernel reaches `init` first stage | 🚧 power-domain/clock modeling in progress |
+| LineageOS: flash `boot`/`vendor_boot`/`dtbo`/`vbmeta`, boot to **recovery** (userspace + `adbd` started) | ✅ via `MTK_PWR_STATE=1` real power/clock modeling; default path unchanged |
 | Audio: AFE model + 440 Hz self-test | 🧪 model ready |
 
 ## Roadmap
 
 - [x] Boot chain, display, UFS, USB, recovery UI
 - [x] LK fastboot over emulated USB device mode (host-side client included)
-- [ ] Full LineageOS/Android boot (power domains, clocks, regulators strict semantics)
+- [x] LineageOS kernel boot to recovery (`MTK_PWR_STATE=1` power/clock/bus-protection modeling)
+- [ ] Full LineageOS/Android boot and `adb sideload`
 - [ ] Kernel USB gadget: `fastbootd`, `adb`, `adb sideload` in recovery
 - [ ] Audio path end-to-end (AFE + MT6368 codec + smart PA)
 - [ ] Networking (Wi-Fi/BT connectivity stack), sensors, camera, and automation/CI hooks
