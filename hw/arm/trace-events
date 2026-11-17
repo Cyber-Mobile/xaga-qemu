@@ -96,3 +96,14 @@ z2_aer915_event(int8_t event, int8_t len) "i2c event =0x%x len=%d bytes"
 
 # bcm2838.c
 bcm2838_gic_set_irq(int irq, int level) "gic irq:%d lvl:%d"
+
+# mt6895.c -- SRAM log header window
+mt6895_logstore_read(uint64_t off, uint64_t size, uint64_t val) "mt6895-logstore read off=0x%llx size=%llu -> 0x%llx"
+mt6895_logstore_write(uint64_t off, uint64_t size, uint64_t val) "mt6895-logstore write off=0x%llx size=%llu = 0x%llx"
+
+# mt6895.c -- preloader self-copy window
+mt6895_dram_copy(uint64_t addr, uint64_t size, uint64_t val) "mt6895-dramcopy addr=0x%llx size=%llu val=0x%llx"
+mt6895_slotprobe(uint64_t n, uint64_t addr, uint64_t size) "mt6895-slotprobe #%llu addr=0x%llx size=%llu"
+mt6895_tblprobe(uint64_t n, uint64_t addr, uint64_t size) "mt6895-tblprobe #%llu addr=0x%llx size=%llu"
+mt6895_geomprobe(uint64_t n, uint64_t addr, uint64_t size) "mt6895-geomprobe #%llu addr=0x%llx size=%llu"
+mt6895_objw(uint64_t n, uint64_t addr, uint64_t size, uint64_t val) "mt6895-objw #%llu addr=0x%llx size=%llu val=0x%llx"

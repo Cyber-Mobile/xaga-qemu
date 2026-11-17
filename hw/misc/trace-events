@@ -442,3 +442,13 @@ iommu_testdev_dma_read(uint64_t gva, uint32_t len) "gva=0x%" PRIx64 " len=%u"
 iommu_testdev_dma_verify(uint32_t expected, uint32_t actual) "expected=0x%x actual=0x%x"
 iommu_testdev_dma_result(uint32_t result) "DMA completed result=0x%x"
 iommu_testdev_dma_armed(bool armed) "armed=%d"
+
+# mtk_syscon.c
+mtk_syscon_read(const char *name, uint64_t off, uint64_t val) "mtk-syscon read  %s off=0x%llx -> 0x%llx"
+mtk_tinysys_mbox_read(uint64_t off, uint64_t val) "mtk-tinysys-mbox read  off=0x%llx -> 0x%llx"
+mtk_tinysys_mbox_write(uint64_t off, uint64_t val) "mtk-tinysys-mbox write off=0x%llx = 0x%llx"
+mtk_ufshci_read(uint64_t off, uint64_t val) "mtk-ufshci read  off=0x%llx -> 0x%llx"
+mtk_ufshci_write(uint64_t off, uint64_t val) "mtk-ufshci write off=0x%llx = 0x%llx"
+mtk_scpsys_read(uint64_t off, uint64_t val) "mtk-scpsys read  off=0x%llx -> 0x%llx"
+mtk_scpsys_write(uint64_t off, uint64_t val) "mtk-scpsys write off=0x%llx = 0x%llx"
+mtk_syscon_write(const char *name, uint64_t off, uint64_t val) "mtk-syscon write %s off=0x%llx = 0x%llx"

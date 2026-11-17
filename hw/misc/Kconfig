@@ -258,3 +258,27 @@ config XLNX_ZYNQ_DDRC
     bool
 
 source macio/Kconfig
+
+config MTK_SYSCON
+    bool
+    depends on ARM
+
+config MTK_SCPSYS
+    bool
+    depends on ARM
+
+config MTK_TINYSYS_MBOX
+    bool
+    depends on ARM
+
+config MTK_UFSHCI
+    bool
+    depends on ARM
+
+config MTK_SPMI_PMIF
+    bool
+    depends on ARM
+
+# MediaTek SPMI PMIC arbiter. The SPMI core and the MTK host controller driver
+# are both built into the ROM kernel, so without a PMIF the PMIC stack never
+# comes up and every consumer of a PMIC regulator stays down.

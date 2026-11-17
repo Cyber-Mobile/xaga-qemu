@@ -141,3 +141,7 @@ stm32f2xx_usart_receive(char *id, uint8_t chr) " %s receiving '%c'"
 # riscv_htif.c
 htif_uart_write_to_host(uint8_t device, uint8_t cmd, uint64_t payload) "device: %u cmd: %02u payload: %016" PRIx64
 htif_uart_unknown_device_command(uint8_t device, uint8_t cmd, uint64_t payload) "device: %u cmd: %02u payload: %016" PRIx64
+
+# mtk_uart.c
+mtk_uart_irq(uint8_t lsr, uint8_t ier, uint8_t iir, int level, bool brk) "mtk-uart irq lsr=0x%02x ier=0x%02x iir=0x%02x level=%d break=%d"
+mtk_uart_break(void) "mtk-uart break received"

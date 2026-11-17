@@ -75,3 +75,11 @@ pl181_data_engine_idle(void) "data engine idle"
 # aspeed_sdhci.c
 aspeed_sdhci_read(uint64_t addr, uint32_t size, uint64_t data) "@0x%" PRIx64 " size %u: 0x%" PRIx64
 aspeed_sdhci_write(uint64_t addr, uint32_t size, uint64_t data) "@0x%" PRIx64 " size %u: 0x%" PRIx64
+
+# mtk_msdc.c -- MediaTek MSDC
+mtk_msdc_read(uint32_t offset, uint32_t value) "mtk-msdc read 0x%03x -> 0x%08x"
+mtk_msdc_write(uint32_t offset, uint32_t value) "mtk-msdc write 0x%03x = 0x%08x"
+mtk_msdc_cmd(uint32_t rawcmd, uint32_t arg) "mtk-msdc command rawcmd=0x%08x arg=0x%08x"
+mtk_msdc_irq(uint32_t status, uint32_t enable, int level) "mtk-msdc irq status=0x%08x enable=0x%08x level=%d"
+mtk_msdc_resp(uint32_t cmd, uint32_t r0) "mtk-msdc response cmd=%u r0=0x%08x"
+mtk_msdc_dma(uint32_t gpd, uint32_t gpdw0, uint32_t bd, uint32_t total, uint32_t done) "mtk-msdc dma gpd=0x%x gpd[0]=0x%x bd=0x%x total=%u done=%u"

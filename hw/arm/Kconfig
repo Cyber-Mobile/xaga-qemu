@@ -1,3 +1,20 @@
+config MT6895
+    bool
+    default y
+    depends on ARM
+    depends on TCG
+    select ARM_GIC
+    select MTK_UART
+    select MTK_SYSCON
+    select MTK_MSDC
+    select MTK_SPMI_PMIF
+    select MTK_SCPSYS
+    select MTK_UFSHCI
+    select MTK_TINYSYS_MBOX
+    select MTK_AFE
+    select MTK_I2C
+    select MTK_DISP
+
 config ARM_VIRT
     bool
     default y
