@@ -36,6 +36,7 @@
 #include "hw/display/mtk_disp.h"
 #include "system/address-spaces.h"
 #include "system/memory.h"
+#include "hw/misc/mtk_iommu.h"
 #include "ui/console.h"
 #include <zlib.h>
 
@@ -60,6 +61,9 @@ struct MtkDispState {
     uint32_t dump_ms;
     bool trace;
 
+    unsigned n_xlate_fail;      /* IOMMU translation failures */
+    unsigned n_xlate_ok;        /* IOMMU translated pages read */
+    unsigned xlate_logged;
     uint32_t *canvas;           /* xRGB8888, width*height */
     uint8_t *line;
     uint32_t last_crc;
@@ -71,6 +75,37 @@ static uint32_t rd32(hwaddr a)
 {
     return address_space_ldl_le(&address_space_memory, a,
                                 MEMTXATTRS_UNSPECIFIED, NULL);
+}
+
+/*
+ * Read scan-out data.  With MTK_IOMMU=1 the OVL layer address is an IOVA and
+ * every 4 KiB page has to be translated through the disp_iommu page table;
+ * without IOMMU translation the address is a physical address and is read
+ * directly (the pre-IOMMU bring-up configuration).
+ */
+static bool mtk_disp_read(MtkDispState *s, uint64_t addr, void *buf,
+                          size_t len, bool iommu)
+{
+    if (!iommu) {
+        return address_space_read(&address_space_memory, addr,
+                                  MEMTXATTRS_UNSPECIFIED, buf, len) == MEMTX_OK;
+    }
+    while (len) {
+        hwaddr pa;
+        size_t chunk = MIN(len, (size_t)(0x1000 - (addr & 0xfff)));
+
+        if (!mtk_iommu_translate_or_identity(MTK_IOMMU_DEV_DISP, addr, &pa) ||
+            address_space_read(&address_space_memory, pa,
+                               MEMTXATTRS_UNSPECIFIED, buf, chunk) != MEMTX_OK) {
+            s->n_xlate_fail++;
+            return false;
+        }
+        s->n_xlate_ok++;
+        buf = (uint8_t *)buf + chunk;
+        addr += chunk;
+        len -= chunk;
+    }
+    return true;
 }
 
 static uint32_t mtk_disp_px(const uint8_t *p, unsigned fmt, bool bswap,
@@ -135,7 +170,8 @@ static unsigned mtk_disp_bpp(unsigned fmt)
 
 static void mtk_disp_blit(MtkDispState *s, uint64_t addr, uint32_t pitch,
                           unsigned fmt, bool bswap, bool rgbswap,
-                          uint32_t x0, uint32_t y0, uint32_t w, uint32_t h)
+                          uint32_t x0, uint32_t y0, uint32_t w, uint32_t h,
+                          bool iommu)
 {
     unsigned bpp = mtk_disp_bpp(fmt);
     uint32_t y, x;
@@ -146,8 +182,15 @@ static void mtk_disp_blit(MtkDispState *s, uint64_t addr, uint32_t pitch,
     w = MIN(w, s->width - x0);
     h = MIN(h, s->height - y0);
     for (y = 0; y < h; y++) {
-        address_space_read(&address_space_memory, addr + (uint64_t)y * pitch,
-                           MEMTXATTRS_UNSPECIFIED, s->line, (hwaddr)w * bpp);
+        if (!mtk_disp_read(s, addr + (uint64_t)y * pitch, s->line,
+                           (size_t)w * bpp, iommu)) {
+            memset(s->line, 0, (size_t)w * bpp);
+            if (s->xlate_logged < 8) {
+                s->xlate_logged++;
+                fprintf(stderr, "MTK-DISP: no IOMMU mapping for %#" PRIx64
+                        " (layer %ux%u fmt %u)\n", addr, w, h, fmt);
+            }
+        }
         for (x = 0; x < w; x++) {
             s->canvas[(y0 + y) * s->width + x0 + x] =
                 mtk_disp_px(s->line + x * bpp, fmt, bswap, rgbswap);
@@ -198,6 +241,7 @@ static bool mtk_disp_compose(MtkDispState *s, char *desc, size_t dlen)
     bool any = false;
     int o, n, pass;
     int mode = mtk_disp_src_mode();
+    bool iommu = mtk_iommu_enabled();
 
     memset(s->canvas, 0, (size_t)s->width * s->height * 4);
     desc[0] = 0;
@@ -208,13 +252,13 @@ static bool mtk_disp_compose(MtkDispState *s, char *desc, size_t dlen)
         mtk_disp_blit(s, s->fb_fallback,
                       s->fb_pitch ? s->fb_pitch : ROUND_UP(s->width, 32) * 4,
                       s->fb_fmt, false, false, 0, 0,
-                      s->fb_right ? s->width / 2 : s->width, s->height);
+                      s->fb_right ? s->width / 2 : s->width, s->height, false);
         if (s->fb_right) {
             mtk_disp_blit(s, s->fb_right,
                           s->fb_right_pitch ? s->fb_right_pitch
                                             : ROUND_UP(s->width / 2, 32) * 4,
                           s->fb_fmt, false, false, s->width / 2, 0,
-                          s->width - s->width / 2, s->height);
+                          s->width - s->width / 2, s->height, false);
         }
         snprintf(desc, dlen, "simplefb fb=%#" PRIx64 " pitch=%u fmt=%u%s%#" PRIx64,
                  s->fb_fallback,
@@ -222,6 +266,10 @@ static bool mtk_disp_compose(MtkDispState *s, char *desc, size_t dlen)
                  s->fb_fmt, s->fb_right ? " right=" : "",
                  s->fb_right);
         return true;
+    }
+    if (iommu) {
+        snprintf(desc + strlen(desc), dlen - strlen(desc),
+                 " iommu_ok=%u iommu_fail=%u", s->n_xlate_ok, s->n_xlate_fail);
     }
     /*
      * Two passes:
@@ -268,7 +316,20 @@ static bool mtk_disp_compose(MtkDispState *s, char *desc, size_t dlen)
                           getenv("MTK_DISP_IGN_SRC_CON") != NULL;
                 normal = enabled && addr != 0 && (size & 0xffff) != 0 &&
                          (size >> 16) != 0;
-                cma = addr >= 0xc0000000u && addr < 0xd0000000u;
+                if (iommu) {
+                    /*
+                     * The layer address is an IOVA: recovery's minui commits
+                     * only ADDR/PITCH of OVL2 L1, so an address that maps
+                     * through disp_iommu is the recovery framebuffer.
+                     */
+                    hwaddr pa;
+
+                    cma = addr != 0 &&
+                          mtk_iommu_translate_or_identity(MTK_IOMMU_DEV_DISP,
+                                                          addr, &pa);
+                } else {
+                    cma = addr >= 0xc0000000u && addr < 0xd0000000u;
+                }
                 fb_addr = cma && !getenv("MTK_DISP_NO_ADDR_FALLBACK") &&
                           (getenv("MTK_DISP_ADDR_ONLY") != NULL || !normal);
                 if (pass == 0) {
@@ -282,7 +343,7 @@ static bool mtk_disp_compose(MtkDispState *s, char *desc, size_t dlen)
                     mtk_disp_blit(s, addr, pitch, (con >> 12) & 0xf,
                                   con & (1u << 24), con & (1u << 25),
                                   xbase + (off & 0xffff), off >> 16,
-                                  size & 0xffff, size >> 16);
+                                  size & 0xffff, size >> 16, true);
                     snprintf(desc + strlen(desc), dlen - strlen(desc),
                              "ovl%d.L%d(en=bit%d src_con=%#x) addr=%#x "
                              "con=%#x size=%ux%u off=%u,%u pitch=%u; ",
@@ -308,12 +369,12 @@ static bool mtk_disp_compose(MtkDispState *s, char *desc, size_t dlen)
                         uint32_t hw2 = (uint32_t)s->width / 2;
 
                         mtk_disp_blit(s, addr + hw2 * 4, fp, 2, false, false,
-                                      0, 0, hw2, s->height);
+                                      0, 0, hw2, s->height, true);
                         mtk_disp_blit(s, addr, fp, 2, false, false,
-                                      hw2, 0, s->width - hw2, s->height);
+                                      hw2, 0, s->width - hw2, s->height, true);
                     } else {
                         mtk_disp_blit(s, addr, fp, 2, false, false, 0, 0,
-                                      s->width, s->height);
+                                      s->width, s->height, true);
                     }
                     snprintf(desc + strlen(desc), dlen - strlen(desc),
                              "ovl%d.L%d(ADDR-FB) addr=%#x pitch=%u; ",
@@ -325,7 +386,7 @@ static bool mtk_disp_compose(MtkDispState *s, char *desc, size_t dlen)
     }
     if (!any && s->fb_fallback && mode != MTK_DISP_SRC_DRM) {
         mtk_disp_blit(s, s->fb_fallback, ROUND_UP(s->width, 32) * 4, 2,
-                      false, false, 0, 0, s->width, s->height);
+                      false, false, 0, 0, s->width, s->height, false);
         snprintf(desc, dlen, "fallback fb=%#" PRIx64, s->fb_fallback);
         any = true;
     }
@@ -362,13 +423,25 @@ static void mtk_disp_dump_ovl(MtkDispState *s, const char *why)
                 "src_con=%#x\n", why, o, (uint64_t)base, roi, dpcon, src_con);
         for (n = 0; n < 4; n++) {
             hwaddr lb = base + 0x20 * n;
+            uint32_t addr = rd32(base + 0xf40 + 0x20 * n);
+            char pabuf[48] = "";
 
+            if (mtk_iommu_enabled() && addr) {
+                hwaddr pa;
+
+                if (mtk_iommu_translate_or_identity(MTK_IOMMU_DEV_DISP,
+                                                     addr, &pa)) {
+                    snprintf(pabuf, sizeof(pabuf), " pa=%#" HWADDR_PRIx, pa);
+                } else {
+                    snprintf(pabuf, sizeof(pabuf), " pa=UNMAPPED");
+                }
+            }
             fprintf(stderr,
                     "MTK-DISP-DBG   L%d con=%#x size=%#x off=%#x pitch=%#x "
-                    "addr=%#x addr_ext=%#x\n",
+                    "addr=%#x addr_ext=%#x%s\n",
                     n, rd32(lb + 0x30), rd32(lb + 0x38), rd32(lb + 0x3c),
-                    rd32(lb + 0x44), rd32(base + 0xf40 + 0x20 * n),
-                    rd32(base + 0xf48 + 0x20 * n));
+                    rd32(lb + 0x44), addr,
+                    rd32(base + 0xf48 + 0x20 * n), pabuf);
         }
     }
 }

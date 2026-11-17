@@ -50,6 +50,7 @@
 #include "block/block-common.h"
 #include "hw/misc/mtk_spmi_pmif.h"
 #include "hw/misc/mtk_syscon.h"
+#include "hw/misc/mtk_iommu.h"
 #include "hw/i2c/mtk_i2c.h"
 #include "hw/display/mtk_disp.h"
 #include "chardev/char.h"
@@ -11713,10 +11714,11 @@ static const struct {
             continue;
         }
         /*
-         * M4U/IOMMU banks: real TLB-invalidate completion (CPE_DONE) semantics,
-         * see hw/misc/mtk_iommu.c.  On a plain register window the kernel's
-         * mtk_iommu_tlb_flush_all polls REG_MMU_CPE_DONE forever ("TLB flush
-         * All timed out", earlier bring-up notes,290 ).  MTK_NO_IOMMU=1 reverts.
+         * M4U/IOMMU banks: real register semantics (TLB invalidate + CPE_DONE)
+         * and, with MTK_IOMMU=1, real ARMv7 short-descriptor page table
+         * translation; see hw/misc/mtk_iommu.c.  On a plain register window the
+         * kernel's mtk_iommu_tlb_flush_all polls REG_MMU_CPE_DONE forever
+         * ("TLB flush All timed out").  MTK_NO_IOMMU=1 reverts to syscon.
          */
         /*
          * GCE/CMDQ: the CMDQ driver polls thread registers directly, so a
@@ -11761,11 +11763,38 @@ static const struct {
         if (!strcmp(blocks[i].name, "mt6895.dev-iommu") &&
             !getenv("MTK_NO_IOMMU")) {
             DeviceState *idev = qdev_new("mtk-iommu");
+            uint64_t base = blocks[i].base;
+            unsigned iommu_id = MTK_IOMMU_DEV_NUM, bank = 0;
 
+            /*
+             * Tag every bank window with the M4U block it belongs to and the
+             * bank index inside it (vendor DT: disp_iommu @ 0x1e802000 with
+             * banks 1..4 at 0x1e803000..0x1e806000, mdp_iommu @ 0x1e810000
+             * with 0x1e811000..0x1e814000, apu_iommu0 @ 0x19010000 and
+             * apu_iommu1 @ 0x19015000, each bank 4 KiB).  Only bank 0 is
+             * translated: banks 1..4 are the protected/secure domains owned by
+             * TF-A, Linux never programs their page tables (hw/misc/mtk_iommu.c
+             * still keeps their register file).
+             */
+            if (base >= 0x1e802000ULL && base <= 0x1e806000ULL) {
+                iommu_id = MTK_IOMMU_DEV_DISP;
+                bank = (base - 0x1e802000ULL) >> 12;
+            } else if (base >= 0x1e810000ULL && base <= 0x1e814000ULL) {
+                iommu_id = MTK_IOMMU_DEV_MDP;
+                bank = (base - 0x1e810000ULL) >> 12;
+            } else if (base >= 0x19010000ULL && base <= 0x19014000ULL) {
+                iommu_id = MTK_IOMMU_DEV_APU0;
+                bank = (base - 0x19010000ULL) >> 12;
+            } else if (base >= 0x19015000ULL && base <= 0x19019000ULL) {
+                iommu_id = MTK_IOMMU_DEV_APU1;
+                bank = (base - 0x19015000ULL) >> 12;
+            }
+            qdev_prop_set_uint32(idev, "iommu-id", iommu_id);
+            qdev_prop_set_uint32(idev, "bank", bank);
             if (!sysbus_realize_and_unref(SYS_BUS_DEVICE(idev), errp)) {
                 return;
             }
-            sysbus_mmio_map(SYS_BUS_DEVICE(idev), 0, blocks[i].base);
+            sysbus_mmio_map(SYS_BUS_DEVICE(idev), 0, base);
             continue;
         }
 

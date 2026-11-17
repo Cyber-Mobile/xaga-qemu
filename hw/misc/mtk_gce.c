@@ -70,6 +70,7 @@
 #include "qom/object.h"
 #include "system/address-spaces.h"
 #include "system/memory.h"
+#include "hw/misc/mtk_iommu.h"
 
 #define TYPE_MTK_GCE "mtk-gce"
 OBJECT_DECLARE_SIMPLE_TYPE(MtkGceState, MTK_GCE)
@@ -372,20 +373,28 @@ static void mtk_gce_thread_complete(MtkGceState *s, unsigned idx)
  */
 static bool mtk_gce_xlate_to_pa(MtkGceState *s, uint32_t gce_addr, hwaddr *pa)
 {
+    hwaddr dma;
+
     if (s->xlate_post) {
         hwaddr a = (hwaddr)gce_addr << s->xlate_shift;
 
         if (a < s->xlate_off) {
             return false;
         }
-        *pa = a - s->xlate_off;
+        dma = a - s->xlate_off;
     } else {
         if (gce_addr < s->xlate_off) {
             return false;
         }
-        *pa = (hwaddr)(gce_addr - s->xlate_off) << s->xlate_shift;
+        dma = (hwaddr)(gce_addr - s->xlate_off) << s->xlate_shift;
     }
-    return true;
+
+    /*
+     * The command buffer is allocated with dma_alloc_coherent(): its DMA
+     * address is a physical address without an IOMMU and an IOVA when the GCE
+     * is behind the real M4U model (DT: gce@1e980000 iommus=<&mdp_iommu ...>).
+     */
+    return mtk_iommu_translate_or_identity(MTK_IOMMU_DEV_MDP, dma, pa);
 }
 
 /*
