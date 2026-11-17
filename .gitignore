@@ -20,3 +20,31 @@ GTAGS
 *.swp
 *.patch
 *.gcov
+
+# ---- xaga emulator project ----
+# Local development notes: keep them out of the published tree
+docs/private/
+
+# Device dumps / firmware / ROMs (never publish)
+fw/
+firmware/
+data/
+lineage/
+super/
+*.img
+*.bin
+*.ko
+*.dtb
+*.dtbo
+*.elf
+*.zip
+*.log
+*.ppm
+OUT_*
+RUN_*
+.runlock/
+.buildlock/
+
+# Python
+__pycache__/
+*.pyc
