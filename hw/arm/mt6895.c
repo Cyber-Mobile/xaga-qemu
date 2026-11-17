@@ -9303,6 +9303,38 @@ ufs_done:
     sysbus_mmio_map(SYS_BUS_DEVICE(s->spmi2), 1, MT6895_SPMI2_MST_BASE);
 
     /*
+     * GPIO/EINT controller (apirq@11e50000, "mediatek,mt6983-eint").
+     *
+     * The five instances (w/e/s/n/c) are separate register banks but share
+     * one GIC line, SPI 259. The device tree routes the SPMI PMIC RCS
+     * interrupt to pin 243, which maps to instance 4 (eint_c) index 16; that
+     * is the line the PMIF's RCS output drives, so the MT6363 power key
+     * interrupt is delivered through the same hardware path as on the phone.
+     */
+    {
+        static const uint64_t eint_bases[] = {
+            0x11e50000ULL,      /* eint-w */
+            0x11ce0000ULL,      /* eint-e */
+            0x11de0000ULL,      /* eint-s */
+            0x11fe0000ULL,      /* eint-n */
+            0x1c01e000ULL,      /* eint-c */
+        };
+        DeviceState *eint = qdev_new("mtk-eint");
+        size_t ei;
+
+        if (!sysbus_realize(SYS_BUS_DEVICE(eint), errp)) {
+            return;
+        }
+        for (ei = 0; ei < ARRAY_SIZE(eint_bases); ei++) {
+            sysbus_mmio_map(SYS_BUS_DEVICE(eint), ei, eint_bases[ei]);
+        }
+        sysbus_connect_irq(SYS_BUS_DEVICE(eint), 0,
+                           qdev_get_gpio_in(s->gic, 259));
+        sysbus_connect_irq(SYS_BUS_DEVICE(s->spmi), 0,
+                           qdev_get_gpio_in(eint, 0));
+    }
+
+    /*
      * Attach the card the user supplied with -drive if=sd. The controller's
      * device tree node is patched to non-removable, so no card-detect GPIO
      * needs modelling.
@@ -12039,11 +12071,11 @@ static const struct {
         /* EXPERIMENT (2026-11-03): boot-to-LK path reads 0x11E40318;
          * the window was unmapped and the read aborted. */
         { "mt6895.dev-iic-e", 0x11e40000ULL, 0x1000 },
-        { "mt6895.eint-w", 0x11e50000ULL, 0x1000 },
-        { "mt6895.eint-e", 0x11ce0000ULL, 0x1000 },
-        { "mt6895.eint-s", 0x11de0000ULL, 0x1000 },
-        { "mt6895.eint-n", 0x11fe0000ULL, 0x1000 },
-        { "mt6895.eint-c", 0x1c01e000ULL, 0x1000 },
+        /*
+         * The five EINT register banks are not plain register files: the
+         * mtk-eint device below owns them because the interrupt status
+         * registers must raise the shared GIC line (SPI 259).
+         */
         { "mt6895.dev-apmixedsys", 0x08000000ULL, 0x1000 },
     /*
          * Register frames of the remaining device-tree peripherals, generated
@@ -14897,23 +14929,6 @@ static const uint8_t stub_cmd_def[0x80] = {
         exit(EXIT_FAILURE);
     }
 
-    /*
-     * Keypad (kp@1c00e000, "mediatek,kp", GIC SPI 106 edge-rising).  The
-     * controller is modelled by hw/misc/mtk_kpd.c: five active-low 16-bit
-     * key-state words at +0x04..+0x14, an interrupt on every key-state
-     * change, and a QEMU input handler so "sendkey volumedown" / a VNC
-     * keyboard reaches the guest.  Needs the GIC, hence the placement here.
-     * MTK_NO_KPD=1 keeps the plain register window installed earlier.
-     */
-    if (!MTK_ENV_CACHED("MTK_NO_KPD")) {
-        DeviceState *kpd = qdev_new("mtk-kpd");
-
-        sysbus_realize_and_unref(SYS_BUS_DEVICE(kpd), &error_fatal);
-        sysbus_mmio_map(SYS_BUS_DEVICE(kpd), 0, MT6895_KP_BASE);
-        sysbus_connect_irq(SYS_BUS_DEVICE(kpd), 0,
-                           qdev_get_gpio_in(s->gic, MT6895_KP_SPI));
-    }
-
     mt6895_create_its(s, &err);
     if (err) {
         error_report_err(err);
@@ -15177,6 +15192,34 @@ static const uint8_t stub_cmd_def[0x80] = {
     if (err) {
         error_report_err(err);
         exit(EXIT_FAILURE);
+    }
+
+    /*
+     * Keypad (kp@1c00e000, "mediatek,kp", GIC SPI 106 edge-rising).  The
+     * controller is modelled by hw/misc/mtk_kpd.c: five active-low 16-bit
+     * key-state words at +0x04..+0x14, an interrupt on every key-state
+     * change, and a QEMU input handler so "sendkey volumedown" / a VNC
+     * keyboard reaches the guest.  Created after the SPMI arbiter so the
+     * power key can be linked to the PMIC key block: on this board the power
+     * key is wired to the MT6363, not to the keypad matrix.
+     * MTK_NO_KPD=1 keeps the plain register window installed earlier.
+     */
+    if (!MTK_ENV_CACHED("MTK_NO_KPD")) {
+        DeviceState *kpd = qdev_new("mtk-kpd");
+
+        /*
+         * The main PMIC (SPMI slave 4) carries the phone's power key. The
+         * keypad model forwards power key edges to it; its PWRKEY/PWRKEY_R
+         * interrupts then reach the CPU through the PMIC RCS line, which is
+         * EINT pin 243 (see the mtk-eint device created with the SPMI
+         * arbiter).
+         */
+        object_property_set_link(OBJECT(kpd), "pmic", OBJECT(s->spmi),
+                                 &error_abort);
+        sysbus_realize_and_unref(SYS_BUS_DEVICE(kpd), &error_fatal);
+        sysbus_mmio_map(SYS_BUS_DEVICE(kpd), 0, MT6895_KP_BASE);
+        sysbus_connect_irq(SYS_BUS_DEVICE(kpd), 0,
+                           qdev_get_gpio_in(s->gic, MT6895_KP_SPI));
     }
 
     if (MTK_ENV_CACHED("MTK_PCSAMPLE") || MTK_ENV_CACHED("MTK_PCTIME")) {

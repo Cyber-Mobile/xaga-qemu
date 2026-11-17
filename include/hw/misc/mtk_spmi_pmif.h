@@ -7,6 +7,7 @@
 #ifndef HW_MISC_MTK_SPMI_PMIF_H
 #define HW_MISC_MTK_SPMI_PMIF_H
 
+#include "hw/core/qdev.h"
 #include "qom/object.h"
 
 #define TYPE_MTK_SPMI_PMIF "mtk-spmi-pmif"
@@ -19,5 +20,12 @@ OBJECT_DECLARE_SIMPLE_TYPE(MtkSpmiPmifState, MTK_SPMI_PMIF)
  */
 void mtk_spmi_pmif_set_pmic_reg(DeviceState *dev, unsigned sid,
                                 unsigned reg, uint8_t val);
+
+/*
+ * Emulate one MT6363 power key edge (the PMIC PWRKEY / PWRKEY_R interrupt).
+ * The keypad model calls this for the phone's power key, which on this board is
+ * wired to the PMIC's key block rather than to the keypad matrix.
+ */
+void mtk_spmi_pmif_power_key(DeviceState *dev, bool pressed);
 
 #endif /* HW_MISC_MTK_SPMI_PMIF_H */

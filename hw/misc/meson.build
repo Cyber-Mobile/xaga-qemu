@@ -1,5 +1,6 @@
 system_ss.add(when: 'CONFIG_MTK_SYSCON', if_true: files('mtk_syscon.c'))
 system_ss.add(when: 'CONFIG_MTK_SPMI_PMIF', if_true: files('mtk_spmi_pmif.c'))
+system_ss.add(when: 'CONFIG_MTK_SYSCON', if_true: files('mtk_eint.c'))
 system_ss.add(when: 'CONFIG_MTK_SCPSYS', if_true: files('mtk_scpsys.c'))
 system_ss.add(when: 'CONFIG_MTK_UFSHCI', if_true: files('mtk_ufshci.c', 'mtk_ufs.c', 'mtk_ufs_lu.c'))
 system_ss.add(when: 'CONFIG_MTK_TINYSYS_MBOX', if_true: files('mtk_tinysys_mbox.c'))

@@ -62,6 +62,8 @@
 #include "hw/core/sysbus.h"
 #include "qemu/module.h"
 #include "qemu/timer.h"
+#include "hw/core/qdev-properties.h"
+#include "hw/misc/mtk_spmi_pmif.h"
 #include "qom/object.h"
 #include "ui/input.h"
 
@@ -89,6 +91,9 @@ struct MtkKpdState {
 
     bool log;
     QemuInputHandlerState *input;
+
+    /* MT6363 PMIC key block that receives the power key edges. */
+    MtkSpmiPmifState *pmic;
 
     /* Boot keys held from reset until MTK_KPD_HOLD expires. */
     bool boot_keys;
@@ -422,6 +427,16 @@ static void mtk_kpd_input_event(DeviceState *dev, QemuConsole *src,
         break;
     case Q_KEY_CODE_POWER:          /* hardware key 8 (LK kpd_hw_pwrkey) */
         bit = 8;
+        /*
+         * On this board the power key is wired to the MT6363 PMIC key block,
+         * not to the keypad matrix: forward the edge so the PMIC raises its
+         * PWRKEY / PWRKEY_R interrupt and the kernel PMIC key driver reports
+         * KEY_POWER.  The keypad state bit is still updated because the
+         * bootloader samples it (LK kpd_hw_pwrkey = 8).
+         */
+        if (s->pmic) {
+            mtk_spmi_pmif_power_key(DEVICE(s->pmic), evt->key.down);
+        }
         break;
     default:
         return;
@@ -513,10 +528,15 @@ static void mtk_kpd_unrealize(DeviceState *dev)
 static void mtk_kpd_class_init(ObjectClass *klass, const void *data)
 {
     DeviceClass *dc = DEVICE_CLASS(klass);
+    static const Property props[] = {
+        DEFINE_PROP_LINK("pmic", MtkKpdState, pmic, TYPE_MTK_SPMI_PMIF,
+                         MtkSpmiPmifState *),
+    };
 
     device_class_set_legacy_reset(dc, mtk_kpd_reset);
     dc->realize = mtk_kpd_realize;
     dc->unrealize = mtk_kpd_unrealize;
+    device_class_set_props(dc, props);
 }
 
 static const TypeInfo mtk_kpd_info = {

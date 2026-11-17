@@ -47,6 +47,7 @@
 #include "hw/core/sysbus.h"
 #include "hw/misc/mtk_spmi_pmif.h"
 #include "qom/object.h"
+#include "ui/input.h"
 
 /*
  * PMIF register block.
@@ -111,6 +112,29 @@
 /* MT6363 chip id, as the driver would read it back */
 #define MT6363_CHIP_ID          0x63
 
+/*
+ * MT6363 main PMIC interrupt state used by the power key.
+ *
+ * The key driver (drivers/input/keyboard/mtk-pmic-keys.c) reports the press
+ * from the PWRKEY interrupt and the release from PWRKEY_R; it does not sample
+ * a register.  The PMIC mfd driver (drivers/mfd/mtk-spmi-pmic.c) walks
+ * TOP_INT_STATUS1 -> PSC_TOP_INT_STATUS0/1 and acknowledges by writing the
+ * status value back (write-1-to-clear).  The PMIC raises its RCS interrupt
+ * line, which on this board is GPIO/EINT pin 243 (spmi@1c804000
+ * "rcs_irq" = <&pio 243 IRQ_TYPE_LEVEL_HIGH>).
+ */
+#define MT6363_PMIC_SID             4
+#define MT6363_TOP_INT_STATUS1      0x4e
+#define MT6363_PSC_TOP_INT_STATUS0  0x91b
+#define MT6363_PSC_TOP_INT_STATUS1  0x91c
+#define MT6363_TOP_PSC_BIT          0x04
+#define MT6363_PSC_PWRKEY           0x01
+#define MT6363_PSC_PWRKEY_R         0x08
+
+/* SPMI master block: per-slave interrupt status, one byte per slave id. */
+#define SPMI_SLV_EINT_BASE          0x20
+#define SPMI_SLV_EINT_REGS          (SPMI_MAX_SID / 4)
+
 struct MtkSpmiPmifState {
     SysBusDevice parent_obj;
 
@@ -122,6 +146,10 @@ struct MtkSpmiPmifState {
 
     /* One register space per SPMI slave id: 16-bit address, 8-bit value */
     uint8_t pmic[SPMI_MAX_SID][SPMI_PMIC_REG_SPACE];
+
+    /* SPMI RCS interrupt output (level, to the EINT controller). */
+    qemu_irq rcs_irq;
+    bool trace;
 };
 
 void mtk_spmi_pmif_set_pmic_reg(DeviceState *dev, unsigned sid,
@@ -134,6 +162,52 @@ void mtk_spmi_pmif_set_pmic_reg(DeviceState *dev, unsigned sid,
     }
 }
 
+/*
+ * SPMI RCS interrupt line: asserted while any slave has a pending interrupt
+ * byte in the SPMI master block. The guest clears a slave's byte by writing
+ * the value back (write-1-to-clear).
+ */
+static void mtk_spmi_pmif_update_rcs(MtkSpmiPmifState *s)
+{
+    bool level = false;
+    unsigned i;
+
+    for (i = 0; i < SPMI_SLV_EINT_REGS; i++) {
+        if (s->mst_regs[(SPMI_SLV_EINT_BASE / 4) + i]) {
+            level = true;
+            break;
+        }
+    }
+    qemu_set_irq(s->rcs_irq, level);
+}
+
+/*
+ * Emulate one MT6363 power key edge: latch the PSC group status bit for the
+ * press or release interrupt and raise the PMIC RCS line.  The PMIC interrupt
+ * handler then reads the status registers back through SPMI.
+ */
+void mtk_spmi_pmif_power_key(DeviceState *dev, bool pressed)
+{
+    MtkSpmiPmifState *s = MTK_SPMI_PMIF(dev);
+    unsigned reg = SPMI_SLV_EINT_BASE + (MT6363_PMIC_SID / 4) * 4;
+    unsigned shift = (MT6363_PMIC_SID % 4) * 8;
+
+    s->pmic[MT6363_PMIC_SID][MT6363_TOP_INT_STATUS1] |= MT6363_TOP_PSC_BIT;
+    s->pmic[MT6363_PMIC_SID][MT6363_PSC_TOP_INT_STATUS0] |=
+        pressed ? MT6363_PSC_PWRKEY : MT6363_PSC_PWRKEY_R;
+    s->mst_regs[reg / 4] |= 1u << shift;
+    if (s->trace) {
+        fprintf(stderr, "MTK-PMIC power key %s: TOP_INT_STATUS1=%#x"
+                " PSC_TOP_INT_STATUS0=%#x rcs=%#x\n",
+                pressed ? "press" : "release",
+                s->pmic[MT6363_PMIC_SID][MT6363_TOP_INT_STATUS1],
+                s->pmic[MT6363_PMIC_SID][MT6363_PSC_TOP_INT_STATUS0],
+                s->mst_regs[reg / 4]);
+    }
+    mtk_spmi_pmif_update_rcs(s);
+}
+
+
 static void mtk_spmi_pmif_reset(DeviceState *dev)
 {
     MtkSpmiPmifState *s = MTK_SPMI_PMIF(dev);
@@ -141,6 +215,7 @@ static void mtk_spmi_pmif_reset(DeviceState *dev)
 
     memset(s->pmif_regs, 0, sizeof(s->pmif_regs));
     memset(s->mst_regs, 0, sizeof(s->mst_regs));
+    mtk_spmi_pmif_update_rcs(s);
 
     /* All channels idle */
     for (i = 0; i < PMIF_NUM_CHANS; i++) {
@@ -402,6 +477,27 @@ static void mtk_spmi_pmif_xfer(MtkSpmiPmifState *s, unsigned chan, uint32_t cmd)
         }
 
         /*
+         * MT6363 status registers are write-1-to-clear (the PMIC interrupt
+         * handler acknowledges a group by writing the status value back).
+         * The top level PSC bit mirrors the group status.
+         */
+        if (sid == MT6363_PMIC_SID) {
+            for (i = 0; i < len; i++) {
+                unsigned r = addr + i;
+
+                if (r == MT6363_TOP_INT_STATUS1 ||
+                    r == MT6363_PSC_TOP_INT_STATUS0 ||
+                    r == MT6363_PSC_TOP_INT_STATUS1) {
+                    s->pmic[sid][r] &= ~((data >> (8 * i)) & 0xff);
+                }
+            }
+            if (!s->pmic[sid][MT6363_PSC_TOP_INT_STATUS0] &&
+                !s->pmic[sid][MT6363_PSC_TOP_INT_STATUS1]) {
+                s->pmic[sid][MT6363_TOP_INT_STATUS1] &= ~MT6363_TOP_PSC_BIT;
+            }
+        }
+
+        /*
          * A write has no payload for the guest to collect, so the channel is
          * done as soon as the command is accepted. Only a read parks in
          * WFVLDCLR, waiting for the guest to clear the valid flag.
@@ -511,6 +607,17 @@ static void mtk_spmi_mst_write(void *opaque, hwaddr offset, uint64_t value,
         return;
     }
 
+    /*
+     * The RCS interrupt status bytes are write-1-to-clear and drive the
+     * level-sensitive RCS line to the EINT controller.
+     */
+    if (offset >= SPMI_SLV_EINT_BASE &&
+        offset < SPMI_SLV_EINT_BASE + SPMI_SLV_EINT_REGS * 4) {
+        s->mst_regs[offset / 4] &= ~(uint32_t)value;
+        mtk_spmi_pmif_update_rcs(s);
+        return;
+    }
+
     s->mst_regs[offset / 4] = value;
 
     if (offset == SPMI_OP_ST_CTRL) {
@@ -544,6 +651,9 @@ static void mtk_spmi_pmif_realize(DeviceState *dev, Error **errp)
     memory_region_init_io(&s->mst, OBJECT(s), &mtk_spmi_mst_ops, s,
                           TYPE_MTK_SPMI_PMIF ".mst", 0x100);
     sysbus_init_mmio(SYS_BUS_DEVICE(dev), &s->mst);
+
+    sysbus_init_irq(SYS_BUS_DEVICE(dev), &s->rcs_irq);
+    s->trace = getenv("MTK_PMICLOG") != NULL;
 }
 
 static void mtk_spmi_pmif_class_init(ObjectClass *klass, const void *data)
