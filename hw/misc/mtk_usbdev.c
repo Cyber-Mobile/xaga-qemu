@@ -74,6 +74,8 @@ OBJECT_DECLARE_SIMPLE_TYPE(MtkUsbDevState, MTK_USBDEV)
 #define R_RXQSAR1              0x0614
 #define R_RXQCPR1              0x0618
 #define R_RXQLDPR1             0x061c
+#define R_TXQHIAR1             0x0484
+#define R_RXQHIAR1             0x04c4
 #define QMU_Q_START            0x00000001
 #define QMU_Q_RESUME           0x00000002
 #define QMU_Q_STOP             0x00000004
@@ -88,6 +90,7 @@ OBJECT_DECLARE_SIMPLE_TYPE(MtkUsbDevState, MTK_USBDEV)
 /* EPCTL CSR (base 0x11201800) -> offset 0x0800 */
 #define R_DEVICE_CONF          0x0800
 #define R_EP_RST               0x0804
+#define R_MISC_CTRL            0x0c84
 /* Capability registers (read-only).  FIFO sizes are in units of
  * MTU3_EP_FIFO_UNIT (512 B); EPINFO packs the TX/RX non-EP0 endpoint counts
  * as CAP_TX_EP_NUM = bits[4:0], CAP_RX_EP_NUM = bits[12:8].  LK fastboot and
@@ -124,6 +127,23 @@ OBJECT_DECLARE_SIMPLE_TYPE(MtkUsbDevState, MTK_USBDEV)
 #define EP0CSR_SENDSTALL       (1u << 25)
 #define PM_SOFT_CONN           (1u << 6)   /* U3D_POWER_MANAGEMENT.SOFT_CONN */
 #define COMMON_INTR_RESET      (1u << 2)
+/* U3D_DEV_LINK_INTR (EPCTL CSR +0x54) */
+#define DEV_LINK_SPEED_CHG     (1u << 0)
+/*
+ * SSUSB_DEV_SPEED(U3D_DEVICE_CONF) encoding of the three USB 2.0 speeds:
+ * 1 = low, 2 = full, 3 = high.  The kernel's enum mtu3_speed uses the same
+ * values (MTU3_SPEED_FULL = 1, MTU3_SPEED_HIGH = 3) and calls
+ * mtu3_ep0_setup() only from the high/full-speed cases of mtu3_link_isr(),
+ * so reporting 2 for high speed left the driver in its UNKNOWN branch
+ * (gadget disconnect, EP0 interrupts never enabled).
+ */
+#define DEVICE_CONF_SPEED_HS   3
+/*
+ * U3D_MISC_CTRL.DMA_ADDR_36BIT is a hardwired capability of the controller
+ * (the mtu3 driver selects its DMA mask from it).  Without it every gadget
+ * buffer above 4 GiB fails to map and the adb function cannot queue requests.
+ */
+#define MISC_CTRL_DMA_ADDR_36BIT (1u << 31)
 #define COMMON_INTR_SUSPEND    (1u << 0)
 #define COMMON_INTR_RESUME     (1u << 1)
 
@@ -174,7 +194,7 @@ struct MtkUsbDevState {
     uint64_t rx_gpd_done;
     bool rx_wait_ack;
     uint64_t rx_wait_since_ms;
-    uint32_t rx_armed_addr;
+    uint64_t rx_armed_addr;
     uint64_t rx_armed_ms;
     uint64_t start_ms;
     uint32_t soft_conn_min_ms;
@@ -182,8 +202,8 @@ struct MtkUsbDevState {
     bool soft_conn_applied;
     uint32_t gpd_stride;
     uint32_t ring_size;
-    uint32_t tx_gpd_last;
-    uint32_t rx_gpd_next;
+    uint64_t tx_gpd_last;   /* next TX GPD to send (36-bit address) */
+    uint64_t rx_gpd_next;   /* first RX GPD of the ring (36-bit address) */
     bool qmu_tx_on;
     bool qmu_rx_on;
     bool qmu_ready;
@@ -276,13 +296,49 @@ static void usbdev_log(MtkUsbDevState *s, const char *msg)
 }
 
 /*
- * QMU (endpoint queue) support for EP1.  LK's fastboot data path uses GPD
- * rings in guest DRAM with a 16-byte stride (from LK's QMU ISR at 0x50f32b10):
- * flags@0 (bit0 = HWO, 1 = still owned by hardware), buf_addr@4, next_gpd@8,
- * dw3@0xc (on completion the low 16 bits carry the actual length).
+ * QMU (endpoint queue) support for EP1.  The GPD ring lives in guest DRAM
+ * with a 16-byte stride; the controller DMA engine supports 36-bit addresses
+ * (U3D_MISC_CTRL.DMA_ADDR_36BIT), so each GPD carries the upper four address
+ * bits in its extension nibbles.
+ *
+ * Legacy U2 GPD layout ("OG" macros in the kernel driver):
+ *   dw0: TX -> { buf_hi@16-19, next_hi@20-23 } | IOC | HWO
+ *        RX -> { rx_buf_len@16-31 }
+ *   dw1: next_gpd (low 32 bits)
+ *   dw2: buffer (low 32 bits)
+ *   dw3: TX -> { data_len@0-15 }
+ *        RX -> { buf_hi@16-19, next_hi@20-23 }
+ *   byte 0: flags (bit0 = HWO, bit7 = IOC)
  * QISAR0 bit17 = RX done / bit1 = TX done for EP1.
  */
-static bool usbdev_dma_read(MtkUsbDevState *s, uint32_t addr, void *buf,
+#define QMU_GPD_MAX_BUF        65532
+
+static uint64_t usbdev_qmu_start_addr(MtkUsbDevState *s, bool is_in)
+{
+    uint32_t sar = s->regs[(is_in ? R_TXQSAR1 : R_RXQSAR1) / 4];
+    uint32_t hiar = s->regs[(is_in ? R_TXQHIAR1 : R_RXQHIAR1) / 4];
+
+    return sar | ((uint64_t)(hiar & 0xf) << 32);
+}
+
+static uint64_t usbdev_qmu_cur_gpd(MtkUsbDevState *s, bool is_in)
+{
+    uint32_t cpr = s->regs[(is_in ? R_TXQCPR1 : R_RXQCPR1) / 4];
+    uint32_t hiar = s->regs[(is_in ? R_TXQHIAR1 : R_RXQHIAR1) / 4];
+
+    return cpr | ((uint64_t)((hiar >> 8) & 0xf) << 32);
+}
+
+static void usbdev_qmu_set_cpr(MtkUsbDevState *s, bool is_in, uint64_t cpr)
+{
+    uint32_t creg = (is_in ? R_TXQCPR1 : R_RXQCPR1) / 4;
+    uint32_t hreg = (is_in ? R_TXQHIAR1 : R_RXQHIAR1) / 4;
+
+    s->regs[creg] = (uint32_t)cpr;
+    s->regs[hreg] = (s->regs[hreg] & ~(0xfu << 8)) |
+                    ((uint32_t)((cpr >> 32) & 0xf) << 8);
+}
+static bool usbdev_dma_read(MtkUsbDevState *s, uint64_t addr, void *buf,
                             unsigned len)
 {
     if (!addr) {
@@ -292,7 +348,7 @@ static bool usbdev_dma_read(MtkUsbDevState *s, uint32_t addr, void *buf,
                            MEMTXATTRS_UNSPECIFIED) == MEMTX_OK;
 }
 
-static bool usbdev_dma_write(MtkUsbDevState *s, uint32_t addr, const void *buf,
+static bool usbdev_dma_write(MtkUsbDevState *s, uint64_t addr, const void *buf,
                              unsigned len)
 {
     if (!addr) {
@@ -302,17 +358,19 @@ static bool usbdev_dma_write(MtkUsbDevState *s, uint32_t addr, const void *buf,
                             MEMTXATTRS_UNSPECIFIED) == MEMTX_OK;
 }
 
-static void usbdev_gpd_parse(const uint8_t *g, uint32_t *flag,
-                             uint32_t *baddr, uint32_t *next, uint16_t *len)
+static void usbdev_gpd_parse(const uint8_t *g, bool is_rx, uint32_t *flag,
+                             uint64_t *baddr, uint64_t *next, uint16_t *len)
 {
+    uint32_t lo_next = (uint32_t)g[4] | ((uint32_t)g[5] << 8) |
+                       ((uint32_t)g[6] << 16) | ((uint32_t)g[7] << 24);
+    uint32_t lo_buf = (uint32_t)g[8] | ((uint32_t)g[9] << 8) |
+                      ((uint32_t)g[10] << 16) | ((uint32_t)g[11] << 24);
+    unsigned hi = is_rx ? g[14] : g[2];
+
     *flag = g[0];
-    /* Observed ring dump: flags@0, next_gpd@4, buffer_addr@8,
-     * completion length@0xc (LK ISR reads the actual length there). */
-    *next = (uint32_t)(g[4] | (g[5] << 8) | (g[6] << 16) |
-                       ((uint32_t)g[7] << 24));
-    *baddr = (uint32_t)(g[8] | (g[9] << 8) | (g[10] << 16) |
-                        ((uint32_t)g[11] << 24));
     *len = (uint16_t)(g[12] | (g[13] << 8));
+    *baddr = lo_buf | ((uint64_t)(hi & 0xf) << 32);
+    *next = lo_next | ((uint64_t)((hi >> 4) & 0xf) << 32);
 }
 
 /*
@@ -336,11 +394,12 @@ static void usbdev_rx_arm_timer(MtkUsbDevState *s, int ms)
 static void usbdev_rx_try_deliver(MtkUsbDevState *s, bool flush_short)
 {
     uint8_t gpd[16];
-    uint32_t base = s->regs[R_RXQSAR1 / 4];
+    uint64_t base = usbdev_qmu_start_addr(s, false);
     uint32_t stride = s->gpd_stride ? s->gpd_stride : 16;
-    uint32_t ring = s->ring_size ? s->ring_size : 0x40;
-    uint32_t gaddr = s->regs[R_RXQCPR1 / 4];
-    uint32_t flag, baddr, next;
+    uint64_t ring = s->ring_size ? s->ring_size : 0x40;
+    uint64_t gaddr = usbdev_qmu_cur_gpd(s, false);
+    uint32_t flag;
+    uint64_t baddr, next;
     uint16_t done_len, buflen;
     unsigned n, avail;
 
@@ -359,13 +418,13 @@ static void usbdev_rx_try_deliver(MtkUsbDevState *s, bool flush_short)
     if (!usbdev_dma_read(s, gaddr, gpd, sizeof(gpd))) {
         return;
     }
-    usbdev_gpd_parse(gpd, &flag, &baddr, &next, &done_len);
+    usbdev_gpd_parse(gpd, true, &flag, &baddr, &next, &done_len);
     if (!(flag & GPD_FLAG_HWO)) {
         if (s->trace && s->rx_gpd_done < 64) {
             static int nw;
             if (nw++ < 16) {
-                fprintf(stderr, "USBDEV RXWAIT cpr=%#x flag=%#x q=%u\n",
-                        gaddr, flag, s->rxq->len);
+                fprintf(stderr, "USBDEV RXWAIT cpr=%#" PRIx64
+                        " flag=%#x q=%u\n", gaddr, flag, s->rxq->len);
             }
         }
         usbdev_rx_arm_timer(s, 3);
@@ -404,7 +463,8 @@ static void usbdev_rx_try_deliver(MtkUsbDevState *s, bool flush_short)
         unsigned i;
         int mask = 0;
 
-        fprintf(stderr, "USBDEV RXDONE cpr=%#x flag=%#x len=%u buf=%u baddr=%#x src=%s\n",
+        fprintf(stderr, "USBDEV RXDONE cpr=%#" PRIx64
+                " flag=%#x len=%u buf=%u baddr=%#" PRIx64 " src=%s\n",
                 gaddr, flag, n, buflen, baddr,
                 (avail < buflen) ? "short" : "full");
         for (i = 0; i < 8 && base; i++) {
@@ -415,7 +475,8 @@ static void usbdev_rx_try_deliver(MtkUsbDevState *s, bool flush_short)
             }
             mask |= (g2[0] & 1) << i;
         }
-        fprintf(stderr, "USBDEV RXARM base=%#x mask=%#x cpr=%#x\n", base, mask, gaddr);
+        fprintf(stderr, "USBDEV RXARM base=%#" PRIx64 " mask=%#x cpr=%#"
+                PRIx64 "\n", base, mask, gaddr);
     }
     usbdev_dma_write(s, baddr, s->rxq->data, n);
     g_byte_array_remove_range(s->rxq, 0, n);
@@ -425,14 +486,22 @@ static void usbdev_rx_try_deliver(MtkUsbDevState *s, bool flush_short)
     gpd[0] &= ~GPD_FLAG_HWO;
     usbdev_dma_write(s, gaddr, gpd, sizeof(gpd));
     {
-        uint32_t cpr = gaddr + stride;
+        /* The GPD carries the DMA address of the next descriptor and the
+         * hardware walks that link, so follow it; the kernel uses 144-entry
+         * rings while LK used a 4-entry one.  Fall back to a linear walk with
+         * the modelled ring size only when a descriptor has no next link. */
+        uint64_t cpr = next;
 
-        if (base && (cpr - base) >= ring) {
-            cpr = base;
+        if (!cpr) {
+            cpr = gaddr + stride;
+            if (base && (cpr - base) >= ring) {
+                cpr = base;
+            }
         }
-        s->regs[R_RXQCPR1 / 4] = cpr;
+        usbdev_qmu_set_cpr(s, false, cpr);
         if (s->trace && s->rx_gpd_done < 128) {
-            fprintf(stderr, "USBDEV RXCPR %#x -> %#x\n", gaddr, cpr);
+            fprintf(stderr, "USBDEV RXCPR %#" PRIx64 " -> %#" PRIx64 "\n",
+                    gaddr, cpr);
         }
     }
     s->regs[R_QISAR0 / 4] |= QMU_RX_DONE_1;
@@ -442,7 +511,8 @@ static void usbdev_rx_try_deliver(MtkUsbDevState *s, bool flush_short)
     s->rx_armed_addr = 0;
     s->rx_armed_ms = 0;
     if (s->trace && (s->rx_gpd_done % 1024) == 1) {
-        fprintf(stderr, "USBDEV RX gpd=%llu gaddr=%#x n=%u buf=%u total=%llu q=%u\n",
+        fprintf(stderr, "USBDEV RX gpd=%llu gaddr=%#" PRIx64
+                " n=%u buf=%u total=%llu q=%u\n",
                 (unsigned long long)s->rx_gpd_done, gaddr, n, buflen,
                 (unsigned long long)s->rx_bytes_done, s->rxq->len);
     }
@@ -480,43 +550,51 @@ static void usbdev_rx_timer(void *opaque)
 
 static void usbdev_tx_kick(MtkUsbDevState *s, uint32_t cpr)
 {
-    uint32_t base = s->regs[R_TXQSAR1 / 4];
+    uint64_t base = usbdev_qmu_start_addr(s, true);
     uint32_t stride = s->gpd_stride ? s->gpd_stride : 16;
-    uint32_t gaddr = s->tx_gpd_last ? s->tx_gpd_last : base;
+    uint64_t gaddr = s->tx_gpd_last ? s->tx_gpd_last : base;
+    uint8_t *buf;
     int guard = 0;
 
     if (!s->qmu_tx_on || !gaddr) {
         return;
     }
-    while (gaddr && guard++ < 32) {
-        uint8_t gpd[16], buf[1024];
-        uint32_t flag, baddr, next;
+    buf = g_malloc(QMU_GPD_MAX_BUF + 1);
+    while (gaddr && guard++ < 64) {
+        uint8_t gpd[16];
+        uint32_t flag;
+        uint64_t baddr, next;
         uint16_t blen;
 
         if (!usbdev_dma_read(s, gaddr, gpd, sizeof(gpd))) {
             break;
         }
-        usbdev_gpd_parse(gpd, &flag, &baddr, &next, &blen);
+        usbdev_gpd_parse(gpd, false, &flag, &baddr, &next, &blen);
         if (!(flag & GPD_FLAG_HWO)) {
             break;
         }
-        if (blen > sizeof(buf)) {
-            blen = sizeof(buf);
+        if (blen > QMU_GPD_MAX_BUF) {
+            blen = QMU_GPD_MAX_BUF;
         }
-        if (!blen) {
-            blen = (uint16_t)(gpd[2] | (gpd[3] << 8));
-        }
-        if (baddr && blen && usbdev_dma_read(s, baddr, buf, blen)) {
+        if (blen && baddr && usbdev_dma_read(s, baddr, buf, blen)) {
             usbdev_send(s, FB_DEV_EP1_IN, buf, blen);
+        } else if (!blen) {
+            /* zero-length packet: hand an empty frame to the host bridge */
+            usbdev_send(s, FB_DEV_EP1_IN, buf, 0);
         }
         gpd[0] &= ~GPD_FLAG_HWO;
         usbdev_dma_write(s, gaddr, gpd, sizeof(gpd));
         if (s->trace) {
-            fprintf(stderr, "USBDEV EP1 IN len=%u gpd=%#x baddr=%#x next=%#x\n",
+            fprintf(stderr, "USBDEV EP1 IN len=%u gpd=%#" PRIx64
+                    " baddr=%#" PRIx64 " next=%#" PRIx64 "\n",
                     blen, gaddr, baddr, next);
         }
-        {
-            uint32_t ring = s->ring_size ? s->ring_size : 0x400;
+        /* Follow the GPD next-descriptor link like the hardware does; fall
+         * back to a linear walk with a ring wrap only if it has no link. */
+        if (next) {
+            gaddr = next;
+        } else {
+            uint64_t ring = s->ring_size ? s->ring_size : 0x400;
 
             if (base && (gaddr - base + stride) >= ring) {
                 gaddr = base;
@@ -525,8 +603,9 @@ static void usbdev_tx_kick(MtkUsbDevState *s, uint32_t cpr)
             }
         }
     }
+    g_free(buf);
     s->tx_gpd_last = gaddr;
-    s->regs[R_TXQCPR1 / 4] = gaddr;
+    usbdev_qmu_set_cpr(s, true, gaddr);
     s->regs[R_QISAR0 / 4] |= QMU_TX_DONE_1;
     s->ep_isr |= (1u << 1);          /* EPISR bit1 = EP1 */
     usbdev_update_irq(s);
@@ -540,7 +619,11 @@ static void usbdev_deliver_setup(MtkUsbDevState *s)
     s->fifo_out_pos = 0;
     s->regs[R_RXCOUNT0 / 4] = 8;
     s->regs[R_EP0CSR / 4] |= EP0CSR_SETUPPKTRDY | EP0CSR_RXPKTRDY;
-    s->ep_isr |= EP0_ISR;
+    /*
+     * SETUPENDISR is what the Linux mtu3 driver uses to return its EP0 state
+     * machine to "waiting for SETUP"; it enables both this bit and EP0ISR.
+     */
+    s->ep_isr |= EP0_ISR | EP0_SETUP_ISR;
     usbdev_update_irq(s);
 }
 
@@ -582,7 +665,19 @@ static void usbdev_host_connect(MtkUsbDevState *s)
 {
     s->connected = true;
     s->common_intr |= COMMON_INTR_RESET;
+    /*
+     * A connect is also a link-speed change for the device controller: the
+     * Linux mtu3 driver only runs mtu3_ep0_setup() (which programs EP0
+     * maxpacket and enables the EP0/SETUPEND interrupts) from its device-link
+     * interrupt handler, so the speed-change interrupt has to be raised here
+     * just like on real hardware.
+     */
+    s->regs[R_DEVICE_CONF / 4] =
+        (s->regs[R_DEVICE_CONF / 4] & ~0x7u) | DEVICE_CONF_SPEED_HS;
+    s->dev_link_intr |= DEV_LINK_SPEED_CHG;
     s->fifo_in_len = 0;
+    s->ep0_in_flight = false;
+    s->setup_pending = false;
     s->regs[R_EP0CSR / 4] = 0;
     s->ep_isr = 0;
     usbdev_log(s, "CONNECTED");
@@ -732,6 +827,10 @@ static uint64_t usbdev_read(void *opaque, hwaddr off, unsigned size)
         break;
     case R_CAP_EPINFO:
         val = ((uint32_t)MTK_USBDEV_EP_PAIRS << 8) | MTK_USBDEV_EP_PAIRS;
+        break;
+    case R_MISC_CTRL:
+        /* DMA_ADDR_36BIT is a hardwired capability of the controller. */
+        val = s->regs[idx] | MISC_CTRL_DMA_ADDR_36BIT;
         break;
     default:
         val = s->regs[idx];
@@ -907,15 +1006,23 @@ static void usbdev_write(void *opaque, hwaddr off, uint64_t value,
         s->regs[idx] = v & 0x7f;
         return;
     case R_TXQSAR1:
-        s->tx_gpd_last = v;
         s->regs[idx] = v;
         return;
     case R_TXQCSR1:
-        /* Report the queue as ACTIVE so LK's start_qmu() poll succeeds. */
+        /* Report the queue as ACTIVE so the driver's start_qmu() poll
+         * succeeds. */
         s->regs[idx] = (v | QMU_Q_ACTIVE) & ~QMU_Q_STOP;
-        if (v & (QMU_Q_START | QMU_Q_RESUME)) {
+        if (v & QMU_Q_START) {
+            s->tx_gpd_last = usbdev_qmu_start_addr(s, true);
             s->qmu_tx_on = true;
-            /* LK kicks the TX queue by writing TXQCSR1 START/RESUME. */
+            usbdev_tx_kick(s, v);
+        } else if (v & QMU_Q_RESUME) {
+            if (!s->tx_gpd_last) {
+                s->tx_gpd_last = usbdev_qmu_start_addr(s, true);
+            }
+            s->qmu_tx_on = true;
+            /* The driver re-arms the queue (RESUME) after it has processed
+             * the previous completions and queued new GPDs. */
             usbdev_tx_kick(s, v);
         }
         if (v & QMU_Q_STOP) {
@@ -926,35 +1033,24 @@ static void usbdev_write(void *opaque, hwaddr off, uint64_t value,
         s->regs[idx] = v;
         return;
     case R_RXQSAR1:
-        s->rx_gpd_next = v;
         s->regs[idx] = v;
-        s->regs[R_RXQCPR1 / 4] = v;      /* hardware CPR starts at ring base */
-
-        if (s->trace) {
-            uint8_t dump[64];
-
-            if (usbdev_dma_read(s, v, dump, sizeof(dump))) {
-                int i;
-
-                fprintf(stderr, "USBDEV RX GPD dump @%#x:", v);
-                for (i = 0; i < (int)sizeof(dump); i++) {
-                    fprintf(stderr, "%02x", dump[i]);
-                }
-                fprintf(stderr, "\n");
-            }
-        }
         return;
     case R_RXQCSR1:
         s->regs[idx] = (v | QMU_Q_ACTIVE) & ~QMU_Q_STOP;
+        if (v & QMU_Q_START) {
+            /* Hardware restarts its current-GPD pointer at the ring base. */
+            s->rx_gpd_next = usbdev_qmu_start_addr(s, false);
+            usbdev_qmu_set_cpr(s, false, s->rx_gpd_next);
+        }
         if (v & (QMU_Q_START | QMU_Q_RESUME)) {
             s->qmu_rx_on = true;
             if (!s->qmu_ready) {
                 s->qmu_ready = true;
                 usbdev_log(s, "QMU_READY");
             }
-            /* LK writes RESUME/START after it has processed the previous RX
-             * request and re-armed GPDs; only then is it safe to complete the
-             * next GPD (avoids the "no correct RX req" panic). */
+            /* The driver writes RESUME/START after it has processed the
+             * previous RX request and re-armed GPDs; only then is it safe to
+             * complete the next GPD. */
             if (s->rxq && s->rxq->len) {
                 usbdev_rx_arm_timer(s, 1);
             }

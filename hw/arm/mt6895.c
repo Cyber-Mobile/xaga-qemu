@@ -11747,7 +11747,11 @@ static void mt6895_create_syscons(Mt6895MachineState *s, Error **errp)
      * deliberately left untouched (it is what makes LK's clock check pass).
      * Host side talks over a chardev socket; env MTK_USBDEV_TCP=<port>
      * (default 4444) or MTK_USBDEV_CHR=<existing chardev id>.
-     * IRQ: LK's MT_SSUSB_IRQ_ID is INTID 169 -> GIC input line 137.
+     * IRQ: the guest FDT's usb0@11201000 node carries
+     * "interrupts = <GIC_SPI 128 IRQ_TYPE_LEVEL_HIGH>" (SPI 128 / INTID 160),
+     * which is the line both LK's fastboot UDC and the kernel mtu3 driver
+     * request.  QEMU's GICv3 input lines are indexed by SPI number (see
+     * mt6895.h), so one constant serves both paths.
      */
     {
         const char *ud = getenv("MTK_USBDEV");
@@ -11787,7 +11791,7 @@ static void mt6895_create_syscons(Mt6895MachineState *s, Error **errp)
                 {
                     const char *ie = getenv("MTK_USBDEV_IRQ");
                     unsigned usb_irq = (ie && *ie) ? strtoul(ie, NULL, 0) :
-                                       (gadget_mode ? 179 : 128);
+                                       MT6895_SSUSB_SPI;
 
                     sysbus_connect_irq(SYS_BUS_DEVICE(udev), 0,
                                        qdev_get_gpio_in(s->gic, usb_irq));

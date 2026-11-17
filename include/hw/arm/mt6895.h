@@ -871,6 +871,14 @@ extern uint8_t mt6895_name_tbl_image[];
 #define MT6895_KP_SPI           106
 
 /*
+ * DT: usb0@11201000, interrupts = <GIC_SPI 128 IRQ_TYPE_LEVEL_HIGH>.
+ * This is the single device-mode interrupt line of the mtu3/ssusb block
+ * (INTID 160); LK's fastboot UDC and the Linux mtu3 gadget driver both
+ * request it.
+ */
+#define MT6895_SSUSB_SPI        128
+
+/*
  * BootROM-supplied startup words, exposed read-only over the payload's BSS:
  * the memory descriptor base pointer and its entry count.
  */
