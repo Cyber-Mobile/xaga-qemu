@@ -78,7 +78,11 @@ export MTK_NO_ATFLOG=1 MTK_NO_ATFARG=1 MTK_NO_ATFARG2=1 MTK_GZ_SKIP=1 MTK_NO_GTA
 | `MTK_GCE_EXEC=on` | execute GCE/CMDQ instructions |
 | `MTK_USB_HOSTMODE=1` | expose mtu3 as xHCI host with emulated devices |
 | `MTK_USBDEV=1 MTK_USBDEV_TCP=4444` | device-mode UDC + TCP bridge for fastboot |
-| `MTK_KCMDLINE_SUBST='old:new'` | same-length kernel cmdline substitution |
+| `MTK_IOMMU=1` | model real M4U/IOMMU translation (ARMv7 short-descriptor page tables + MTK 34-bit IOVA/35-bit PA extension); the DRM/GCE clients then program IOVAs and their DMA reads are translated |
+| `MTK_IOMMU_LOG=1` | trace the M4U page-table base, TLB invalidations and identity/fault translations |
+| `MTK_GCE_MASK_ALL=1` | positive (inverted) GCE mask-write formula required by LineageOS \`first_enable\` |
+| `MTK_DT_NOIOMMU=1` | **deprecated** legacy bring-up hack: NOP the device-tree \`iommus\` properties so DRM/GCE fall back to physical addresses; use \`MTK_IOMMU=1\` instead |
+| `MTK_KCMDLINE_SUBST='old:new'` | same-length kernel cmdline substitution (diagnostic); the \`cma=256M\` workaround it was used for is **deprecated** - the IOMMU model removes the contiguous-CMA requirement |
 | `MTK_SMPDBG=1` | per-CPU debug trail |
 | `MTK_ATF_LAZY_PLANT=1` | plant EL3 context before first non-PSCI SMC (secondary TEE) |
 
