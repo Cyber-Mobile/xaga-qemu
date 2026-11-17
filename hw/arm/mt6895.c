@@ -11102,11 +11102,13 @@ static const struct {
         { "mt6895.eint-c", 0x1c01e000ULL, 0x1000 },
         { "mt6895.dev-apmixedsys", 0x08000000ULL, 0x1000 },
     /*
-         * 设备树中其余外设的寄存器窗口，机械生成。
-         * 规则：label 可选、缩进不限、地址大小写不敏感、取每个节点的全部 reg 项；
-         * 排除 BootROM/SRAM 区、机型实际映射区、以及已专门建模的区域。
-         * 这些块不做行为建模（普通寄存器文件），但必须映射：驱动 probe 会
-         * 读写它们，未映射会触发 synchronous external abort 并 panic。
+         * Register frames of the remaining device-tree peripherals, generated
+         * mechanically.  Rules: label optional, indentation free, addresses
+         * case-insensitive, and all 'reg' entries of every node are taken.
+         * BootROM/SRAM ranges, ranges the machine already maps and regions with
+         * dedicated models are excluded.  These blocks are plain register files
+         * with no behaviour, but they must be mapped: drivers probe them, and an
+         * unmapped access raises a synchronous external abort and panics.
          */
         { "mt6895.dev-infracfg_ao_mem", 0x10002000ULL, 0x1000 },
         { "mt6895.dev-pericfg", 0x10003000ULL, 0x1000 },
@@ -12613,16 +12615,18 @@ static void mt6895_init(MachineState *machine)
     }
 
     /*
-     * SCMI 共享内存的初始状态。
+     * Initial state of the SCMI shared memory.
      *
-     * arm,scmi 的 shmem 布局里，channel_status 位于 +4，bit0 为 CHANNEL_FREE。
-     * 真机上该位由平台侧（tinysys）在通道空闲时置位；本模拟器没有平台侧，
-     * 若不预置，内核在 shmem_channel_free() 里读回 0 判定"通道忙"，
-     * shmem_tx_prepare() 就会在 ldr/dmb 自旋里无限等待（实测 PC 停在
-     * shmem_tx_prepare+0x28c，X09 恒为 0）。
+     * In the arm,scmi shmem layout channel_status sits at +4 and bit0 is
+     * CHANNEL_FREE.  On real silicon the platform side (tinysys) sets that bit
+     * when the channel is idle; this model has no platform side, so unless it is
+     * pre-set the kernel reads 0 from shmem_channel_free(), decides the channel
+     * is busy and spins forever in shmem_tx_prepare() (observed PC stuck at
+     * shmem_tx_prepare+0x28c with X09 always 0).
      *
-     * 预置 CHANNEL_FREE 后首个事务能发出；之后内核等不到平台回复会按自己的
-     * 超时返回并让 probe 失败，而不是把整条启动链挂死。
+     * With CHANNEL_FREE pre-set the first transaction goes out; the kernel then
+     * times out waiting for the platform reply and lets probe fail instead of
+     * hanging the whole boot chain.
      */
     for (int i = 2; i < MT6895_NUM_SRAMS; i++) {
         uint8_t *p = memory_region_get_ram_ptr(&s->sram[i]);

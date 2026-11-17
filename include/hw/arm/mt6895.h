@@ -141,15 +141,18 @@ OBJECT_DECLARE_SIMPLE_TYPE(Mt6895MachineState, MT6895_MACHINE)
 #define MT6895_BOOT_ARG_SIZE    0x00001000ULL
 
 /*
- * SCMI 共享内存（ssram1/ssram2）。
+ * SCMI shared memory (ssram1/ssram2).
  *
- * arm,scmi 通过 mailbox 与 tinysys 通信，双方通过这两块 SRAM 交换消息头、
- * 状态字与载荷。它们必须是可读写内存而不是寄存器文件：内核要写 channel_status
- * 的 CHANNEL_FREE 位（以及消息头/长度），平台侧读走后再回写。若按普通寄存器文件
- * 映射，读回恒为 0，shmem_channel_free() 永远判定通道忙，shmem_tx_prepare()
- * 就在 ldr/dmb 自旋里死等（实测 PC 停在 shmem_tx_prepare+0x28c）。
+ * arm,scmi talks to tinysys through a mailbox and both sides exchange message
+ * headers, status words and payloads over these two SRAM blocks.  They must be
+ * mapped as writable memory rather than as a register file: the kernel writes
+ * the CHANNEL_FREE bit of channel_status (plus the message header and length)
+ * and the platform side reads it and writes it back.  When mapped as a plain
+ * register file the reads always return 0, shmem_channel_free() considers the
+ * channel busy forever and shmem_tx_prepare() spins on ldr/dmb (observed PC
+ * stuck at shmem_tx_prepare+0x28c).
  *
- * 设备树给出的长度是 0x80，这里按 4 KiB 对齐映射，留出余量。
+ * The device tree gives a length of 0x80; map 4 KiB-aligned to leave headroom.
  */
 #define MT6895_SCMI_TX_SHMEM_BASE   0x1c350000ULL
 #define MT6895_SCMI_RX_SHMEM_BASE   0x1c360000ULL
