@@ -53,6 +53,7 @@
 #include "hw/misc/mtk_iommu.h"
 #include "hw/misc/mtk_gce.h"
 #include "hw/i2c/mtk_i2c.h"
+#include "hw/i2c/bq28z610.h"
 #include "hw/misc/ktz8863a.h"
 #include "hw/display/mtk_disp.h"
 #include "chardev/char.h"
@@ -9913,6 +9914,13 @@ static void mt6895_create_i2c(Mt6895MachineState *s, Error **errp)
                 i2c_slave_realize_and_unref(I2C_SLAVE(ktz), MTK_I2C(dev)->bus,
                                             &error_fatal);
             }
+            if (ctl[i].addr == 0x11d04000ULL) {
+                DeviceState *fg = DEVICE(i2c_slave_new(TYPE_BQ28Z610, 0x55));
+
+                i2c_slave_realize_and_unref(I2C_SLAVE(fg), MTK_I2C(dev)->bus,
+                                            &error_fatal);
+            }
+
         }
     }
 
