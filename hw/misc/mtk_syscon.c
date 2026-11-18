@@ -37,7 +37,8 @@
 /*
  * The DRAM PHY "ch_rsv" per-rank completion word (offset 0x70b0) carries
  * three 2-bit fields, one bit per rank: [15:14], [19:18] and [21:20]. Only
- * the rank-0 halves are set, because the emulated part is one 8 GiB rank.
+ * the rank-0 halves are set, because the emulated part is one rank (the
+ * 6 GiB LPDDR5X part in the default/6 GiB configuration).
  */
 #define MTK_SYSCON_DRAM_PHY_CHAR_RANK_STATUS  0x00144000
 
@@ -55,11 +56,23 @@ struct MtkSysconState {
     /* Hardware-voter clock-gate votes / done acks; see mtk_hwv_cg_decode(). */
     uint32_t hwv_vote[256];
     uint32_t hwv_done[256];
+    /* EFUSE/OTP controller (0x11F10000): documented device state. */
+    bool efuse;
+    bool efuse_unlocked;
+    /* Board strap selecting LPDDR5X (genuine 6 GiB configuration). */
+    bool lpdd5x_strap;
 };
 
 static bool mtk_infracfg_b4_ctl;
 static bool mtk_infracfg_b0_ctl;
-static bool mtk_efuse_cmd_seen;
+
+/*
+ * ULPOSC_CON0 written by the preloader's PMIF clock-manager calibration
+ * (syscon "vlp_cksys_clk" + 0x200).  Read by the topckgen frequency meter so
+ * the meter returns a measured frequency instead of a fixed count; see
+ * include/hw/misc/mtk_syscon.h.
+ */
+uint32_t mtk_vlp_ulposc_con0;
 
 /* MTK_HWVLOG: log hwv/apmixedsys accesses, collapsing repeated reads. */
 static void mtk_hwvlog(const char *name, char rw, hwaddr off, uint64_t v)
@@ -102,6 +115,183 @@ static uint64_t mtk_usbdev_pc(void)
     CPUState *cs = qemu_get_cpu(0);
 
     return cs ? (uint64_t)CPU_GET_CLASS(cs)->get_pc(cs) : 0;
+}
+
+/*
+ * EFUSE/OTP controller (0x11F10000) -- documented device state
+ * ===========================================================
+ *
+ * The real controller exposes its OTP words memory-mapped inside the 64 KiB
+ * window: LK reads them through a table of pointers (e.g. 0xFFFF000011F10060
+ * for the secure-boot word), caches the 0xD4 words it needs in RAM, and reads
+ * whole fields through an indexed helper.  The control block is:
+ *
+ *   +0x000  status: bit0 done, bit1 busy, bit2 start, bits[10:] command
+ *   +0x010  unlock: 0x6B32970A written before an access, 0 written to lock
+ *   +0x230  bank command register (LK masks 0xFFFFFC00)
+ *   +0x430  second bank command register (LK masks 0xFFFFFFF0)
+ *
+ * This model therefore carries a real OTP word map as *device state* instead
+ * of a register-file stub.  The default state is the state observed on the
+ * actual xaga unit, taken from that unit's own boot logs (expdb):
+ *
+ *   offset  value  provenance
+ *   0x060   0x2    secure-boot fuse bit 1: LK "dump sw sbc:0x11, sw sdl:0x22,
+ *                  hw sbc: 1"; preloader "sbc_en = 1" twice and
+ *                  "[SEC] HW DEC".
+ *
+ * Every OTP word without evidence reads erased (0): nothing is invented.  The
+ * anti-rollback/OTP version (device log: "otp ver:1", "(verk,verc,otp)=
+ * (1,1,1)", "[IMG_VER] pl ver check, ver=(0,1)") must be placed at the word
+ * the firmware actually reads, once MTK_EFUSE_TRACE has shown which word that
+ * is; until then it reads erased and the guest's own check decides -- an
+ * honest failure, never a planted verdict.
+ *
+ * MTK_EFUSE_STATE selects a documented unit state ("xaga", the default, or
+ * "blank" for a factory-fresh/unreadable OTP).  MTK_EFUSE_FILE supplies a
+ * per-unit word map: one "offset value" line, both hex, '#' for comments.
+ * There is deliberately no knob that forces a value.
+ */
+#define MTK_EFUSE_UNLOCK_MAGIC 0x6b32970au
+#define MTK_EFUSE_OFF_STATUS   0x000u
+#define MTK_EFUSE_OFF_UNLOCK   0x010u
+
+static const struct MtkEfuseWord {
+    uint32_t off;
+    uint32_t val;
+    const char *why;
+} mtk_efuse_xaga_words[] = {
+    /*
+     * Bit 1 of this word is read DIRECTLY by LK (VA 0x50f79464: mov x8,
+     * #0x11f10060 / ldr w8,[x8] / ubfx w0,w8,#1,#1) and printed as "hw sbc".
+     * Device log: "dump sw sbc:0x11, sw sdl:0x22 , hw sbc: 1"; preloader
+     * prints "sbc_en = 1" twice and "[SEC] HW DEC".
+     */
+    { 0x060, 0x2, "secure-boot fuse bit1 (LK direct read 0x11f10060)" },
+    /*
+     * RID words 0..3.  LK's shadow indices 0x0c..0x0f map to these offsets
+     * (direct table reads, not synthesised) and LK prints them as
+     * "dump rid, ...".  Values are this unit's own, from its boot log.
+     */
+    { 0x140, 0xd5a75b8b, "RID word 0 (device log dump rid)" },
+    { 0x144, 0x8468f77b, "RID word 1 (device log dump rid)" },
+    { 0x148, 0x71379f15, "RID word 2 (device log dump rid)" },
+    { 0x14c, 0xa30332f0, "RID word 3 (device log dump rid)" },
+    /*
+     * Fuse blow status.  The efuse blower (preloader VA 0x2054fa0) reads this
+     * word and treats bits[1:0] != 0 as "already blown / blow forbidden"
+     * (0x2054fb8: ldr.w r0,[r6,#0x450] ; lsls r0,r0,#0x1e ; beq blow-path),
+     * and the same firmware writes 1 here on a completed blow
+     * (0x2055048 / 0x20550d0: str #1,[r6,#0x450]).  The device's own expdb
+     * log contains no blow sequence at all, i.e. the real unit reads this as
+     * a blown/forbidden part.  Exact silicon value (1 vs 2 vs 3) is
+     * UNVERIFIED; no observed consumer branches on the exact value, only on
+     * bits[1:0] being non-zero.
+     */
+    { 0x490, 0x1, "blow status: already blown (gate: bits[1:0]!=0)" },
+};
+
+static void mtk_efuse_trace(char rw, hwaddr off, unsigned size, uint64_t val)
+{
+    static int on = -1;
+    static int n;
+
+    if (on < 0) {
+        on = getenv("MTK_EFUSE_TRACE") != NULL;
+    }
+    if (!on || n++ > 4000) {
+        return;
+    }
+    fprintf(stderr,
+            "EFUSE %c off=%#010x size=%u val=%#" PRIx64 " pc=%#" PRIx64 "\n",
+            rw, (unsigned)off, size, val, mtk_usbdev_pc());
+}
+
+/*
+ * Controller registers are writable (commands/config); the OTP word map is
+ * device state and read-only.  Real hardware cannot un-blow a fuse, so a
+ * blow sequence must never mutate this model's state either.  The ranges are
+ * the registers LK's efuse code drives: status/unlock at 0x000..0x01c, and
+ * the two bank command blocks at 0x200..0x23c / 0x400..0x43c.
+ */
+static bool mtk_efuse_off_is_control(uint32_t off)
+{
+    return off <= 0x01c ||
+           (off >= 0x200 && off <= 0x23c) ||
+           (off >= 0x400 && off <= 0x43c) ||
+           (off >= 0x490 && off <= 0x49c);
+}
+
+/* True if this offset holds documented OTP state (not software storage). */
+static bool mtk_efuse_word_is_state(uint32_t off, uint32_t *val)
+{
+    size_t i;
+
+    for (i = 0; i < ARRAY_SIZE(mtk_efuse_xaga_words); i++) {
+        if (mtk_efuse_xaga_words[i].off == off) {
+            if (val) {
+                *val = mtk_efuse_xaga_words[i].val;
+            }
+            return true;
+        }
+    }
+    return false;
+}
+
+static void mtk_efuse_apply_state(MtkSysconState *s)
+{
+    const char *state = getenv("MTK_EFUSE_STATE");
+    const char *file = getenv("MTK_EFUSE_FILE");
+    size_t i;
+
+    if (!s->efuse) {
+        return;
+    }
+    if (!state || !*state) {
+        state = "xaga";
+    }
+    if (!strcmp(state, "xaga")) {
+        for (i = 0; i < ARRAY_SIZE(mtk_efuse_xaga_words); i++) {
+            s->regs[mtk_efuse_xaga_words[i].off / 4] =
+                mtk_efuse_xaga_words[i].val;
+        }
+        fprintf(stderr, "mtk-syscon: efuse state 'xaga' (%zu documented words)\n",
+                ARRAY_SIZE(mtk_efuse_xaga_words));
+    } else if (strcmp(state, "blank")) {
+        fprintf(stderr,
+                "mtk-syscon: unknown MTK_EFUSE_STATE='%s', using blank OTP\n",
+                state);
+    }
+    if (file && *file) {
+        FILE *fp = fopen(file, "r");
+        char line[128];
+
+        if (!fp) {
+            fprintf(stderr, "mtk-syscon: cannot open MTK_EFUSE_FILE=%s\n", file);
+        } else {
+            unsigned nwords = 0;
+
+            while (fgets(line, sizeof(line), fp)) {
+                unsigned long off, val;
+                char *p = line;
+
+                while (*p == ' ' || *p == '\t') {
+                    p++;
+                }
+                if (*p == '#' || *p == '\n' || *p == '\0') {
+                    continue;
+                }
+                if (sscanf(p, "%lx %lx", &off, &val) == 2 &&
+                    off + 4 <= s->size) {
+                    s->regs[off / 4] = (uint32_t)val;
+                    nwords++;
+                }
+            }
+            fclose(fp);
+            fprintf(stderr, "mtk-syscon: efuse state file %s (%u words)\n",
+                    file, nwords);
+        }
+    }
 }
 
 static void mtk_usbdevtrace(const char *name, char rw, hwaddr off,
@@ -318,8 +508,33 @@ static bool mtk_hwv_cg_active(MtkSysconState *s)
            MTK_ENV_CACHED("MTK_PWR_STATE");
 }
 
+/*
+ * Observational trace (MTK_SYSCON_TRACE=1): every access to a named syscon
+ * window, with the window name.  Used to locate the PMIF clock-manager /
+ * ULPOSC registers the preloader calibrates; it never changes behaviour.
+ */
+static bool mtk_syscon_trace_on(void)
+{
+    static int on = -1;
+
+    if (on < 0) {
+        on = MTK_ENV_CACHED("MTK_SYSCON_TRACE");
+    }
+    return on;
+}
+
 static uint64_t mtk_syscon_read(void *opaque, hwaddr offset, unsigned size)
 {
+    if (mtk_syscon_trace_on()) {
+        MtkSysconState *st = MTK_SYSCON(opaque);
+        static int budget;
+
+        if (budget < 50000) {
+            budget++;
+            fprintf(stderr, "MTK-SYSCON rd %s off=%#x size=%u\n",
+                    st->name ? st->name : "(null)", (unsigned)offset, size);
+        }
+    }
     {
         MtkSysconState *sp = MTK_SYSCON(opaque);
 
@@ -360,6 +575,23 @@ static uint64_t mtk_syscon_read(void *opaque, hwaddr offset, unsigned size)
         MtkSysconState *s0 = MTK_SYSCON(opaque);
 
         /*
+         * Pinctrl board strap selecting the DRAM generation.
+         *
+         * The preloader's dram-type detector (0x020283f0) bit-bangs the
+         * pinctrl word at +0x200 (bit 0) and +0x260 (bit 14).  On the xaga
+         * board the first reads high and the second low, which is how the
+         * firmware selects LPDDR5X (dram_type 0xC) instead of falling back to
+         * LPDDR5 (0xB).  Both are board input levels, like the pad input lines
+         * described below, not guest state.
+         *
+         * The machine enables this only in the genuine 6 GiB configuration;
+         * every other -m keeps the historical plain-storage behaviour.
+         */
+        if (s0->lpdd5x_strap && offset == 0x200 && offset + 4 <= s0->size) {
+            return s0->regs[offset / 4] | 1u;
+        }
+
+        /*
          * infracfg_ao (0x10001000) + 0xb0/0xb4 acknowledge a request the same
          * way the other MTK handshake windows do: the stage writes the
          * control word, then spins until the block reports the transfer as
@@ -390,13 +622,6 @@ static uint64_t mtk_syscon_read(void *opaque, hwaddr offset, unsigned size)
             }
         }
         /*
-         * EFUSE controller +0x00: keep it a plain register.  The read-done
-         * bit is raised by the command write below and cleared by the next
-         * command, so the data words read back unchanged -- an earlier
-         * version forced bit 0 on every read, which silently corrupted the
-         * OTP words BL2 pulls its key material from.
-         */
-        /*
          * GPIO input register file.  Tracing the preloader's fastmeta probe
          * shows it reads the pad's mode (0x000), data-out (0x200), pull-enable
          * (0x260, read twice), pull-select and the input level (0x300); one
@@ -413,22 +638,24 @@ static uint64_t mtk_syscon_read(void *opaque, hwaddr offset, unsigned size)
          * words high breaks early boot, so they are left as plain storage --
          * the pad input level is not served from this block.
          */
-        if (s0->name && strstr(s0->name, "efuse") && offset == 0) {
-            return s0->regs[0] | (mtk_efuse_cmd_seen ? 1u : 0u);
-        }
-        /*
-         * EXPERIMENT (env-gated): secure-boot fuse at EFUSE +0x60 bit 1.
-         *
-         * LK reads 0xFFFF000011F10060 and extracts bit 1 as "sbc_en".  On a
-         * production unit the secure-boot fuse is burned, so the bit reads 1
-         * and the image path goes through the (fenrir-patched) cert parser
-         * instead of the raw signature memcmp.  The model currently returns 0
-         * for every OTP word because the fuse map is not known; gate the
-         * experiment so it can be evaluated and reverted.
-         */
-        if (s0->name && strstr(s0->name, "efuse") && offset == 0x60 &&
-            getenv("MTK_EFUSE_SBC")) {
-            return s0->regs[offset / 4] | 0x2u;
+        if (s0->efuse) {
+            uint64_t v;
+
+            if (offset + 4 > s0->size) {
+                return 0;
+            }
+            if (offset == MTK_EFUSE_OFF_STATUS) {
+                /*
+                 * Idle controller: done set, busy clear, start self-clears
+                 * because a read is satisfied from the model's word map with
+                 * no pending operation.  Command bits are kept as written.
+                 */
+                v = (s0->regs[offset / 4] & ~0x7u) | 0x1u;
+            } else {
+                v = s0->regs[offset / 4];
+            }
+            mtk_efuse_trace('R', offset, size, v);
+            return v;
         }
     }
     MtkSysconState *s = MTK_SYSCON(opaque);
@@ -503,7 +730,8 @@ static uint64_t mtk_syscon_read(void *opaque, hwaddr offset, unsigned size)
      * reports the rank-0 bits of all three fields: 0x00144000.
      *
      * The register lives in the windows the machine names
-     * mt6895.dramc-20..dramc-27; the emulated part is one 8 GiB rank, so
+     * mt6895.dramc-20..dramc-27; the emulated part is one rank (6 GiB LPDDR5X
+ * by default), so
      * only the rank-0 halves of the fields are set.
      */
     if (offset == 0x70b0 && s->name &&
@@ -654,6 +882,27 @@ static void mtk_syscon_write(void *opaque, hwaddr offset, uint64_t value,
 {
     MtkSysconState *s = MTK_SYSCON(opaque);
 
+    if (mtk_syscon_trace_on()) {
+        static int budget;
+
+        if (budget < 100000) {
+            budget++;
+            fprintf(stderr, "MTK-SYSCON wr %s off=%#x size=%u val=%#x\n",
+                    s->name ? s->name : "(null)", (unsigned)offset, size,
+                    (unsigned)value);
+        }
+    }
+
+    /*
+     * ULPOSC_CON0 (VLP clock-sys + 0x200): remember the trim code the PMIF
+     * clock-manager calibration applied, for the topckgen frequency meter.
+     */
+    if (s->name && !strcmp(s->name, "vlp_cksys_clk") && offset == 0x200) {
+        mtk_vlp_ulposc_con0 = (uint32_t)value;
+    }
+
+
+    bool efuse_ignored = false;
 
     if (s->name && strstr(s->name, "infracfg-ao")) {
         if (offset == 0xb4 && value) {
@@ -663,16 +912,40 @@ static void mtk_syscon_write(void *opaque, hwaddr offset, uint64_t value,
             mtk_infracfg_b0_ctl = true;
         }
     }
-    if (s->name && strstr(s->name, "efuse") && offset == 0 && value) {
-        mtk_efuse_cmd_seen = true;
-    }
-    if (s->name && strstr(s->name, "efuse") && getenv("MTK_EFUSE")) {
-        static int ne;
+    if (s->efuse) {
+        mtk_efuse_trace('W', offset, size, value);
+        if (size == 4 && offset == MTK_EFUSE_OFF_UNLOCK) {
+            /*
+             * Magic-gated access, as the real controller requires before a
+             * bank operation: LK writes 0x6B32970A to open, 0 to lock.
+             */
+            s->efuse_unlocked = (value == MTK_EFUSE_UNLOCK_MAGIC);
+        }
+        if (!mtk_efuse_off_is_control((uint32_t)offset)) {
+            /*
+             * A write into the OTP word map is a blow attempt.  This unit's
+             * fuses are already burnt and fuses cannot be undone, so the
+             * model refuses the write instead of quietly changing device
+             * state.  The guest is free to decide what that refusal means.
+             */
+            static int nref;
 
-        if (ne < 30) {
-            ne++;
-            fprintf(stderr, "EFUSE-W off=%#x val=%#" PRIx64 "\n",
-                    (unsigned)offset, value);
+            efuse_ignored = true;
+            if (nref++ < 8) {
+                fprintf(stderr,
+                        "EFUSE-REFUSE W off=%#010x val=%#" PRIx64
+                        " size=%u: OTP state is read-only\n",
+                        (unsigned)offset, value, size);
+            }
+        }
+        if (getenv("MTK_EFUSE")) {
+            static int ne;
+
+            if (ne < 30) {
+                ne++;
+                fprintf(stderr, "EFUSE-W off=%#x val=%#" PRIx64 "\n",
+                        (unsigned)offset, value);
+            }
         }
     }
     if (s->name && strstr(s->name, "infracfg-ao") &&
@@ -713,11 +986,22 @@ static void mtk_syscon_write(void *opaque, hwaddr offset, uint64_t value,
     }
     unsigned int i;
 
-    for (i = 0; i < size; i += 4) {
+    for (i = 0; !efuse_ignored && i < size; i += 4) {
         hwaddr o = offset + i;
 
         if (o + 4 <= s->size) {
-            s->regs[o / 4] = (value >> (8 * i)) & 0xffffffff;
+            uint32_t state_val;
+
+            if (s->efuse && mtk_efuse_word_is_state(o, &state_val)) {
+                /*
+                 * Documented OTP words are device state, not software
+                 * storage: firmware writes cannot change the unit's fuses
+                 * through the data window.
+                 */
+                s->regs[o / 4] = state_val;
+            } else {
+                s->regs[o / 4] = (value >> (8 * i)) & 0xffffffff;
+            }
         }
     }
     if (size == 4) {
@@ -849,7 +1133,9 @@ static void mtk_syscon_reset_hold(Object *obj, ResetType type)
     memset(s->regs, 0, s->size);
     memset(s->hwv_vote, 0, sizeof(s->hwv_vote));
     memset(s->hwv_done, 0, sizeof(s->hwv_done));
+    s->efuse_unlocked = false;
     mtk_syscon_bp_presets(s);
+    mtk_efuse_apply_state(s);
 }
 
 /*
@@ -867,7 +1153,10 @@ static void mtk_syscon_realize(DeviceState *dev, Error **errp)
                           TYPE_MTK_SYSCON, s->size);
     sysbus_init_mmio(SYS_BUS_DEVICE(dev), &s->iomem);
     s->regs = g_new0(uint32_t, s->size / 4);
+    s->efuse = s->name && strstr(s->name, "efuse");
+    s->efuse_unlocked = false;
     mtk_syscon_bp_presets(s);
+    mtk_efuse_apply_state(s);
 }
 
 static void mtk_syscon_finalize(Object *obj)
@@ -885,6 +1174,7 @@ static const Property mtk_syscon_props[] = {
      * impossible to attribute. The machine sets this per window.
      */
     DEFINE_PROP_STRING("name", MtkSysconState, name),
+    DEFINE_PROP_BOOL("lpdd5x-strap", MtkSysconState, lpdd5x_strap, false),
 };
 
 static void mtk_syscon_class_init(ObjectClass *klass, const void *data)

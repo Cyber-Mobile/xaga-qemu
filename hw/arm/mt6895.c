@@ -1947,6 +1947,99 @@ static const MemoryRegionOps mt6895_atf_percpu_ops = {
     .impl = { .min_access_size = 1, .max_access_size = 8 },
 };
 
+/*
+ * DIAGNOSTIC (MTK_BAGWATCH): transparent, read-through observation of the
+ * regions that decide the LK boot-argument path.  Accesses are forwarded to
+ * RAM unchanged; only logging is added.
+ *
+ * The 0x020F7D30 boot-parameter window is deliberately SPLIT around
+ * 0x020F7D78..0x020F7D7B: that word is served by the lk_bootarg plant, and a
+ * priority-4 overlay over it would shadow the plant, change boot behaviour and
+ * produce the very abort this diagnostic is meant to observe.
+ */
+#define MT6895_BAG_BLK_BASE   0x020F3740ULL
+#define MT6895_BAG_BLK_SIZE   0x0000093C
+#define MT6895_BAG_BA_LO_BASE 0x020F7D30ULL
+#define MT6895_BAG_BA_LO_SIZE 0x00000048
+#define MT6895_BAG_BA_HI_BASE 0x020F7D7CULL
+#define MT6895_BAG_BA_HI_SIZE 0x00000124
+
+typedef struct Mt6895BagRegion {
+    Mt6895MachineState *s;
+    hwaddr base;
+    unsigned nrd;
+    unsigned nwr;
+} Mt6895BagRegion;
+
+static Mt6895BagRegion mt6895_bag_blk;
+static Mt6895BagRegion mt6895_bag_ba_lo;
+static Mt6895BagRegion mt6895_bag_ba_hi;
+static Mt6895BagRegion mt6895_bag_gl1;
+static Mt6895BagRegion mt6895_bag_gl2;
+
+static void mt6895_bag_log(const char *tag, hwaddr base, hwaddr off,
+                           uint64_t val, unsigned size, bool wr)
+{
+    ARMCPU *cpu = ARM_CPU(qemu_get_cpu(0));
+    uint64_t pc = 0, lr = 0;
+
+    if (cpu) {
+        pc = cpu->env.pc;
+        lr = cpu->env.aarch64 ? cpu->env.xregs[30] : cpu->env.regs[14];
+    }
+    fprintf(stderr, "MTK-%s %s base=%#" HWADDR_PRIx " off=%#x abs=%#"
+            HWADDR_PRIx " val=%#" PRIx64 " size=%u pc=%#" PRIx64
+            " lr=%#" PRIx64 "\n", tag, wr ? "WR" : "RD", base,
+            (unsigned)off, base + off, val, size, pc, lr);
+}
+
+static uint64_t mt6895_bag_read(void *opaque, hwaddr off, unsigned size)
+{
+    Mt6895BagRegion *r = opaque;
+    uint8_t *p = mt6895_guest_ptr(r->s, r->base + off, size);
+    uint64_t v = 0;
+    unsigned i;
+
+    if (!p) {
+        return 0;
+    }
+    for (i = 0; i < size; i++) {
+        v |= (uint64_t)p[i] << (8 * i);
+    }
+    if (r->nrd < 200) {
+        r->nrd++;
+        mt6895_bag_log("BAG", r->base, off, v, size, false);
+    }
+    return v;
+}
+
+static void mt6895_bag_write(void *opaque, hwaddr off, uint64_t val,
+                             unsigned size)
+{
+    Mt6895BagRegion *r = opaque;
+    uint8_t *p = mt6895_guest_ptr(r->s, r->base + off, size);
+    unsigned i;
+
+    if (!p) {
+        return;
+    }
+    if (r->nwr < 120) {
+        r->nwr++;
+        mt6895_bag_log("BAG", r->base, off, val, size, true);
+    }
+    for (i = 0; i < size; i++) {
+        p[i] = (val >> (8 * i)) & 0xff;
+    }
+}
+
+static const MemoryRegionOps mt6895_bag_ops = {
+    .read = mt6895_bag_read,
+    .write = mt6895_bag_write,
+    .endianness = DEVICE_LITTLE_ENDIAN,
+    .valid = { .min_access_size = 1, .max_access_size = 8 },
+    .impl = { .min_access_size = 1, .max_access_size = 8 },
+};
+
 static const MemoryRegionOps mt6895_cpc_status_ops = {
     .read = mt6895_cpc_status_read,
     .write = mt6895_cpc_status_write,
@@ -2051,215 +2144,12 @@ static const MemoryRegionOps mt6895_rodata_ops = {
 };
 
 /*
- * The payload's device table, overlaid for the same reason as the vtable:
- * a plain RAM write does not survive the payload's BSS clear. Entries are
- * served from the store when the guest has written them and from the
- * machine's defaults otherwise, so a zeroed entry still answers.
+ * The machine used to overlay four payload PMIC structures here (device table,
+ * PMIC ops vtable, auxadc registry, auxadc device object) with synthesised
+ * copies.  With the SPMI bus now modelled the payload builds them itself and
+ * the overlays poisoned the regulator table, so they are deleted: the guest
+ * sees the payload's own data.  See the note in mt6895_init().
  */
-static const uint32_t mt6895_devtbl_default[] = {
-    /* +0 name, +4 selector, +8 ops */
-    [0x00 / 4] = 0x02059632,   /* "vcore"     */
-    [0x04 / 4] = 0x00000000,
-    [0x08 / 4] = 0x0207850c,   /* PMIC ops vtable */
-    [0x0c / 4] = 0x020596a9,   /* "vddq"      */
-    [0x10 / 4] = 0x00000001,
-    [0x14 / 4] = 0x0207850c,
-    [0x18 / 4] = 0x02059638,   /* "vmddr"     */
-    [0x1c / 4] = 0x00000002,
-    [0x20 / 4] = 0x0207850c,
-    [0x24 / 4] = 0x0205f1dd,   /* "vsram_cpul" */
-    [0x28 / 4] = 0x00000003,
-    [0x2c / 4] = 0x0207850c,
-    [0x30 / 4] = 0x0205ed13,   /* "vcpul"     */
-    [0x34 / 4] = 0x00000004,
-    [0x38 / 4] = 0x0207850c,
-    [0x3c / 4] = 0x0205f1c7,   /* "vsram_cpub" */
-    [0x40 / 4] = 0x00000005,
-    [0x44 / 4] = 0x0207850c,
-    [0x48 / 4] = 0x0205ed03,   /* "vcpub"     */
-    [0x4c / 4] = 0x00000006,
-    [0x50 / 4] = 0x0207850c,
-    [0x54 / 4] = 0x0205f1d2,   /* "vsram_cpum" */
-    [0x58 / 4] = 0x00000007,
-    [0x5c / 4] = 0x0207850c,
-    [0x60 / 4] = 0x0205ed0d,   /* "vcpum"     */
-    [0x64 / 4] = 0x00000008,
-    [0x68 / 4] = 0x0207850c,
-    /* remaining slots zero: the scan stops at a zero name pointer */
-};
-
-static uint64_t mt6895_devtbl_read(void *opaque, hwaddr off, unsigned size)
-{
-    Mt6895MachineState *s = opaque;
-
-    if (off / 4 < ARRAY_SIZE(s->devtbl_store) && s->devtbl_store[off / 4]) {
-        return extract64(s->devtbl_store[off / 4], 0, size * 8);
-    }
-    if (off / 4 < ARRAY_SIZE(mt6895_devtbl_default) &&
-        mt6895_devtbl_default[off / 4]) {
-        return extract64(mt6895_devtbl_default[off / 4], 0, size * 8);
-    }
-    return 0;
-}
-
-static void mt6895_devtbl_write(void *opaque, hwaddr off, uint64_t val,
-                                unsigned size)
-{
-    Mt6895MachineState *s = opaque;
-
-    if (off + size <= MT6895_DEVTBL_SIZE &&
-        off / 4 < ARRAY_SIZE(s->devtbl_store)) {
-        s->devtbl_store[off / 4] = val;
-    }
-}
-
-static const MemoryRegionOps mt6895_devtbl2_ops = {
-    .read = mt6895_devtbl_read,
-    .write = mt6895_devtbl_write,
-    .endianness = DEVICE_NATIVE_ENDIAN,
-    .valid = {
-        .min_access_size = 1,
-        .max_access_size = 4,
-    },
-};
-
-/* The payload image's own PMIC ops vtable bytes at 0x0207850C. */
-static const uint32_t mt6895_pmicv_default[] = {
-    0x0203a9c1,   /* 0x0207850c */
-    0x0203aab1,   /* 0x02078510  get_voltage */
-    0x0203ab79,   /* 0x02078514 */
-    0x0203abc9,   /* 0x02078518 */
-    0x0203ac31,   /* 0x0207851c */
-    0x0203ac99,   /* 0x02078520 */
-};
-
-static uint64_t mt6895_pmicv_read(void *opaque, hwaddr off, unsigned size)
-{
-    Mt6895MachineState *s = opaque;
-
-    if (off / 4 < ARRAY_SIZE(s->rodata_store2) && s->rodata_store2[off / 4]) {
-        return extract64(s->rodata_store2[off / 4], 0, size * 8);
-    }
-    if (off / 4 < ARRAY_SIZE(mt6895_pmicv_default)) {
-        return extract64(mt6895_pmicv_default[off / 4], 0, size * 8);
-    }
-    return 0;
-}
-
-static void mt6895_pmicv_write(void *opaque, hwaddr off, uint64_t val,
-                               unsigned size)
-{
-    Mt6895MachineState *s = opaque;
-
-    if (off + size <= sizeof(mt6895_pmicv_default) &&
-        off / 4 < ARRAY_SIZE(s->rodata_store2)) {
-        s->rodata_store2[off / 4] = val;
-    }
-}
-
-static const MemoryRegionOps mt6895_pmicv_ops = {
-    .read = mt6895_pmicv_read,
-    .write = mt6895_pmicv_write,
-    .endianness = DEVICE_NATIVE_ENDIAN,
-    .valid = { .min_access_size = 1, .max_access_size = 4 },
-};
-
-/*
- * The pmic auxadc registry, overlaid with the machine's own slots and
- * descriptors so the walk in pmic_auxadc_device_register never dereferences
- * a garbage slot. Guest writes win where present.
- */
-static const uint32_t mt6895_auxadc_default[] = {
-    /* 0x020F4BC8: ten descriptor slots, stride 8 */
-    [0x00 / 4] = 0x020f4c18,             /* slot 0 -> "main_pmic"  */
-    [0x08 / 4] = 0x020f4c20,             /* slot 1 -> "subpmic"    */
-    /* slots 2..9 stay zero: the walk skips them (cbz) */
-    /* 0x020F4C18: descriptor for "main_pmic" */
-    [0x50 / 4] = 0x0205f365,
-    /* 0x020F4C20: descriptor for "subpmic" */
-    [0x58 / 4] = 0x0205fe42,
-};
-
-/*
- * The auxadc device object at 0x02078E94, which mt6375_auxadc_init hands to
- * pmic_auxadc_device_register (0x0203C6C8: ldr r0, =0x02078E94).
- *
- * It is separate from the registry above and only sixteen bytes wide, because
- * 0x02078EA4 is the payload's partition name table -- covering more than this
- * object would shadow data the payload uses at run time.
- *
- * With the I2C bus unmodelled the PMIC reads all return -121, the init never
- * builds this object, and the later register call dereferences r4 = 0. The
- * count at +8 is zero so the loop at 0x0204600 exits immediately and the
- * zeroed array pointer at +4 is never dereferenced.
- */
-static const uint32_t mt6895_auxdev_default[] = {
-    [0x00 / 4] = 0x0205f365,             /* +0x00 name "main_pmic" */
-    [0x04 / 4] = 0x00000000,             /* +0x04 array pointer    */
-    [0x08 / 4] = 0x00000000,             /* +0x08 entry count 0    */
-    [0x0c / 4] = 0x00000000,
-};
-
-static uint64_t mt6895_auxdev_read(void *opaque, hwaddr off, unsigned size)
-{
-    Mt6895MachineState *s = opaque;
-
-    if (off / 4 < ARRAY_SIZE(s->auxdev_store) && s->auxdev_store[off / 4]) {
-        return extract64(s->auxdev_store[off / 4], 0, size * 8);
-    }
-    if (off / 4 < ARRAY_SIZE(mt6895_auxdev_default)) {
-        return extract64(mt6895_auxdev_default[off / 4], 0, size * 8);
-    }
-    return 0;
-}
-
-static void mt6895_auxdev_write(void *opaque, hwaddr off, uint64_t val,
-                                unsigned size)
-{
-    Mt6895MachineState *s = opaque;
-
-    if (off + size <= 0x10 && off / 4 < ARRAY_SIZE(s->auxdev_store)) {
-        s->auxdev_store[off / 4] = val;
-    }
-}
-
-static const MemoryRegionOps mt6895_auxdev_ops = {
-    .read = mt6895_auxdev_read,
-    .write = mt6895_auxdev_write,
-    .endianness = DEVICE_NATIVE_ENDIAN,
-    .valid = { .min_access_size = 1, .max_access_size = 4 },
-};
-static uint64_t mt6895_auxadc_read(void *opaque, hwaddr off, unsigned size)
-{
-    Mt6895MachineState *s = opaque;
-
-    if (off / 4 < ARRAY_SIZE(s->auxadc_store) && s->auxadc_store[off / 4]) {
-        return extract64(s->auxadc_store[off / 4], 0, size * 8);
-    }
-    if (off / 4 < ARRAY_SIZE(mt6895_auxadc_default) &&
-        mt6895_auxadc_default[off / 4]) {
-        return extract64(mt6895_auxadc_default[off / 4], 0, size * 8);
-    }
-    return 0;
-}
-
-static void mt6895_auxadc_write(void *opaque, hwaddr off, uint64_t val,
-                                unsigned size)
-{
-    Mt6895MachineState *s = opaque;
-
-    if (off + size <= MT6895_AUXADC_SIZE &&
-        off / 4 < ARRAY_SIZE(s->auxadc_store)) {
-        s->auxadc_store[off / 4] = val;
-    }
-}
-
-static const MemoryRegionOps mt6895_auxadc_ops = {
-    .read = mt6895_auxadc_read,
-    .write = mt6895_auxadc_write,
-    .endianness = DEVICE_NATIVE_ENDIAN,
-    .valid = { .min_access_size = 1, .max_access_size = 4 },
-};
 
 /*
  * The MTK I2C device descriptor table at 0x020F369C: ten entries of 16 bytes,
@@ -3468,6 +3358,7 @@ static const MemoryRegionOps mt6895_pdn_ops = {
     .endianness = DEVICE_LITTLE_ENDIAN,
 };
 
+;
 
 static uint64_t mt6895_atfctx_read(void *opaque, hwaddr off, unsigned size)
 {
@@ -3489,6 +3380,7 @@ static const MemoryRegionOps mt6895_atfctx_ops = {
     .valid = { .min_access_size = 1, .max_access_size = 8 },
 };
 
+;
 
 /*
  * Write watch on ATF's SIP-dispatch mode flag (0x4825abd8). When it reads as 1
@@ -3625,9 +3517,48 @@ static const MemoryRegionOps mt6895_diagg_ops = {
     .valid = { .min_access_size = 1, .max_access_size = 4 },
 };
 
+/*
+ * The DRAM part the machine presents follows the configured RAM size:
+ *
+ *  - 6 GiB: the genuine Xiaomi xaga part, one 6 GiB LPDDR5X rank.  The
+ *    unit's own boot log reports dram_type 0xC, mr5 0xFF and rank0_size
+ *    0x180000000, and this is the machine default.
+ *  - any other size: the historical 8 GiB development configuration (QVL
+ *    row 7, one 8 GiB LPDDR5 rank).  Runs that still pass -m 8G therefore
+ *    keep exactly the DRAM behaviour they had before the LPDDR5X fix.
+ *
+ * Deriving the part from the configured RAM keeps the guest from ever being
+ * told about a memory map that does not describe the part the DRAM
+ * controller reports.
+ */
+#define MT6895_DRAM_SIZE        0x180000000ULL   /* 6 GiB, genuine part */
 
+static bool mt6895_dram_is_6g(Mt6895MachineState *s)
+{
+    return MACHINE(s)->ram_size == MT6895_DRAM_SIZE;
+}
 
+/*
+ * Mode-register answers for the configured part.
+ *
+ * MR5 is the manufacturer/die identity check_qvl compares against its QVL
+ * table; MR8 bits [5:2] select a per-die density from the preloader's
+ * density switch at 0x02027014 and bits [7:6] the die count.  The product
+ * is scaled by the channel count (4) to give the rank size:
+ *
+ *   6 GiB LPDDR5X: MR5 0xff, MR8 0x14 -> 0x60000000 * 1 die * 4
+ *   = 0x180000000, QVL row 5 (type C, rank0 6 GiB, rank1 0);
+ *   8 GiB LPDDR5:  MR5 0x06, MR8 0x18 -> 0x80000000 * 1 die * 4
+ *   = 0x200000000, QVL row 7 (type B, rank0 8 GiB, rank1 0).
+ */
+static uint32_t mt6895_dram_mr5(Mt6895MachineState *s)
+{
+    return mt6895_dram_is_6g(s) ? 0x00ff : 0x0006;
+}
 
+static uint32_t mt6895_dram_mr8(Mt6895MachineState *s)
+{
+    return mt6895_dram_is_6g(s) ? 0x0014 : 0x0018;
 }
 
 static void mt6895_place_device_table(Mt6895MachineState *s)
@@ -4278,19 +4209,10 @@ static const MemoryRegionOps mt6895_masp_ops = {
 #define MT6895_DRAMC_TOP3_SIZE 0x1000
 
 /*
- * The DRAM part the machine presents: one 8 GiB LPDDR5 rank.
- *
- * The preloader works out what is fitted by reading the part's mode
- * registers over the controller. MR5 becomes dev[+0x46] and check_qvl
- * compares it verbatim against the QVL table at 0x0206efb8 (+0x50), which
- * only lists 1, 6 and 0xff. MR8's bits [5:2] pick a per-die size from the
- * table at 0x0202701a and bits [7:6] the die count; the product is scaled
- * by the channel count (dev[+0] = 4) to give the rank size. MR5 = 6 with
- * MR8 = 0x18 therefore reports 0x80000000 * 1 * 4 = 0x200000000, which is
- * what QVL row 7 asks for (type B, mr5 6, rank0 8 GiB, rank1 0).
+ * Which part is fitted follows the configured RAM size, so the mode-register
+ * answers live next to MT6895_DRAM_SIZE (mt6895_dram_mr5/mt6895_dram_mr8)
+ * rather than in compile-time constants here.
  */
-#define MT6895_DRAM_MR5         0x0006
-#define MT6895_DRAM_MR8         0x0018
 
 /*
  * Nothing answers at rank 1: an MRR there reads back all ones, which puts
@@ -4398,17 +4320,18 @@ static uint64_t mt6895_dramc_top2_read(void *opaque, hwaddr off, unsigned size)
             } else {
                 switch (MT6895_DRAMC_CMD_MR(cmd)) {
                 case 5:
-                    res = MT6895_DRAM_MR5;
+                    res = mt6895_dram_mr5(w->s);
                     break;
                 case 6:
                 case 7:
                     res = 0;
                     break;
                 case 8:
-                    res = MT6895_DRAM_MR8;
+                    res = mt6895_dram_mr8(w->s);
                     break;
                 default:
-                    res = (MT6895_DRAMC_CMD_RANK(cmd) == 0) ? MT6895_DRAM_MR8 : MT6895_DRAM_MR_ABSENT;
+                    res = (MT6895_DRAMC_CMD_RANK(cmd) == 0)
+                              ? mt6895_dram_mr8(w->s) : MT6895_DRAM_MR_ABSENT;
                     break;
                 }
             }
@@ -4719,9 +4642,104 @@ static const MemoryRegionOps mt6895_dramc_cmd_ops = {
 
 #define MT6895_TOPCKGEN_SIZE 0x1000
 
+/*
+ * Topckgen clock block.  Besides the plain register file it carries the
+ * frequency-meter (PLL/oscillator measurement) pair used by the preloader's
+ * PMIF clock-manager calibration: 0x220 starts a measurement, 0x224 reads the
+ * pulse count.
+ *
+ * MTK_TOPCLK_TRACE=1 logs every access; it is observational only.
+ */
+/* Last window/trigger word written to the frequency meter (topckgen 0x224). */
+static uint32_t mt6895_topckgen_meter_cfg;
+
+/*
+ * ULPOSC1 frequency meter (topckgen meter channel 63).
+ *
+ * The preloader's PMIF clock-manager calibration trims the ULPOSC1 RC
+ * oscillator through the VLP clock-sys block (syscon "vlp_cksys_clk" + 0x200,
+ * ULPOSC_CON0; trim code in bits [6:0]) and measures it with this meter.
+ * The measured frequency of each trim code, from the real unit's own boot log
+ * ("[PMIF] cali_val=... , ... KHz"):
+ *
+ *   code 0x3f -> 245476 kHz      code 0x49 -> 261420 kHz
+ *   code 0x47 -> 258168 kHz      code 0x4b -> 264976 kHz
+ *   code 0x48 -> 260304 kHz      code 0x4f -> 271880 kHz
+ *                                code 0x5f -> 304176 kHz
+ *                                code 0x7f -> 394772/394872 kHz
+ *
+ * The device's search walks exactly these codes and settles on 0x48
+ * ("[PMIF] ULPOSC1 K done: 260M"), so reproducing the curve reproduces the
+ * calibration.  In between the points are linearly interpolated and below
+ * 0x3f the first segment's slope is extrapolated.
+ *
+ * The meter counts the test clock during a window of 256 reference cycles of
+ * 26 MHz, i.e. kHz = count * 26000 / 256.  That is the same arithmetic the old
+ * fixed count 1024 reproduced as 104000 kHz.
+ *
+ * CON0 bit 8, which the search also toggles, is NOT modelled: the device log
+ * provides only one or two measurements for it, and inventing the extra
+ * dimension would be guessing.  It is an open item (needs a trim sweep).
+ */
+static const struct {
+    uint32_t code;
+    uint32_t khz;
+} mt6895_ulposc_curve[] = {
+    { 0x3f, 245476 },
+    { 0x47, 258168 },
+    { 0x48, 260304 },
+    { 0x49, 261420 },
+    { 0x4b, 264976 },
+    { 0x4f, 271880 },
+    { 0x5f, 304176 },
+    { 0x7f, 394872 },
+};
+
+static uint32_t mt6895_ulposc_khz(uint32_t code)
+{
+    unsigned i;
+    const unsigned n = ARRAY_SIZE(mt6895_ulposc_curve);
+
+    if (code <= mt6895_ulposc_curve[0].code) {
+        int32_t slope = (int32_t)(mt6895_ulposc_curve[1].khz -
+                                  mt6895_ulposc_curve[0].khz) /
+                        (int32_t)(mt6895_ulposc_curve[1].code -
+                                  mt6895_ulposc_curve[0].code);
+        return (uint32_t)((int32_t)mt6895_ulposc_curve[0].khz +
+                          slope * ((int32_t)code -
+                                   (int32_t)mt6895_ulposc_curve[0].code));
+    }
+    for (i = 1; i < n; i++) {
+        if (code <= mt6895_ulposc_curve[i].code) {
+            uint32_t lo = mt6895_ulposc_curve[i - 1].khz;
+            uint32_t hi = mt6895_ulposc_curve[i].khz;
+            uint32_t c0 = mt6895_ulposc_curve[i - 1].code;
+            uint32_t c1 = mt6895_ulposc_curve[i].code;
+
+            return lo + (hi - lo) * (code - c0) / (c1 - c0);
+        }
+    }
+    return mt6895_ulposc_curve[n - 1].khz;
+}
+
+/* Meter result: ULPOSC1 frequency for the trim code currently programmed. */
+static uint32_t mt6895_ulposc_meter_count(void)
+{
+    uint32_t code = mtk_vlp_ulposc_con0 & 0x7f;
+    uint32_t khz = mt6895_ulposc_khz(code);
+    uint32_t count = (khz * 256u + 13000u) / 26000u;
+
+    if (MTK_ENV_CACHED("MTK_ULPOSC_LOG")) {
+        fprintf(stderr, "MTK-ULPOSC con0=%#x code=%#x khz=%u count=%u\n",
+                mtk_vlp_ulposc_con0, code, khz, count);
+    }
+    return count;   /* round to nearest count */
+}
+
 static uint64_t mt6895_topckgen_read(void *opaque, hwaddr off, unsigned size)
 {
     Mt6895MachineState *s = opaque;
+    uint32_t v;
 
     if (off + 4 > MT6895_TOPCKGEN_SIZE) {
         return 0;
@@ -4730,16 +4748,36 @@ static uint64_t mt6895_topckgen_read(void *opaque, hwaddr off, unsigned size)
     switch (off) {
     case 0x220:
         /* Bit 4: frequency meter trigger/busy. Cleared when measurement done. */
-        return s->topckgen_regs[off / 4] & ~0x10U;
+        v = s->topckgen_regs[off / 4] & ~0x10U;
+        break;
     case 0x224:
-        /* Frequency meter pulse counter: default 1024 (26 MHz) if unwritten */
-        if (s->topckgen_regs[off / 4] == 0) {
-            return 1024;
+        /*
+         * ULPOSC measurement window (0x400) -> report the measured ULPOSC1
+         * frequency.  The PLL-meter path programs a different window word,
+         * which is left to the plain register model until the PLL tree is
+         * modelled.
+         */
+        if (mt6895_topckgen_meter_cfg == 0x400) {
+            v = mt6895_ulposc_meter_count();
+        } else {
+            v = s->topckgen_regs[off / 4] == 0 ? 1024 :
+                s->topckgen_regs[off / 4];
         }
-        return s->topckgen_regs[off / 4];
+        break;
     default:
-        return s->topckgen_regs[off / 4];
+        v = s->topckgen_regs[off / 4];
+        break;
     }
+    if (MTK_ENV_CACHED("MTK_TOPCLK_TRACE")) {
+        static int budget;
+
+        if (budget < 200000) {
+            budget++;
+            fprintf(stderr, "MTK-TOPCK rd off=%#x -> %#x\n",
+                    (unsigned)off, v);
+        }
+    }
+    return v;
 }
 
 static void mt6895_topckgen_write(void *opaque, hwaddr off, uint64_t val,
@@ -4749,6 +4787,19 @@ static void mt6895_topckgen_write(void *opaque, hwaddr off, uint64_t val,
 
     if (off + 4 > MT6895_TOPCKGEN_SIZE) {
         return;
+    }
+    if (MTK_ENV_CACHED("MTK_TOPCLK_TRACE")) {
+        static int budget;
+
+        if (budget < 200000) {
+            budget++;
+            fprintf(stderr, "MTK-TOPCK wr off=%#x val=%#x\n",
+                    (unsigned)off, (unsigned)val);
+        }
+    }
+
+    if (off == 0x224) {
+        mt6895_topckgen_meter_cfg = (uint32_t)val;
     }
 
     s->topckgen_regs[off / 4] = val;
@@ -5280,6 +5331,16 @@ static void mt6895_peri_fill_write(void *opaque, hwaddr off, uint64_t val,
 {
     (void)opaque; (void)size;
     mt6895_usbdevtrace('W', 0x10000000ULL + off, size, val);
+    if (MTK_ENV_CACHED("MTK_PERI_WTRACE")) {
+        static int budget;
+
+        if (budget < 100000) {
+            budget++;
+            fprintf(stderr, "MTK-PERI wr addr=%#" PRIx64 " val=%#" PRIx64
+                    " size=%u\n", (uint64_t)(0x10000000ULL + off),
+                    (uint64_t)val, size);
+        }
+    }
     if (MTK_ENV_CACHED("MTK_MFGTRACE") &&
         (0x10000000ULL + off) >= 0x1c1f00ULL &&
         (0x10000000ULL + off) < 0x1c2000ULL) {
@@ -7207,6 +7268,89 @@ static void mt6895_place_gpt(Mt6895MachineState *s, Error **errp)
                 s->gpt_path, (uint64_t)MT6895_GPT_SOURCE, s->entry_bytes);
 }
 
+
+/*
+ * Genuine BootROM boot-argument block.
+ *
+ * On hardware the BROM builds a boot-argument record list in SRAM, stores a
+ * pointer to it where its AArch32 hand-off expects it (r4), and the preloader's
+ * SRAM stage writes that r4 value into [0x02001000]; the DRAM stage then copies
+ * 0x93C bytes from it into its own block at 0x020F3740 and walks it as a TLV
+ * list ("u32 size; u32 type; data at +8; advance by size; size==0 terminates")
+ * with record types 0x779F0000 + id.  This machine used to hand the preloader
+ * the A32 service entry (0x21) in r4 instead, so the 0x93C-byte copy came from
+ * BROM stub code and every downstream consumer saw garbage/zero boot args.
+ *
+ * Only records whose value genuinely comes from this machine's modelled boot
+ * state are emitted here:
+ *   id 0x00 BOOT_TAG_VERSION : this platform's boot-argument format version (1)
+ *   id 0x01 BOOT_REASON      : the same power-on reason the model presents to
+ *                              the boot dispatcher (default NORMAL_BOOT = 1;
+ *                              MTK_BOOT_REASON overrides, as elsewhere)
+ *   id 0x02 BOOT_MODE        : 0 (cold boot from power-on)
+ *   id 0x0c EFLAG            : 0 (cold boot, no early flag)
+ *   id 0x12 SRAM start/size  : SoC SRAM map (0x10DC00/0x12400)
+ * Records whose genuine source is not modelled yet are deliberately NOT
+ * synthesised: META_COM, DA_INFO, PLAT_DBG_INFO, the DRAM/EMI + mblock +
+ * orig_dram record (id 0x20), FG/ADC, ram_console and AEE exception info.
+ */
+#define MT6895_BROM_BOOTARGS_PA   0x02081000ULL
+#define MT6895_BROM_BOOTARGS_SIZE 0x00001000ULL
+#define MT6895_BROM_TLV_TYPE      0x779f0000U
+
+static void mt6895_build_brom_bootargs(Mt6895MachineState *s)
+{
+    uint8_t *p = mt6895_guest_ptr(s, MT6895_BROM_BOOTARGS_PA,
+                                  MT6895_BROM_BOOTARGS_SIZE);
+    const char *e;
+    uint32_t reason = 1;
+    size_t off = 0;
+
+    if (!p) {
+        return;
+    }
+    memset(p, 0, MT6895_BROM_BOOTARGS_SIZE);
+
+    e = getenv("MTK_BOOT_REASON");
+    if (e) {
+        reason = (uint32_t)atoi(e);
+    }
+
+    /* id 0x00: BOOT_TAG_VERSION (format version of this boot-argument ABI). */
+    stl_le_p(p + off, 0x0c);
+    stl_le_p(p + off + 4, MT6895_BROM_TLV_TYPE | 0x00);
+    stl_le_p(p + off + 8, 1);
+    off += 0x0c;
+
+    /* id 0x01: BOOT_REASON, same value the boot dispatcher is given. */
+    stl_le_p(p + off, 0x0c);
+    stl_le_p(p + off + 4, MT6895_BROM_TLV_TYPE | 0x01);
+    stl_le_p(p + off + 8, reason);
+    off += 0x0c;
+
+    /* id 0x02: BOOT_MODE, cold boot from power-on. */
+    stl_le_p(p + off, 0x0c);
+    stl_le_p(p + off + 4, MT6895_BROM_TLV_TYPE | 0x02);
+    stl_le_p(p + off + 8, 0);
+    off += 0x0c;
+
+    /* id 0x0c: EFLAG, cold boot (no early-boot flag). */
+    stl_le_p(p + off, 0x0c);
+    stl_le_p(p + off + 4, MT6895_BROM_TLV_TYPE | 0x0c);
+    stl_le_p(p + off + 8, 0);
+    off += 0x0c;
+
+    /* id 0x12: SRAM window the BROM reports to the preloader. */
+    stl_le_p(p + off, 0x10);
+    stl_le_p(p + off + 4, MT6895_BROM_TLV_TYPE | 0x12);
+    stl_le_p(p + off + 8, 0x0010dc00);
+    stl_le_p(p + off + 0xc, 0x00012400);
+    off += 0x10;
+
+    /* size==0 terminates the record list. */
+    stl_le_p(p + off, 0);
+}
+
 static void mt6895_load_boot_lun(Mt6895MachineState *s, Error **errp,
                                  bool on_reset)
 {
@@ -7982,6 +8126,21 @@ static void mt6895_load_boot_lun(Mt6895MachineState *s, Error **errp,
          * payload's "blx r4" enters it in Thumb state. Overridable with
          * -machine boot-r4=<value>.
          */
+        s->boot_r4 = MT6895_BOOTROM_A32_SERVICE;
+    }
+    /*
+     * Genuine BROM boot-argument block: built unconditionally (the builder is
+     * kept compiled and syntax-checked), but handed to the preloader only when
+     * MTK_BROMARGS_BLOCK=1.  The block fields are load-bearing: handing over a
+     * block whose memory/power descriptors are absent stalls the preloader
+     * before LK prints "Booting Linux" (prime test, 2026-11-18).  The default
+     * OFF keeps the tree bootable until every field emitted by
+     * mt6895_build_brom_bootargs() has a genuine source.
+     */
+    mt6895_build_brom_bootargs(s);
+    if (MTK_ENV_CACHED("MTK_BROMARGS_BLOCK")) {
+        s->boot_r4 = MT6895_BROM_BOOTARGS_PA;
+    } else {
         s->boot_r4 = MT6895_BOOTROM_A32_SERVICE;
     }
     s->boot_valid = true;
@@ -9134,6 +9293,15 @@ ufs_done:
      * drivers that hang off a PMIC regulator can probe.
      */
     s->spmi = qdev_new(TYPE_MTK_SPMI_PMIF);
+    /*
+     * The board's PMIC population, as wired in the xaga device tree /
+     * preloader SPMI check table: MT6363 main PMIC at slave 4, MT6368 second
+     * PMIC at slave 5, the two MT6319 buck dies at slaves 6 and 7 and the
+     * MT6685 RTC/auxadc PMIC at slave 9.  The arbiter itself carries no part
+     * knowledge; it gets it from this machine description.
+     */
+    qdev_prop_set_string(s->spmi, "slave-map",
+                         "4=mt6363,5=mt6368,6=mt6319,7=mt6319,9=mt6685");
     if (!sysbus_realize(SYS_BUS_DEVICE(s->spmi), errp)) {
         return;
     }
@@ -9141,6 +9309,12 @@ ufs_done:
     sysbus_mmio_map(SYS_BUS_DEVICE(s->spmi), 1, MT6895_SPMI_MST_BASE);
 
     s->spmi2 = qdev_new(TYPE_MTK_SPMI_PMIF);
+    /*
+     * Alternate SPMI master of the same bus (spmi@1c804000 has two master
+     * windows); the board population is identical.
+     */
+    qdev_prop_set_string(s->spmi2, "slave-map",
+                         "4=mt6363,5=mt6368,6=mt6319,7=mt6319,9=mt6685");
     if (!sysbus_realize(SYS_BUS_DEVICE(s->spmi2), errp)) {
         return;
     }
@@ -9231,6 +9405,15 @@ static const struct {
     uint8_t reg;
     uint8_t val[4];
 } mt6895_i2c_fake[] = {
+    /*
+     * MT6375 identity: regmap 0x100 = bank 1 offset 0x00, 1 byte.  Verified
+     * driver semantics (notes_peri_spec.md §8.2): (value & 0xF0) must be 0x70
+     * (MT6375_VID) and bits[3:0] are the chip revision, accepted as-is.  The
+     * real unit's preloader prints "mt6375_check_devid rev=0x2", so the byte is
+     * 0x72.  Bank 1's I2C address is 0x34 (7-bit) = 0x68 on the wire, from the
+     * payload bank table at preloader 0x206d048 ("4e 34 1a 4a 64 3f").
+     */
+    { 0x68, 0x00, { 0x72 } },
     { 0x34, 0x58, { 0x12, 0x34 } },   /* gauge efuse word (first guess) */
     { 0x34, 0xae, { 0x01 } },
     { 0x7e, 0x03, { 0x00 } },
@@ -12755,6 +12938,15 @@ static const struct {
         qdev_prop_set_uint32(dev, "size", blocks[i].size);
         /* Names the window in the trace, so accesses can be attributed. */
         qdev_prop_set_string(dev, "name", n);
+        if (!strcmp(n, "mt6895.pinctrl") && mt6895_dram_is_6g(s)) {
+            /*
+             * The xaga board pulls the pinctrl DRAM-generation strap high;
+             * the preloader's dram-type detector reads it to select LPDDR5X
+             * (dram_type 0xC).  Only the genuine 6 GiB configuration enables
+             * it, so -m 8G keeps the historical LPDDR5 behaviour.
+             */
+            qdev_prop_set_bit(dev, "lpdd5x-strap", true);
+        }
 
     /*
          * REVERTED all-ones PLL probe. Making the PLL windows read all-ones
@@ -13578,6 +13770,20 @@ static void mt6895_init(MachineState *machine)
     }
 
     /*
+     * The machine default is the genuine 6 GiB LPDDR5X part, and both the
+     * DRAM controller registers and the BootROM's DRAM-size word are derived
+     * from the configured RAM size.  -m 8G still selects the historical 8 GiB
+     * LPDDR5 development part (so old runs stay bit-identical), but that is
+     * not the unit this model reproduces; say so once so a stray 8 GiB run is
+     * visible.
+     */
+    if (machine->ram_size != MT6895_DRAM_SIZE) {
+        warn_report("mt6895: -m %" PRIu64 " MiB selects the historical 8 GiB "
+                    "LPDDR5 part; the genuine unit is 6 GiB LPDDR5X "
+                    "(use -m 6G)", machine->ram_size / MiB);
+    }
+
+    /*
      * DRAM is the machine's default RAM backend (mc->default_ram_id), so use
      * the region QEMU already created rather than allocating a second one.
      */
@@ -13971,11 +14177,20 @@ static const uint8_t stub_cmd_def[0x80] = {
                                       (const uint8_t *)mt6895_bdev_write_stub };
 
         /*
+         * REMAINING INJECTION (B2): the boot-args struct at 0x020F7D30 is not
+         * initialised by the real preloader/BL2 in this model; field +0x48
+         * (0x020F7D78) is read as a pointer by the boot-to-LK path
+         * (0x02049AF4) and dereferenced at 0x020497FE.  Kept until the
+         * genuine boot-chain step that initialises it is modelled.
          */
         static const uint8_t lk_bootarg_def[4] = { 0x00, 0x00, 0x70, 0x50 };
         planted[4] = (Mt6895Planted){ s, 0x020f7d78, 4, lk_bootarg_def };
 
         /*
+         * REMAINING INJECTION (B2): bl32_map_bl_params reads the tee-secmem
+         * physical base from the BL2_EXT BSS global at 0x62ff2098; GZ is
+         * loaded but never executed, so that global stays zero in the model.
+         * Kept until BL32/GZ execution or the genuine BL2 step is modelled.
          */
         static const uint8_t tee_base_def[8] = {
             0x00, 0x00, 0x80, 0x7c, 0x00, 0x00, 0x00, 0x00,
@@ -14265,6 +14480,54 @@ static const uint8_t stub_cmd_def[0x80] = {
                                             &s->atf_percpu_mr, 1);
         memory_region_init_io(&s->bt_mr, OBJECT(s), &mt6895_bt_ops, s,
                               "mt6895.bt-watch", 0x2000);
+        if (MTK_ENV_CACHED("MTK_BAGWATCH")) {
+            static MemoryRegion bag_blk_mr;
+            static MemoryRegion bag_ba_lo_mr;
+            static MemoryRegion bag_ba_hi_mr;
+
+            mt6895_bag_blk.s = s;
+            mt6895_bag_blk.base = MT6895_BAG_BLK_BASE;
+            mt6895_bag_ba_lo.s = s;
+            mt6895_bag_ba_lo.base = MT6895_BAG_BA_LO_BASE;
+            mt6895_bag_ba_hi.s = s;
+            mt6895_bag_ba_hi.base = MT6895_BAG_BA_HI_BASE;
+            mt6895_bag_gl1.s = s;
+            mt6895_bag_gl1.base = 0x020FA47CULL;
+            mt6895_bag_gl2.s = s;
+            mt6895_bag_gl2.base = 0x020FB718ULL;
+            memory_region_init_io(&bag_blk_mr, OBJECT(s), &mt6895_bag_ops,
+                                  &mt6895_bag_blk, "mt6895.bag-blk",
+                                  MT6895_BAG_BLK_SIZE);
+            memory_region_add_subregion_overlap(sysmem, MT6895_BAG_BLK_BASE,
+                                                &bag_blk_mr, 4);
+            memory_region_init_io(&bag_ba_lo_mr, OBJECT(s), &mt6895_bag_ops,
+                                  &mt6895_bag_ba_lo, "mt6895.bag-ba-lo",
+                                  MT6895_BAG_BA_LO_SIZE);
+            memory_region_add_subregion_overlap(sysmem, MT6895_BAG_BA_LO_BASE,
+                                                &bag_ba_lo_mr, 4);
+            memory_region_init_io(&bag_ba_hi_mr, OBJECT(s), &mt6895_bag_ops,
+                                  &mt6895_bag_ba_hi, "mt6895.bag-ba-hi",
+                                  MT6895_BAG_BA_HI_SIZE);
+            memory_region_add_subregion_overlap(sysmem, MT6895_BAG_BA_HI_BASE,
+                                                &bag_ba_hi_mr, 4);
+            {
+                static MemoryRegion bag_gl1_mr;
+                static MemoryRegion bag_gl2_mr;
+
+                memory_region_init_io(&bag_gl1_mr, OBJECT(s), &mt6895_bag_ops,
+                                      &mt6895_bag_gl1, "mt6895.bag-gl1",
+                                      0x58);
+                memory_region_add_subregion_overlap(sysmem, 0x020FA47CULL,
+                                                    &bag_gl1_mr, 4);
+                memory_region_init_io(&bag_gl2_mr, OBJECT(s), &mt6895_bag_ops,
+                                      &mt6895_bag_gl2, "mt6895.bag-gl2",
+                                      0x20);
+                memory_region_add_subregion_overlap(sysmem, 0x020FB718ULL,
+                                                    &bag_gl2_mr, 4);
+            }
+            fprintf(stderr, "mt6895: MTK_BAGWATCH active (plant-safe split: "
+                    "block 0x93C, struct low 0x48 + high 0x124)\n");
+        }
         memory_region_add_subregion_overlap(sysmem, 0x48600000ULL,
                                             &s->bt_mr, 1);
 
@@ -14279,13 +14542,19 @@ static const uint8_t stub_cmd_def[0x80] = {
                           "mt6895.conbase", MT6895_CONBASE_SIZE);
     memory_region_add_subregion(sysmem, MT6895_CONBASE_ADDR, &s->conbase);
 
-    memory_region_init_io(&s->auxadc, OBJECT(s), &mt6895_auxadc_ops, s,
-                          "mt6895.pmic-auxadc", MT6895_AUXADC_SIZE);
-    memory_region_add_subregion(sysmem, MT6895_AUXADC_ADDR, &s->auxadc);
-
-    memory_region_init_io(&s->auxdev, OBJECT(s), &mt6895_auxdev_ops, s,
-                          "mt6895.auxadc-dev", 0x10);
-    memory_region_add_subregion(sysmem, 0x02078e94, &s->auxdev);
+    /*
+     * The PMIC auxadc registry (payload 0x020F4BC8), the auxadc device object
+     * (0x02078E94), the payload device table (0x020F48AC) and the PMIC ops
+     * vtable (0x0207850C) used to be pre-filled with model-synthesised
+     * structures because, with the SPMI/I2C buses unmodelled, the payload's
+     * PMIC init built nothing and later walks dereferenced garbage.
+     *
+     * Now that the SPMI bus is modelled the payload builds these structures
+     * itself, and the overlays were poisoning them (the regulator table came
+     * out empty: "mtk_regulator_get failed.(0x7FFF)").  The overlays are gone
+     * - this is a de-injection, not a switch: the payload's own data must be
+     * what the guest sees.
+     */
 
     memory_region_init_io(&s->loghdr, OBJECT(s), &mt6895_loghdr_ops, s,
                           "mt6895.pl-loghdr", 0x20);
@@ -14336,14 +14605,8 @@ static const uint8_t stub_cmd_def[0x80] = {
                           "mt6895.name-tbl", MT6895_NAME_TABLE_SIZE);
     memory_region_add_subregion(sysmem, MT6895_NAME_TABLE_BASE, &s->name_tbl);
 
-    memory_region_init_io(&s->devtbl, OBJECT(s), &mt6895_devtbl2_ops, s,
-                          "mt6895.payload-devtbl", MT6895_DEVTBL_SIZE);
-    memory_region_add_subregion(sysmem, MT6895_DEVTBL_ADDR, &s->devtbl);
-
-    memory_region_init_io(&s->rodata2, OBJECT(s), &mt6895_pmicv_ops, s,
-                          "mt6895.pmic-vtbl",
-                          sizeof(mt6895_pmicv_default));
-    memory_region_add_subregion(sysmem, 0x0207850c, &s->rodata2);
+    /* Payload device table and PMIC ops vtable: see the de-injection note
+     * above; the payload builds and maintains both itself. */
 
     {
 
@@ -15231,7 +15494,8 @@ static void mt6895_machine_class_init(ObjectClass *oc, const void *data)
     mc->init = mt6895_init;
     mc->max_cpus = MT6895_NUM_CPUS;
     mc->default_cpus = MT6895_NUM_CPUS;
-    mc->default_ram_size = 4 * GiB;
+    /* Default to the genuine 6 GiB LPDDR5X part (see MT6895_DRAM_SIZE). */
+    mc->default_ram_size = 6 * GiB;
     mc->default_ram_id = "mt6895.ddr";
     mc->possible_cpu_arch_ids = mt6895_possible_cpu_arch_ids;
     mc->reset = mt6895_machine_reset;

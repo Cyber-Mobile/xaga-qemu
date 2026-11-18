@@ -77,6 +77,9 @@ struct MtkEintState {
     /* Pin wired to GPIO input line 0 (SPMI PMIC RCS line). */
     uint32_t rcs_instance;
     uint32_t rcs_index;
+    /* Touch IRQ line (GPIO input 1). */
+    uint32_t touch_instance;
+    uint32_t touch_index;
 
     bool trace;
 };
@@ -95,6 +98,12 @@ static void mtk_eint_update_irq(MtkEintState *s)
         }
     }
 
+    if (s->trace) {
+        fprintf(stderr,
+                "MTK-EINT update level=%d pend0=%#x mask0=%#x pend1=%#x mask1=%#x pend4=%#x mask4=%#x\n",
+                level, s->pend[0][0], s->mask[0][0], s->pend[1][0],
+                s->mask[1][0], s->pend[4][0], s->mask[4][0]);
+    }
     qemu_set_irq(s->irq, level);
 }
 
@@ -181,8 +190,8 @@ static const MemoryRegionOps mtk_eint_ops = {
 static void mtk_eint_line_in(void *opaque, int n, int level)
 {
     MtkEintState *s = MTK_EINT(opaque);
-    unsigned inst = s->rcs_instance;
-    unsigned index = s->rcs_index;
+    unsigned inst = n == 0 ? s->rcs_instance : s->touch_instance;
+    unsigned index = n == 0 ? s->rcs_index : s->touch_index;
     uint32_t bit;
 
     if (inst >= MTK_EINT_INSTANCES || index >= 32 * MTK_EINT_NREGS) {
@@ -195,8 +204,10 @@ static void mtk_eint_line_in(void *opaque, int n, int level)
         s->pend[inst][index >> 5] &= ~bit;
     }
     if (s->trace) {
-        fprintf(stderr, "MTK-EINT line %d -> %d (inst%u bit%u)\n",
-                n, level, inst, index & 31);
+        fprintf(stderr,
+                "MTK-EINT line n=%d level=%d inst=%u bit=%u pend=%#x mask=%#x\n",
+                n, level, inst, index & 31,
+                s->pend[inst][index >> 5], s->mask[inst][index >> 5]);
     }
     mtk_eint_update_irq(s);
 }
@@ -239,7 +250,7 @@ static void mtk_eint_realize(DeviceState *dev, Error **errp)
         sysbus_init_mmio(SYS_BUS_DEVICE(dev), &s->bank[i].mr);
     }
     sysbus_init_irq(SYS_BUS_DEVICE(dev), &s->irq);
-    qdev_init_gpio_in(dev, mtk_eint_line_in, 1);
+    qdev_init_gpio_in(dev, mtk_eint_line_in, 2);
 }
 
 static void mtk_eint_class_init(ObjectClass *klass, const void *data)
@@ -248,6 +259,8 @@ static void mtk_eint_class_init(ObjectClass *klass, const void *data)
     static const Property props[] = {
         DEFINE_PROP_UINT32("rcs-instance", MtkEintState, rcs_instance, 4),
         DEFINE_PROP_UINT32("rcs-index", MtkEintState, rcs_index, 16),
+        DEFINE_PROP_UINT32("touch-instance", MtkEintState, touch_instance, 0),
+        DEFINE_PROP_UINT32("touch-index", MtkEintState, touch_index, 0),
     };
 
     dc->realize = mtk_eint_realize;
