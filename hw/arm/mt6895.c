@@ -54,6 +54,12 @@
 #include "hw/misc/mtk_gce.h"
 #include "hw/i2c/mtk_i2c.h"
 #include "hw/i2c/bq28z610.h"
+#include "hw/ssi/mtk_spi.h"
+#include "hw/ssi/nvt36672c.h"
+
+/* Set where the EINT controller is created; the touch IRQ is wired to it. */
+static DeviceState *mt6895_eint_dev;
+static void mt6895_create_spi(Mt6895MachineState *s, Error **errp);
 #include "hw/misc/ktz8863a.h"
 #include "hw/display/mtk_disp.h"
 #include "chardev/char.h"
@@ -9536,6 +9542,12 @@ ufs_done:
             0x1c01e000ULL,      /* eint-c */
         };
         DeviceState *eint = qdev_new("mtk-eint");
+        /* Board wiring: the touch IRQ line maps to this EINT pin. */
+        /* Touch INT: EINT instance 1, index 31 (discovered from the guest own request_irq programming). */
+        qdev_prop_set_uint32(eint, "touch-instance", 1);
+        qdev_prop_set_uint32(eint, "touch-index", 31);
+
+        mt6895_eint_dev = eint;
         size_t ei;
 
         if (!sysbus_realize(SYS_BUS_DEVICE(eint), errp)) {
@@ -9548,6 +9560,18 @@ ufs_done:
                            qdev_get_gpio_in(s->gic, 259));
         sysbus_connect_irq(SYS_BUS_DEVICE(s->spmi), 0,
                            qdev_get_gpio_in(eint, 0));
+        /*
+         * Touch stack: SPI controllers + Novatek NT36672C client.  Opt-in via
+         * MTK_TOUCH=1; default OFF because binding the NVT driver currently
+         * exposes a pre-existing display/CMDQ model defect (GCE-D "aee not
+         * ready" -> cmdq_task_handle_error -> smi_dbg_hang_detect -> emidbg
+         * flood, no recovery).  See artifacts/r1302/phase2/touch_landing/
+         * DISPLAY_CMDQ_DEFECT.md.  Unset means the machine creates no touch
+         * devices and behaves exactly like the committed base.
+         */
+        if (MTK_ENV_CACHED("MTK_TOUCH")) {
+            mt6895_create_spi(s, errp);
+        }
     }
 
     /*
@@ -9994,6 +10018,54 @@ static void mt6895_dump_bl2_list(Mt6895MachineState *s)
     }
 }
 
+/* BEGIN MTK TOUCH WIRING (touch_wiring.py) */
+/*
+ * SPI / touch stack: eight spi-mt65xx controllers at 0x11010000..0x11017000
+ * (GIC SPI 203..210), with the Novatek NT36672C touch controller as the SSI
+ * client of spi2/CS0 (DT: novatek@0 on spi2; its IRQ is DT GPIO 400, which
+ * the vendor pinctrl driver maps onto an EINT pin described by the
+ * touch-instance/touch-index properties of the mtk-eint device).
+ */
+static void mt6895_create_spi(Mt6895MachineState *s, Error **errp)
+{
+    static const struct {
+        uint64_t addr;
+        int spi;
+    } ctl[] = {
+        { 0x11010000ULL, 203 }, { 0x11011000ULL, 204 },
+        { 0x11012000ULL, 205 }, { 0x11013000ULL, 206 },
+        { 0x11014000ULL, 207 }, { 0x11015000ULL, 208 },
+        { 0x11016000ULL, 209 }, { 0x11017000ULL, 210 },
+    };
+    const int nvt_spi = 2;
+    int i;
+
+    if (!mt6895_eint_dev) {
+        return;
+    }
+    for (i = 0; i < ARRAY_SIZE(ctl); i++) {
+        DeviceState *dev = qdev_new(TYPE_MTK_SPI);
+        SysBusDevice *sbd = SYS_BUS_DEVICE(dev);
+
+        qdev_prop_set_uint32(dev, "clock-hz", 13000000);
+        sysbus_realize_and_unref(sbd, &error_fatal);
+        sysbus_connect_irq(sbd, 0, qdev_get_gpio_in(s->gic, ctl[i].spi));
+        memory_region_add_subregion_overlap(get_system_memory(), ctl[i].addr,
+                                            sysbus_mmio_get_region(sbd, 0), 1);
+        if (i == nvt_spi) {
+            SSIBus *bus = (SSIBus *)qdev_get_child_bus(dev, "spi");
+            DeviceState *nvt = qdev_new(TYPE_NVT36672C);
+
+            if (!ssi_realize_and_unref(nvt, bus, errp)) {
+                return;
+            }
+            qdev_connect_gpio_out(nvt, 0,
+                                  qdev_get_gpio_in(mt6895_eint_dev, 1));
+            sysbus_connect_irq(sbd, 1, qdev_get_gpio_in(nvt, 0));
+        }
+    }
+}
+/* END MTK TOUCH WIRING */
 static void mt6895_create_i2c(Mt6895MachineState *s, Error **errp)
 {
     MemoryRegion *sysmem = get_system_memory();
