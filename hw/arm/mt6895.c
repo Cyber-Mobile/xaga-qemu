@@ -1620,33 +1620,136 @@ static void mt6895_atflog_write(void *opaque, hwaddr off, uint64_t val,
 static uint64_t mt6895_cpc_entries[MT6895_CPC_ENTRY_COUNT];
 static uint32_t mt6895_cpc_req_word;
 static uint32_t mt6895_cpc_powered = 1;   /* CPU0 runs from reset */
+static uint32_t mt6895_cpc_pending;       /* cores with a queued power-up */
+static QEMUTimer *mt6895_cpc_power_timer;
 
 static void mt6895_cpc_state_reset(void)
 {
     memset(mt6895_cpc_entries, 0, sizeof(mt6895_cpc_entries));
     mt6895_cpc_req_word = 0;
     mt6895_cpc_powered = 1;
+    mt6895_cpc_pending = 0;
+    if (mt6895_cpc_power_timer) {
+        timer_del(mt6895_cpc_power_timer);
+    }
+}
+
+/*
+ * DIAGNOSTIC (MTK_CPCTRACE=1): log every CPC register access with value and
+ * the accessing PC.  Pure observation: nothing is written or faked; the trace
+ * is how the CPU_ON handshake between the guest ATF and this device is verified.
+ */
+static void mt6895_cpc_trace(const char *op, uint64_t addr, uint64_t val,
+                             unsigned size)
+{
+    ARMCPU *cpu = ARM_CPU(current_cpu);
+    uint64_t pc = 0;
+
+    if (cpu) {
+        pc = cpu->env.aarch64 ? cpu->env.pc : (uint64_t)cpu->env.regs[15];
+    }
+    fprintf(stderr, "MTK-CPC-TRACE %s addr=%#" PRIx64 " val=%#" PRIx64
+            " size=%u pc=%#" PRIx64 "\n", op, addr, val, size, pc);
 }
 
 static uint64_t mt6895_cpc_status_read(void *opaque, hwaddr off, unsigned size)
 {
+    uint64_t v;
+
     (void)opaque; (void)off;
     if (!MTK_ENV_CACHED("MTK_CPCON")) {
         return (size >= 8) ? ~0ULL : ((1ULL << (size * 8)) - 1);
     }
-    return mt6895_cpc_powered;
+    v = mt6895_cpc_powered;
+    if (MTK_ENV_CACHED("MTK_CPCTRACE")) {
+        mt6895_cpc_trace("rd-status", MT6895_CPC_STATUS_ADDR + off, v, size);
+    }
+    return v;
 }
 
 static void mt6895_cpc_status_write(void *opaque, hwaddr off, uint64_t val,
                                     unsigned size)
 {
-    (void)opaque; (void)off; (void)val; (void)size;
+    (void)opaque; (void)off; (void)size;
+    if (MTK_ENV_CACHED("MTK_CPCTRACE")) {
+        mt6895_cpc_trace("wr-status", MT6895_CPC_STATUS_ADDR + off, val, size);
+    }
 }
 
 static uint64_t mt6895_cpc_req_read(void *opaque, hwaddr off, unsigned size)
 {
     (void)opaque; (void)off; (void)size;
+    if (MTK_ENV_CACHED("MTK_CPCTRACE")) {
+        mt6895_cpc_trace("rd-req", MT6895_CPC_REQ_ADDR + off,
+                         mt6895_cpc_req_word, size);
+    }
     return mt6895_cpc_req_word;
+}
+
+/*
+ * Power-up completion for cores requested through the CPC bridge.
+ *
+ * Hardware does not finish a CPU_ON inside the primary's register write: the
+ * request starts the power controller, the core is released, and the per-core
+ * power-status bit only rises once that power-up has happened.  The guest's
+ * ATF depends on exactly that ordering: mt_smp.c writes the request and then
+ * polls bit n of 0x0C53A840, expecting it to be clear on the first poll and set
+ * on a later iteration, while it drives the SPM power-up sequence.  Doing the
+ * whole thing synchronously in the request write skipped ATF's own power-up
+ * path and released the core before TF-A had committed the target's
+ * non-secure context - that inverted causality is what this timer restores.
+ *
+ * 1 ms of virtual power-up latency stays well inside ATF's wait budget
+ * (mt_smp polls 0xC351 times with a 1 us delay, i.e. about 50 ms).
+ */
+#define MT6895_CPC_POWER_ON_NS  1000000ULL
+
+static void mt6895_cpc_mark_powered(CPUState *cs, run_on_cpu_data data)
+{
+    unsigned n = data.host_ulong;
+
+    (void)cs;
+    mt6895_cpc_powered |= 1u << n;
+}
+
+static void mt6895_cpc_power_on_tick(void *opaque)
+{
+    unsigned n;
+
+    (void)opaque;
+    for (n = 0; n < MT6895_CPC_ENTRY_COUNT; n++) {
+        uint64_t entry = mt6895_cpc_entries[n];
+        CPUState *target;
+        int ret;
+
+        if (!(mt6895_cpc_pending & (1u << n))) {
+            continue;
+        }
+        mt6895_cpc_pending &= ~(1u << n);
+        if (entry == 0) {
+            continue;
+        }
+        ret = arm_set_cpu_on((uint64_t)n << 8, entry, 0, 3, true);
+        if (MTK_ENV_CACHED("MTK_CPCLOG")) {
+            fprintf(stderr, "MTK-CPC on cpu%u entry=%#" PRIx64 " ret=%d\n",
+                    n, entry, ret);
+        }
+        if (ret != 0) {
+            continue;
+        }
+        /*
+         * arm_set_cpu_on() has queued the target's reset/start work on its own
+         * vCPU thread; queue the status update behind it so the bit only rises
+         * after the core has actually been reset and started.
+         */
+        target = arm_get_cpu_by_id((uint64_t)n << 8);
+        if (target) {
+            async_run_on_cpu(target, mt6895_cpc_mark_powered,
+                             RUN_ON_CPU_HOST_ULONG(n));
+        } else {
+            mt6895_cpc_powered |= 1u << n;
+        }
+    }
 }
 
 static void mt6895_cpc_req_write(void *opaque, hwaddr off, uint64_t val,
@@ -1656,6 +1759,9 @@ static void mt6895_cpc_req_write(void *opaque, hwaddr off, uint64_t val,
     int n;
 
     (void)opaque; (void)off; (void)size;
+    if (MTK_ENV_CACHED("MTK_CPCTRACE")) {
+        mt6895_cpc_trace("wr-req", MT6895_CPC_REQ_ADDR + off, val, size);
+    }
     raised = (uint32_t)val & ~mt6895_cpc_req_word;
     mt6895_cpc_req_word = val;
     if (!MTK_ENV_CACHED("MTK_CPCON")) {
@@ -1663,35 +1769,24 @@ static void mt6895_cpc_req_write(void *opaque, hwaddr off, uint64_t val,
     }
     for (n = 0; n < MT6895_CPC_ENTRY_COUNT; n++) {
         uint32_t bit = 1u << (MT6895_CPC_REQ_BIT0 + n);
-        uint64_t entry;
-        bool locked_here = false;
-        int ret = -1;
 
-        if (!(raised & bit)) {
+        if (!(raised & bit) || mt6895_cpc_entries[n] == 0) {
             continue;
         }
-        entry = mt6895_cpc_entries[n];
-        if (entry != 0) {
-            if (!bql_locked()) {
-                bql_lock();
-                locked_here = true;
-            }
-            ret = arm_set_cpu_on((uint64_t)n << 8, entry, 0, 3, true);
-            if (locked_here) {
-                bql_unlock();
-            }
-        }
-        if (MTK_ENV_CACHED("MTK_CPCLOG")) {
-            fprintf(stderr, "MTK-CPC on cpu%d entry=%#" PRIx64 " ret=%d\n",
-                    n, entry, ret);
-        }
         /*
-         * Report the CPU powered even when arm_set_cpu_on() failed or no
-         * entry was captured: ATF then skips its own power-on sequence
-         * instead of panicking at mt_smp.c:162, so a broken bridge degrades
-         * to the old "CPUx failed to come online" instead of an ATF panic.
+         * Do not touch the status bit or arm_set_cpu_on() here: the power-up
+         * itself is a hardware sequence that completes after this write, and
+         * ATF polls the status register expecting to see it still clear first.
          */
-        mt6895_cpc_powered |= 1u << n;
+        mt6895_cpc_pending |= 1u << n;
+        if (!mt6895_cpc_power_timer) {
+            mt6895_cpc_power_timer =
+                timer_new_ns(QEMU_CLOCK_VIRTUAL, mt6895_cpc_power_on_tick,
+                             NULL);
+        }
+        timer_mod(mt6895_cpc_power_timer,
+                  qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
+                  MT6895_CPC_POWER_ON_NS);
     }
 }
 
@@ -1704,8 +1799,15 @@ static uint64_t mt6895_cpc_entry_read(void *opaque, hwaddr off, unsigned size)
     if (n >= MT6895_CPC_ENTRY_COUNT) {
         return 0;
     }
-    return hi ? (uint32_t)(mt6895_cpc_entries[n] >> 32)
-              : (uint32_t)mt6895_cpc_entries[n];
+    {
+        uint64_t v = hi ? (uint32_t)(mt6895_cpc_entries[n] >> 32)
+                        : (uint32_t)mt6895_cpc_entries[n];
+
+        if (MTK_ENV_CACHED("MTK_CPCTRACE")) {
+            mt6895_cpc_trace("rd-entry", MT6895_CPC_ENTRY_ADDR + off, v, size);
+        }
+        return v;
+    }
 }
 
 static void mt6895_cpc_entry_write(void *opaque, hwaddr off, uint64_t val,
@@ -1717,6 +1819,9 @@ static void mt6895_cpc_entry_write(void *opaque, hwaddr off, uint64_t val,
     (void)opaque; (void)size;
     if (n >= MT6895_CPC_ENTRY_COUNT) {
         return;
+    }
+    if (MTK_ENV_CACHED("MTK_CPCTRACE")) {
+        mt6895_cpc_trace("wr-entry", MT6895_CPC_ENTRY_ADDR + off, val, size);
     }
     if (hi) {
         mt6895_cpc_entries[n] = (mt6895_cpc_entries[n] & 0xffffffffULL) |
