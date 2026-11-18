@@ -418,8 +418,9 @@ bool mtk_ufs_rpmb_enabled(void)
 
 uint64_t mtk_ufs_rpmb_blocks(void)
 {
-    /* xaga RPMB size is not documented; 16 MiB is the common UFS 3.1 size
-     * (MTK_RPMB_MIB overrides). In 256-byte RPMB blocks. */
+    /* xaga RPMB size from the unit's own UFS unit descriptor:
+     * logical_blk_size 256 bytes * logical_blk_cnt 0x10000 = 16 MiB (the
+     * device boot log records both).  MTK_RPMB_MIB overrides for tests. */
     const char *e = getenv("MTK_RPMB_MIB");
     uint64_t mib = e ? strtoull(e, NULL, 0) : 16;
 
@@ -539,10 +540,10 @@ static uint16_t mtk_rpmb_res(MtkUfsRpmb *r, uint16_t res)
 }
 
 /* SECURITY PROTOCOL OUT: n request frames */
-static void mtk_rpmb_out(MtkUfsRpmb *r, uint8_t *fr, int n)
+static void mtk_rpmb_out(MtkUfsRpmb *r, const uint8_t *fr, int n)
 {
     uint16_t type = lduw_be_p(fr + RPMB_TYPE_OFS);
-    uint8_t *last = fr + (n - 1) * RPMB_FRAME;
+    const uint8_t *last = fr + (n - 1) * RPMB_FRAME;
 
     switch (type) {
     case RPMB_REQ_KEY:
@@ -762,6 +763,40 @@ done:
     *ret = UFS_REQUEST_SUCCESS;
     return true;
 }
+int mtk_ufs_rpmb_request(const uint8_t *frames, int nframes);
+int mtk_ufs_rpmb_response(uint8_t *frames, int max_frames);
+
+/*
+ * Shared entry points for hw/misc/mtk_ufshci.c.
+ *
+ * The boot chain reaches the RPMB W-LUN through the host controller's UTP
+ * path, not through this LU's SCSI emulation.  Both must drive the same
+ * genuine JEDEC state machine, so the controller asks for frame processing
+ * here instead of answering frames itself.  Every result code, write counter
+ * and MAC is then computed by the same code on both paths -- nothing about
+ * the outcome is decided by the host-controller model.
+ */
+int mtk_ufs_rpmb_request(const uint8_t *frames, int nframes)
+{
+    if (!mtk_ufs_rpmb_enabled() || nframes < 1 ||
+        nframes > RPMB_MAX_FRAMES) {
+        return -1;
+    }
+    mtk_rpmb_out(mtk_rpmb_get(), frames, nframes);
+    return 0;
+}
+
+int mtk_ufs_rpmb_response(uint8_t *frames, int max_frames)
+{
+    if (!mtk_ufs_rpmb_enabled() || max_frames < 1) {
+        return 0;
+    }
+    if (max_frames > RPMB_MAX_FRAMES) {
+        max_frames = RPMB_MAX_FRAMES;
+    }
+    return mtk_rpmb_in(mtk_rpmb_get(), frames, max_frames);
+}
+
 /* ===== end RPMB ===== */
 
 static UfsReqResult mtk_ufs_emulate_scsi_cmd(UfsLu *lu, UfsRequest *req)

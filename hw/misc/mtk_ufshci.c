@@ -495,7 +495,19 @@ static void mtk_ufshci_query(const uint8_t *rq, uint8_t *resp)
 #define UFS_RPMB_MAC_OFS 0x0c4
 #define UFS_RPMB_MAC_LEN 32
 #define UFS_RPMB_WCOUNT_OFS 0x1f4
+#define UFS_RPMB_RES_OFS 0x1fc
 #define UFS_RPMB_TYPE_OFS 0x1fe
+/* Frames handled per SECURITY PROTOCOL command (the boot chain uses one). */
+#define UFS_RPMB_MAX_FRAMES 16
+
+/*
+ * Provided by hw/misc/mtk_ufs_lu.c.  The RPMB W-LUN is one device, so the
+ * host-controller model and the LU model must drive the same JEDEC state
+ * machine; the controller must never compute a result or a MAC itself.
+ */
+bool mtk_ufs_rpmb_enabled(void);
+int mtk_ufs_rpmb_request(const uint8_t *frames, int nframes);
+int mtk_ufs_rpmb_response(uint8_t *frames, int max_frames);
 
 
 struct MtkUfshciState {
@@ -521,12 +533,6 @@ struct MtkUfshciState {
     uint32_t attr_id[MTK_UFSHCI_ATTRS];
     uint32_t attr_val[MTK_UFSHCI_ATTRS];
     unsigned attr_n;
-    /* Legacy UFS RPMB (LUN 0xC4) emulation. The guest uses a single
-     * 512-byte frame in its own DRAM; the device side needs only the
-     * last request nonce and the write counter for the boot sequence. */
-    uint8_t rpmb_req[512];
-    bool rpmb_have_req;
-    uint32_t rpmb_write_counter;
 };
 
 static void mtk_ufshci_serve(MtkUfshciState *s, uint64_t ucd,
@@ -616,17 +622,18 @@ static void mtk_ufshci_serve(MtkUfshciState *s, uint64_t ucd,
             }
         }
         resp[0x05] = 0x00;             /* status GOOD */
-        if (rq[2] == 0xc4 && prdt_cnt &&
+        if (mtk_ufs_rpmb_enabled() && rq[2] == 0xc4 && prdt_cnt &&
             (cdb[0] == 0xb5 || cdb[0] == 0xa2 || cdb[0] == 0xa3)) {
-            /* Legacy UFS RPMB arrives as SECURITY PROTOCOL-style CDBs to
-             * the RPMB well-known LUN. The 512-byte frame lives in the
-             * first PRDT buffer. The first command (0xB5) carries the
-             * request and the second (0xA2) is the host's get-response
-             * command; answer the latter in-place. */
+            /* Legacy UFS RPMB arrives as SECURITY PROTOCOL CDBs to the
+             * RPMB well-known LUN: 0xB5 (OUT) carries the request frames,
+             * 0xA2/0xA3 (IN) returns the response frames.  The frames are
+             * handed to the genuine JEDEC HMAC-SHA256 state machine in
+             * hw/misc/mtk_ufs_lu.c.  This model computes no result, no
+             * write counter and no MAC on the guest's behalf: an unkeyed
+             * RPMB must fail the way it fails on the device. */
             uint8_t ent[16];
             uint64_t buf = 0;
             uint32_t len = 0;
-            uint8_t frame[UFS_RPMB_FRAME_LEN];
 
             if (!dma_memory_read(&address_space_memory,
                                  ucd + (prdt_off ? prdt_off : 0x400), ent,
@@ -634,37 +641,36 @@ static void mtk_ufshci_serve(MtkUfshciState *s, uint64_t ucd,
                 memcpy(&buf, ent, 8);
                 memcpy(&len, ent + 12, 4);
                 len = (len & 0x3ffff) + 1;
-                if (len >= UFS_RPMB_FRAME_LEN) {
-                    if (!dma_memory_read(&address_space_memory, buf, frame,
-                                         UFS_RPMB_FRAME_LEN,
-                                         MEMTXATTRS_UNSPECIFIED)) {
-                        if (cdb[0] == 0xb5) {
-                            memcpy(s->rpmb_req, frame, UFS_RPMB_FRAME_LEN);
-                            s->rpmb_have_req = true;
+                if (buf && len >= UFS_RPMB_FRAME_LEN) {
+                    uint8_t frames[UFS_RPMB_MAX_FRAMES * UFS_RPMB_FRAME_LEN];
+                    int nframes = len / UFS_RPMB_FRAME_LEN;
+
+                    if (nframes > UFS_RPMB_MAX_FRAMES) {
+                        nframes = UFS_RPMB_MAX_FRAMES;
+                    }
+                    if (cdb[0] == 0xb5) {
+                        if (!dma_memory_read(&address_space_memory, buf,
+                                             frames,
+                                             nframes * UFS_RPMB_FRAME_LEN,
+                                             MEMTXATTRS_UNSPECIFIED)) {
+                            mtk_ufs_rpmb_request(frames, nframes);
                         }
-                        if (cdb[0] == 0xa2 || cdb[0] == 0xa3) {
-                            if (s->rpmb_have_req) {
-                                memcpy(frame, s->rpmb_req,
-                                       UFS_RPMB_FRAME_LEN);
-                            }
-                            stl_be_p(frame + UFS_RPMB_WCOUNT_OFS,
-                                     s->rpmb_write_counter);
-                            frame[UFS_RPMB_TYPE_OFS - 1] = 0;
-                            stw_le_p(frame + UFS_RPMB_TYPE_OFS, 2);
-                            /* The host's local MAC checker runs through a
-                             * stubbed trusted service in this model, so the
-                             * expected MAC reads back as zero. Leaving the
-                             * device MAC at zero lets the type/result/nonce
-                             + MAC checks all pass for the boot sequence. */
-                            memset(frame + UFS_RPMB_MAC_OFS, 0,
-                                   UFS_RPMB_MAC_LEN);
-                            dma_memory_write(&address_space_memory, buf,
-                                             frame, UFS_RPMB_FRAME_LEN,
-                                             MEMTXATTRS_UNSPECIFIED);
+                    } else {
+                        int got = mtk_ufs_rpmb_response(frames, nframes);
+
+                        if (got > 0 &&
+                            !dma_memory_write(&address_space_memory, buf,
+                                              frames,
+                                              got * UFS_RPMB_FRAME_LEN,
+                                              MEMTXATTRS_UNSPECIFIED) &&
+                            MTK_ENV_CACHED("MTK_RPMB_TRACE")) {
                             fprintf(stderr,
-                                    "MT6895-DBG ufs rpmb responded "
-                                    "cdb=%02x wcount=%u\n",
-                                    cdb[0], s->rpmb_write_counter);
+                                    "MT6895 ufs rpmb IN cdb=%02x frames=%d "
+                                    "type=%#x result=%#x wcnt=%#x\n",
+                                    cdb[0], got,
+                                    lduw_be_p(frames + UFS_RPMB_TYPE_OFS),
+                                    lduw_be_p(frames + UFS_RPMB_RES_OFS),
+                                    ldl_be_p(frames + UFS_RPMB_WCOUNT_OFS));
                         }
                     }
                 }
