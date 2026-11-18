@@ -5177,11 +5177,249 @@ static void mt6895_usbdevtrace(char rw, uint64_t abs, unsigned size,
     }
 }
 
+/*
+ * MTK_BL2PC=1: bounded PC sampler for the BL2_EXT->BL31 hand-off.
+ *
+ * The zero-injection boot stops after BL2_EXT frees "system_bl2-ext" with all
+ * next images already staged, so the failure is a spin, a bad jump or an idle
+ * wait at the transfer.  This diagnostic samples the PC at 1 kHz (virtual
+ * clock) and keeps the last 256 PCs seen in 0x62F00000..0x64F00000 together
+ * with LR/SP/DAIF; it dumps once when the same 64-byte PC window repeats for
+ * more than 500 samples, and always dumps the last 32 samples at process exit.
+ * The last BL2_EXT MMIO access (pa/value/read-write) is printed with either
+ * dump, so "spinning on a missing register" is directly visible.  Diagnostic
+ * only: without the env nothing is allocated and no timer runs.
+ */
+typedef struct MtkBl2PcSample {
+    uint64_t pc, lr, sp, daif;
+} MtkBl2PcSample;
+
+#define MTK_BL2PC_RING 256
+static struct {
+    bool enabled;
+    QEMUTimer *timer;
+    unsigned head, count;
+    uint64_t stuck_key;
+    unsigned stuck;
+    bool dumped;
+    unsigned last_head, idle_ticks;
+    bool dumped_noprogress;
+    uint64_t vbar_last;
+    unsigned vbar_changes;
+    unsigned walker_path;
+    bool blr_seen;
+    uint64_t blr_pc, blr_x0, blr_x1, blr_x2, blr_x3, blr_x4, blr_x25;
+    uint64_t blr_esr, blr_elr, blr_spsr, blr_vbar, blr_sctlr, blr_tcr;
+    bool have_mmio;
+    uint64_t mmio_pa, mmio_val;
+    unsigned mmio_write;
+    MtkBl2PcSample ring[MTK_BL2PC_RING];
+    MtkBl2PcSample any[16];
+    unsigned any_head, any_count;
+} mtk_bl2pc;
+
+static bool mtk_bl2pc_pc_in_range(uint64_t pc)
+{
+    /*
+     * BL2_EXT starts at physical 0x62f00000 but runs at the secure alias
+     * 0xffff0000_62f00000 once its MMU is on (seen as pc=0xffff000062f4a3d4
+     * in MTK-PCSTALL).  Accept both by comparing the low 48 bits.
+     */
+    uint64_t p = pc & 0x0000ffffffffffffULL;
+
+    return p >= 0x62f00000ULL && p < 0x64f00000ULL;
+}
+
+static void mtk_bl2pc_print(unsigned n, const char *why)
+{
+    unsigned i, start;
+
+    if (!mtk_bl2pc.enabled || !mtk_bl2pc.count) {
+        return;
+    }
+    if (n > mtk_bl2pc.count) {
+        n = mtk_bl2pc.count;
+    }
+    fprintf(stderr, "MTK-BL2PC dump (%s): %u of %u samples\n",
+            why, n, mtk_bl2pc.count);
+    start = (mtk_bl2pc.head + MTK_BL2PC_RING - n) % MTK_BL2PC_RING;
+    for (i = 0; i < n; i++) {
+        MtkBl2PcSample *p = &mtk_bl2pc.ring[(start + i) % MTK_BL2PC_RING];
+
+        fprintf(stderr,
+                "  pc=%016" PRIx64 " lr=%016" PRIx64 " sp=%016" PRIx64
+                " daif=%#" PRIx64 "\n", p->pc, p->lr, p->sp, p->daif);
+    }
+    if (mtk_bl2pc.have_mmio) {
+        fprintf(stderr, "  last-bl2-mmio %c pa=%#" PRIx64 " val=%#" PRIx64
+                "\n", mtk_bl2pc.mmio_write ? 'W' : 'R',
+                mtk_bl2pc.mmio_pa, mtk_bl2pc.mmio_val);
+    }
+    fprintf(stderr, "  el3 vbar=%016" PRIx64 " vbar_changes=%u"
+            " walker_path=%s\n", mtk_bl2pc.vbar_last,
+            mtk_bl2pc.vbar_changes,
+            mtk_bl2pc.walker_path == 1 ? "fail(returned0)" :
+            mtk_bl2pc.walker_path == 2 ? "ok" : "unseen");
+    if (mtk_bl2pc.blr_seen) {
+        fprintf(stderr, "  blr pc=%016" PRIx64 " x0=%016" PRIx64
+                " x1=%016" PRIx64 " x2=%016" PRIx64 " x3=%016" PRIx64
+                " x4=%016" PRIx64 " x25=%016" PRIx64 "\n",
+                mtk_bl2pc.blr_pc, mtk_bl2pc.blr_x0, mtk_bl2pc.blr_x1,
+                mtk_bl2pc.blr_x2, mtk_bl2pc.blr_x3, mtk_bl2pc.blr_x4,
+                mtk_bl2pc.blr_x25);
+        fprintf(stderr, "  blr-el3 esr=%#" PRIx64 " elr=%016" PRIx64
+                " spsr=%#" PRIx64 " vbar=%016" PRIx64 " sctlr=%016" PRIx64
+                " tcr=%016" PRIx64 "\n", mtk_bl2pc.blr_esr,
+                mtk_bl2pc.blr_elr, mtk_bl2pc.blr_spsr, mtk_bl2pc.blr_vbar,
+                mtk_bl2pc.blr_sctlr, mtk_bl2pc.blr_tcr);
+    }
+}
+
+static void mtk_bl2pc_exit_dump(void)
+{
+    mtk_bl2pc_print(32, "exit");
+}
+
+static void mtk_bl2pc_tick(void *opaque)
+{
+    CPUState *cs = qemu_get_cpu(0);
+    CPUARMState *env;
+    uint64_t pc, key;
+
+    if (!cs) {
+        return;
+    }
+    env = cpu_env(cs);
+    timer_mod(mtk_bl2pc.timer,
+              qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + 1000000);
+    pc = env->pc;
+    {
+        uint64_t lopc = pc & 0x0000ffffffffffffULL;
+        uint64_t vb = env->cp15.vbar_el[3];
+
+        if (vb != mtk_bl2pc.vbar_last) {
+            mtk_bl2pc.vbar_last = vb;
+            mtk_bl2pc.vbar_changes++;
+        }
+        if (lopc >= 0x62f0c5b8ULL && lopc < 0x62f0c5dcULL) {
+            mtk_bl2pc.walker_path = 1;
+        } else if (lopc >= 0x62f0c5dcULL && lopc < 0x62f0c5f8ULL) {
+            mtk_bl2pc.walker_path = 2;
+        }
+        if (lopc >= 0x62f0c610ULL && lopc <= 0x62f0c628ULL) {
+            mtk_bl2pc.blr_seen = true;
+            mtk_bl2pc.blr_pc = pc;
+            mtk_bl2pc.blr_x0 = env->xregs[0];
+            mtk_bl2pc.blr_x1 = env->xregs[1];
+            mtk_bl2pc.blr_x2 = env->xregs[2];
+            mtk_bl2pc.blr_x3 = env->xregs[3];
+            mtk_bl2pc.blr_x4 = env->xregs[4];
+            mtk_bl2pc.blr_x25 = env->xregs[25];
+            mtk_bl2pc.blr_esr = env->cp15.esr_el[3];
+            mtk_bl2pc.blr_elr = env->elr_el[3];
+            mtk_bl2pc.blr_spsr = (env->pstate | env->daif);
+            mtk_bl2pc.blr_vbar = vb;
+            mtk_bl2pc.blr_sctlr = env->cp15.sctlr_el[3];
+            mtk_bl2pc.blr_tcr = env->cp15.tcr_el[3];
+        }
+    }
+    mtk_bl2pc.any[mtk_bl2pc.any_head] = (MtkBl2PcSample){ pc, env->xregs[30],
+                                                        env->xregs[31],
+                                                        env->daif };
+    mtk_bl2pc.any_head = (mtk_bl2pc.any_head + 1) % 16;
+    if (mtk_bl2pc.any_count < 16) {
+        mtk_bl2pc.any_count++;
+    }
+    if (mtk_bl2pc_pc_in_range(pc)) {
+        mtk_bl2pc.ring[mtk_bl2pc.head] = (MtkBl2PcSample){ pc, env->xregs[30],
+                                                          env->xregs[31],
+                                                          env->daif };
+        mtk_bl2pc.head = (mtk_bl2pc.head + 1) % MTK_BL2PC_RING;
+        if (mtk_bl2pc.count < MTK_BL2PC_RING) {
+            mtk_bl2pc.count++;
+        }
+    }
+    /*
+     * No-progress watchdog: if BL2_EXT stops executing for 2 s (bad jump to
+     * an address outside its range, or an idle/wait it never returns from),
+     * dump before the harness kills QEMU -- the atexit dump would not run on
+     * a forced kill.  Labelled separately from the stall dump.
+     */
+    if (mtk_bl2pc.head == mtk_bl2pc.last_head) {
+        mtk_bl2pc.idle_ticks++;
+    } else {
+        mtk_bl2pc.last_head = mtk_bl2pc.head;
+        mtk_bl2pc.idle_ticks = 0;
+    }
+    if (mtk_bl2pc.idle_ticks == 2000 && !mtk_bl2pc.dumped_noprogress &&
+        mtk_bl2pc.count) {
+        mtk_bl2pc.dumped_noprogress = true;
+        mtk_bl2pc_print(32, "no-progress");
+        fprintf(stderr, "  current pc=%016" PRIx64 " lr=%016" PRIx64
+                " sp=%016" PRIx64 " daif=%#" PRIx64 "\n", pc,
+                env->xregs[30], env->xregs[31], env->daif);
+        if (mtk_bl2pc.any_count) {
+            unsigned k, start = (mtk_bl2pc.any_head + 16 -
+                                 mtk_bl2pc.any_count) % 16;
+            for (k = 0; k < mtk_bl2pc.any_count; k++) {
+                MtkBl2PcSample *a =
+                    &mtk_bl2pc.any[(start + k) % 16];
+                fprintf(stderr, "  after[%u] pc=%016" PRIx64 " lr=%016"
+                        PRIx64 " sp=%016" PRIx64 " daif=%#" PRIx64 "\n",
+                        k, a->pc, a->lr, a->sp, a->daif);
+            }
+        }
+    }
+    key = (pc & 0x0000ffffffffffffULL) & ~0x3fULL;
+    if (key == mtk_bl2pc.stuck_key) {
+        mtk_bl2pc.stuck++;
+    } else {
+        mtk_bl2pc.stuck_key = key;
+        mtk_bl2pc.stuck = 1;
+    }
+    if (mtk_bl2pc.stuck == 500 && !mtk_bl2pc.dumped) {
+        mtk_bl2pc.dumped = true;
+        mtk_bl2pc_print(64, "stall");
+    }
+}
+
+static void mtk_bl2pc_mmio(hwaddr pa, uint64_t val, bool is_write)
+{
+    CPUState *cs;
+
+    if (!mtk_bl2pc.enabled) {
+        return;
+    }
+    cs = qemu_get_cpu(0);
+    if (!cs || !mtk_bl2pc_pc_in_range(cpu_env(cs)->pc)) {
+        return;
+    }
+    mtk_bl2pc.have_mmio = true;
+    mtk_bl2pc.mmio_pa = pa;
+    mtk_bl2pc.mmio_val = val;
+    mtk_bl2pc.mmio_write = is_write;
+}
+
+static void mtk_bl2pc_init(void)
+{
+    if (mtk_bl2pc.enabled || !MTK_ENV_CACHED("MTK_BL2PC")) {
+        return;
+    }
+    mtk_bl2pc.enabled = true;
+    mtk_bl2pc.timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, mtk_bl2pc_tick, NULL);
+    timer_mod(mtk_bl2pc.timer,
+              qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + 1000000);
+    atexit(mtk_bl2pc_exit_dump);
+    fprintf(stderr, "mt6895: MTK_BL2PC sampler enabled "
+            "(BL2_EXT 0x62f00000..0x64efffff)\n");
+}
+
 static uint64_t mt6895_peri_fill_read(void *opaque, hwaddr off, unsigned size)
 {
     (void)opaque;
     (void)size;
     mt6895_usbdevtrace('R', 0x10000000ULL + off, size, 0);
+    mtk_bl2pc_mmio(0x10000000ULL + off, 0, false);
     if (MTK_ENV_CACHED("MTK_SPIN2")) {
         static hwaddr last;
         static unsigned long cnt;
@@ -5251,6 +5489,7 @@ static void mt6895_peri_fill_write(void *opaque, hwaddr off, uint64_t val,
 {
     (void)opaque; (void)size;
     mt6895_usbdevtrace('W', 0x10000000ULL + off, size, val);
+    mtk_bl2pc_mmio(0x10000000ULL + off, val, true);
     if (MTK_ENV_CACHED("MTK_PERI_WTRACE")) {
         static int budget;
 
@@ -11555,6 +11794,7 @@ static const MemoryRegionOps mt6895_dsi_intr_ops = {
 
 static void mt6895_create_syscons(Mt6895MachineState *s, Error **errp)
 {
+    mtk_bl2pc_init();
     /*
      * Low-priority fill for unimplemented peripheral registers in the
      * 0x1000_0000 window. LK's monitor/debug_ctrl_ao drivers (taken from the
