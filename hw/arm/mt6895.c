@@ -825,115 +825,35 @@ static const MemoryRegionOps mt6895_lba_source_ops = {
 };
 
 /*
- * The payload's partition name table at 0x02078EA4, overlaid so the BSS
- * clear cannot wipe it between the early proinfo read and the later bl2_ext
- * lookup.
- *
- * The table is 11 entries x 20 bytes = 220 bytes, ending at 0x02078F80. An
- * earlier attempt covered a flat 256 bytes and cut the boot to 3217 bytes of
- * serial output, because 0x02078F80..0x02079FA4 is SRAM1 the payload uses;
- * this overlay is sized to the table alone. Guest writes win where present,
- * and the machine's own entries are the fallback -- the pattern that already
- * makes the RKP object and the vtable overlays survive the same clear.
+ * The payload's partition name table at 0x02078EA4: pure pass-through
+ * overlay. The payload builds and maintains the table it consumes (GPT path
+ * selected by the flag at 0x020F4AC4); the machine seeds nothing.
  */
-uint8_t mt6895_name_tbl_image[MT6895_NAME_TABLE_SIZE];
 
 static int mt6895_tblprobe_n;
 static int mt6895_geomprobe_n;
 static int mt6895_bl2_name_write_diag_n;
 
-static bool mt6895_name_query_is_bl2_ext(void)
-{
-    static unsigned diag_count;
-    ARMCPU *cpu = ARM_CPU(current_cpu);
-    uint32_t query, pc, lr;
-    uint8_t name[16] = { 0 };
-    MemTxResult result;
-    bool match;
-
-    if (!cpu) {
-        return false;
-    }
-
-    query = (uint32_t)cpu->env.regs[4];
-    pc = (uint32_t)cpu->env.regs[15];
-    lr = (uint32_t)cpu->env.regs[14];
-    result = address_space_read(&address_space_memory, query,
-                                MEMTXATTRS_UNSPECIFIED, name, sizeof(name));
-    match = result == MEMTX_OK && !memcmp(name, "bl2_ext", sizeof("bl2_ext"));
-
-    if (diag_count < 16) {
-        diag_count++;
-        fprintf(stderr,
-                "mt6895-dbg: name query addr=%08x bytes="
-                "%02x %02x %02x %02x %02x %02x %02x %02x "
-                "%02x %02x %02x %02x %02x %02x %02x %02x "
-                "result=%u match_bl2=%u pc=%08x lr=%08x\n",
-                query, name[0], name[1], name[2], name[3],
-                name[4], name[5], name[6], name[7],
-                name[8], name[9], name[10], name[11],
-                name[12], name[13], name[14], name[15],
-                result, match, pc, lr);
-    }
-    return match;
-}
-
 static uint64_t mt6895_name_tbl_read(void *opaque, hwaddr off, unsigned size)
 {
     Mt6895MachineState *s = opaque;
-    ARMCPU *cpu = ARM_CPU(current_cpu);
-    uint32_t pc = cpu ? (uint32_t)cpu->env.regs[15] : 0;
     uint64_t value = 0;
     unsigned i;
-    bool synthetic_bl2;
 
-    /* Latch the query while entry 9 is scanned; r4 changes during the copy. */
-    if (pc == 0x0204054eu && off == 0xb8) {
-        s->name_tbl_bl2_entry_active = mt6895_name_query_is_bl2_ext();
-    }
-    synthetic_bl2 = s->name_tbl_bl2_entry_active &&
-                    off >= 0xb4 && off < 0xc8;
-
-    /*
-     * The partition finder at 0x02040538 walks this table when the flag at
-     * 0x020F4AC4 is set, and 0x0202D764 reads the GPT when it is not. Whether
-     * this window is touched at all says which of the two ran, which is what
-     * decides where a failed lookup has to be fixed.
-     */
     if (mt6895_tblprobe_n < 48) {
         mt6895_tblprobe_n++;
-        trace_mt6895_tblprobe(mt6895_tblprobe_n,
-                              MT6895_NAME_TABLE_BASE + off, size);
+        trace_mt6895_tblprobe(mt6895_tblprobe_n, MT6895_NAME_TABLE_BASE + off, size);
     }
-    if (mt6895_geomprobe_n < 48 &&
-        ((off % MT6895_NAME_TABLE_STRIDE) == 4)) {
+    if (mt6895_geomprobe_n < 48 && ((off % MT6895_NAME_TABLE_STRIDE) == 4)) {
         mt6895_geomprobe_n++;
-        trace_mt6895_geomprobe(mt6895_geomprobe_n,
-                               MT6895_NAME_TABLE_BASE + off, size);
+        trace_mt6895_geomprobe(mt6895_geomprobe_n, MT6895_NAME_TABLE_BASE + off, size);
     }
-
     for (i = 0; i < size; i++) {
-        hwaddr byte_off = off + i;
-        uint8_t byte;
-
-        if (byte_off >= MT6895_NAME_TABLE_SIZE) {
-            byte = 0;
-        } else if (synthetic_bl2) {
-            byte = mt6895_name_tbl_image[byte_off];
-        } else if (s->name_tbl_valid[byte_off]) {
-            byte = (s->name_tbl_store[byte_off / 4] >>
-                    ((byte_off % 4) * 8)) & 0xff;
-        } else {
-            byte = mt6895_name_tbl_image[byte_off];
-        }
+        hwaddr b = off + i;
+        uint8_t byte = (b >= MT6895_NAME_TABLE_SIZE || !s->name_tbl_valid[b]) ? 0 :
+            (uint8_t)(s->name_tbl_store[b / 4] >> ((b % 4) * 8));
         value |= (uint64_t)byte << (i * 8);
     }
-
-    /* The bytewise memcpy ends at entry 9's last byte. */
-    if (synthetic_bl2 && pc == 0x020487d6u && off + size >= 0xc8) {
-        s->name_tbl_bl2_entry_active = false;
-    }
-
     return value;
 }
 
@@ -6272,125 +6192,6 @@ static ssize_t mt6895_pwrite(int fd, const void *buf, size_t len, uint64_t off)
 #else
     return pwrite(fd, buf, len, off);
 #endif
-}
-
-static void mt6895_place_name_table(Mt6895MachineState *s, Error **errp)
-{
-    /*
-     * One 20-byte table serves two lookups.
-     *
-     * The DRAM stage's name lookup (0x0203F62A) and the partition lookup
-     * (0x0204054E) walk the same entries: +0x04 must be non-zero, +0x10 is
-     * the name, and the entry the partition lookup matches is where the
-     * partition's geometry comes from (0x020406C0: [r6+0] = start LBA,
-     * [r6+4] = size in 512-byte blocks).
-     *
-     * The machine previously wrote only one entry -- the DRAM-stage trick
-     * of pointing the name at the payload's own string -- so partition
-     * lookups for "misc", "mem", "seccfg", ... never matched and every
-     * partition read failed with "read boot_control fail", "mem read
-     * fail!", "seccfg part not found" (all one root cause, which then
-     * cascaded into "[AB] no valid slot!" and "[PLFM] Unknown boot!").
-     *
-     * Fill in the real geometry from the device's GPT (tools/gpt, header
-     * from LUA_2). The DRAM-stage lookup key is the payload's own
-     * "expdb" string at 0x0205CB2D, so the expdb entry doubles as its
-     * match; every other entry is a partition the preloader reads.
-     *
-     * Entries: {+0x00 start LBA, +0x04 size, +0x08, +0x0c, +0x10 *name}.
-     * The table ends at the first entry whose size field reads zero.
-     */
-    struct {
-        uint32_t lba, size, w2, w3;
-        uint32_t name;
-    } parts[] = {
-        { 64, 8192, 8192, 0, 0x0205689b },  /* misc (real GPT geometry) */
-        { 21790720, 8192, 8192, 0, 0x02061d1f },  /* mem */
-        { 118784, 2048, 2048, 0, 0x020637fa },  /* seccfg */
-        { 2378752, 51200, 51200, 0, 0x02059bef },  /* dram_para */
-        { 48512, 32768, 32768, 0, 0x0205cb2d },  /* expdb */
-        { 48384, 128, 128, 0, 0x020568a0 },  /* para */
-        { 1820672, 16384, 16384, 0, 0x0205d8ec },  /* lk_a */
-        { 21741568, 32768, 32768, 0, 0x02057140 },  /* gsort */
-        /*
-         * proinfo -- the product-info partition the preloader reads right
-         * after AOC init (0x02042C54). Without an entry here the lookup at
-         * 0x0204053E fails, the error path at 0x02042C7A prints
-         * "[proinfo] can't find boot device(1)", and that same path clears
-         * the UART console pointer at 0x02079E00 -- after which every
-         * further serial write spins forever in the THRE poll at
-         * 0x02048F32, because [0]=0 makes the +0x14 read return 0 and the
-         * transmitter never reports empty.
-         *
-         * Geometry is the real partition's, from the LUA_2 GPT: start LBA
-         * 22528, 23295 sectors. The name pointer is the payload's own
-         * "proinfo" string at 0x0205D5D6, the same idiom the other entries
-         * use.
-         */
-        { 22528, 23295, 23295, 0, 0x0205d5d6 },  /* proinfo */
-
-
-        /*
-         * bl2_ext -- the second-stage boot image the preloader loads right
-         * after trustzone pre init. The lookup runs through the same
-         * 0x0204053E walk, and when it fails the boot stops with
-         *   "[BLDR] fail to get bl2_ext part_offset"
-         *   <ASSERT> .../preloader/platform/mt6895/src/core/main.c:line 420
-         *   "PL fatal error..."
-         *
-         * Neither the synthetic GPT this device boots from nor the real
-         * 87-partition GPT out of LUA_2 carries a bl2_ext partition, so the
-         * entry's geometry borrows lk_a's: same start LBA and a size large
-         * enough for the load. The name pointer is the payload's own
-         * "bl2_ext" string at 0x0205D3B1, like the other entries.
-         */
-        { 3400000, 65536, 65536, 0, 0x0205d3b1 },  /* bl2_ext */
-    };
-    uint8_t table[MT6895_NAME_TABLE_STRIDE * (ARRAY_SIZE(parts) + 1)] = { 0 };
-    size_t off = 0;
-
-    for (size_t i = 0; i < ARRAY_SIZE(parts); i++) {
-        stl_le_p(table + off + 0x00, parts[i].lba);
-        stl_le_p(table + off + 0x04, parts[i].size);
-        stl_le_p(table + off + 0x08, parts[i].w2);
-        stl_le_p(table + off + 0x0c, parts[i].w3);
-        stl_le_p(table + off + 0x10, parts[i].name);
-        off += MT6895_NAME_TABLE_STRIDE;
-    }
-    /* zero-size entry terminates every walk */
-    memset(table + off, 0, MT6895_NAME_TABLE_STRIDE);
-
-    /*
-     * Seed the overlay store as well as RAM. The RAM write is the original
-     * behaviour and is what the payload normally consumes; the store keeps a
-     * machine-side copy available for any narrower overlay that is added
-     * later. (Overlaying 0x02078EA4 wholesale was tried and reverted -- the
-     * range is ordinary SRAM1 the payload uses, and covering it killed the
-     * boot in the PMIF stage.)
-     */
-    for (size_t i = 0; i < sizeof table && i / 4 < ARRAY_SIZE(s->name_tbl_store);
-         i += 4) {
-        stl_le_p((uint8_t *)&s->name_tbl_store[i / 4],
-                 ldl_le_p(table + i));
-    }
-
-    /*
-     * Snapshot the entries into the overlay's default image. A plain
-     * address_space_write here does not survive the payload's BSS clear --
-     * measured: the table still reads zero well into the run -- so later
-     * lookups (bl2_ext after trustzone pre init) find nothing and the boot
-     * stops at "[BLDR] fail to get bl2_ext part_offset".
-     */
-    for (size_t i = 0; i < sizeof table && i < MT6895_NAME_TABLE_SIZE; i++) {
-        mt6895_name_tbl_image[i] = table[i];
-    }
-
-    address_space_write(&address_space_memory, MT6895_NAME_TABLE_BASE,
-                        MEMTXATTRS_UNSPECIFIED, table, sizeof table);
-
-    info_report("mt6895: partition name table at %#" PRIx64 " (%d entries)",
-                (uint64_t)MT6895_NAME_TABLE_BASE,
-                (int)ARRAY_SIZE(parts));
 }
 
 /*
@@ -14620,13 +14421,17 @@ static const uint8_t stub_cmd_def[0x80] = {
     }
 
     /*
-     * NOTE: a name-table overlay at MT6895_NAME_TABLE_BASE was tried and
-     * reverted. Covering 0x02078EA4..0x02078FA4 with an MMIO region cut the
-     * serial output from 119141 bytes to 3217 (dead in the PMIF stage),
-     * because that range is ordinary SRAM1 the payload itself uses. The
-     * name table still has to be published some other way; see
-     * mt6895_place_name_table, which now seeds s->name_tbl_store so the
-     * data is ready whenever a narrower mechanism is found.
+     * NOTE: an MMIO name-table overlay at MT6895_NAME_TABLE_BASE was tried
+     * and reverted: covering 0x02078EA4..0x02078FA4 cut the serial output
+     * from 119141 bytes to 3217 (dead in the PMIF stage) because that range
+     * is ordinary SRAM1 the payload itself uses.
+     *
+     * The synthetic name table itself, and the fabricated bl2_ext entry that
+     * went with it, have since been removed outright. bl2_ext is not a
+     * partition: it is the MMM container at lk_a+0xC48B0 (magic 0x58881688),
+     * and the payload resolves it through its own container path. Verified:
+     * with the table gone the tree still reaches recovery with the aid set,
+     * and the containers still load.
      */
 
     memory_region_init_io(&s->logstore_win, OBJECT(s), &mt6895_logstore_ops,
@@ -14879,13 +14684,6 @@ static const uint8_t stub_cmd_def[0x80] = {
                       qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + 7000000000LL);
         }
 
-        if (!err && !MTK_ENV_CACHED("MTK_NO_NAMETBL")) {
-            mt6895_place_name_table(s, &err);
-        }
-        if (err) {
-            fprintf(stderr, "MT6895-INIT-FAIL name_table: %s\n",
-                    error_get_pretty(err));
-        }
         mt6895_place_device_table(s);
         /*
          * APUSYS peri window: ATF's SMC handler stores per-op records at

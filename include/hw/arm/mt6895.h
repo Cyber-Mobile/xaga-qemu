@@ -673,8 +673,6 @@ static const struct { hwaddr base; hwaddr size; } mt6895_dramc_wins[] = {
 #define MT6895_AUXADC_ADDR       0x020f4bc8ULL
 #define MT6895_AUXADC_SIZE       0x00000078ULL
 
-/* Filled by mt6895_place_name_table; the overlay's default image. */
-extern uint8_t mt6895_name_tbl_image[];
 /*
  * The name the DRAM stage looks up is the pointer its caller passes, and that
  * pointer is 0x02062341 -- two bytes into the string "aee_debug_kinfo", so the
@@ -973,7 +971,6 @@ struct Mt6895MachineState {
     uint32_t rkp_head_store[1];
     uint32_t name_tbl_store[MT6895_NAME_TABLE_SIZE / 4];
     uint8_t name_tbl_valid[MT6895_NAME_TABLE_SIZE];
-    bool name_tbl_bl2_entry_active;
     MemoryRegion name_tbl;       /* partition name table overlay */
     MemoryRegion peri_fill_mr;  /* low-priority fill for 0x1000_0000 window */
     MemoryRegion atf_head_mr;   /* write-protected ATF console list head */
