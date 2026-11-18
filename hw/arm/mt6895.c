@@ -7095,6 +7095,20 @@ static void mt6895_place_gpt(Mt6895MachineState *s, Error **errp)
  * executed: 0x02040000 was rejected after disassembly showed it is live Thumb
  * code, so writing justified fields there would crash the preloader instead of
  * testing the descriptor-content hypothesis.
+ *
+ * The hand-off block also carries a genuine BROM field the preloader's MMM
+ * parser consumes at +0x808 (a pointer to an MMM container).  Our genuine
+ * boot-LUN container matches that parser's root-component path exactly
+ * (masked magic 0x4D4D4D, type 0, +0x1B=5, size 0x7A0B0, +0x2C=0x66C and the
+ * 0xE291F358 trailer signature at trailer+4, which the parser turns into
+ * cache+0xC=1 and a cache+0x10 value), but the parser's type-8 metadata
+ * (magic 0xC975E033 at component+0x2C, the flag at 0x020FB720) is present in
+ * none of the genuine images this model holds (fw/LUA_1 and every image in
+ * firmware/xaga/parts were scanned).  Pointing +0x808 at our own container
+ * regressed the boot: the parser walked the chain and cached the metadata,
+ * then spun reading cache+0x8 and the boot stalled at LK FGADC (+60 s).
+ * The field is therefore deliberately left stale rather than invented, and
+ * the builder stays default OFF until the genuine container is available.
  */
 #define MT6895_BROM_BOOTARGS_PA   0x02065000ULL
 #define MT6895_BROM_BOOTARGS_SIZE 0x00001000ULL
