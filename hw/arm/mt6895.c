@@ -1446,69 +1446,6 @@ static const MemoryRegionOps mt6895_atf_node_ops = {
 };
 
 /*
- * ATF boot argument ("atfarg").
- *
- * ATF's entry stores the pointer BL2 passes in x0 into the global at
- * 0x482596a8; platform code then reads it through 0x4820b7f0 and, when it
- * is NULL, dereferences NULL+0xc10 and takes a data abort (FAR=0xc10,
- * ESR=0x96000007 at ELR=0x4820f1e8). This machine hands off warm, so BL2
- * never supplies it. Point the global at a zeroed scratch page: the first
- * field the code tests ([arg+0xc10]) is then 0, which is the documented
- * "no boot args" path (cbz w8 -> 0x4820f280), and ATF continues on its
- * defaults instead of faulting.
- */
-static uint64_t mt6895_atfarg_read(void *opaque, hwaddr off, unsigned size)
-{
-    Mt6895MachineState *s = opaque;
-    uint8_t *p = s ? mt6895_guest_ptr(s, 0x482596a8ULL + off, size) : NULL;
-    uint64_t v = 0;
-    unsigned i;
-    static int n;
-
-    /*
-     * Firmware value first.  Since the RMR hand-off keeps x0, BL31 is entered
-     * with the preloader's mtk_bl_param_t pointer and stores it here itself;
-     * the substitute below is only for a BL31 that was given nothing.
-     */
-    for (i = 0; p && i < size; i++) {
-        v |= (uint64_t)p[i] << (8 * i);
-    }
-    if (n < 8) {
-        n++;
-        fprintf(stderr, "MTK-ATFARG-GLOBAL rd off=%#x size=%u ram=%#" PRIx64
-                "%s\n", (unsigned)off, size, v,
-                v ? "" : " -> 0x4824a000");
-    }
-    if (v) {
-        return v;
-    }
-    /*
-     * Return the atfarg blob the firmware publishes at 0x4824a000.
-     *
-     * NOTE: this window is inside ATF's own BSS range (the image ends at
-     * 0x48246190 and BSS runs from 0x4824b000), so only 0x1000 bytes are
-     * usable before ATF's cold-entry clear would clobber the table.  The
-     * mblock table therefore has to live in the first six slots; a table
-     * that reaches past 0x1000 reads back as empty entries and the
-     * cmdq_reserved_init lookup of "me_cmdq_reserved" fails.
-     */
-    return 0x4824a000ULL;
-}
-
-static void mt6895_atfarg_write(void *opaque, hwaddr off, uint64_t val,
-                                unsigned size)
-{
-    Mt6895MachineState *s = opaque;
-    uint8_t *p = s ? mt6895_guest_ptr(s, 0x482596a8ULL + off, size) : NULL;
-    unsigned i;
-
-    /* Let BL31's own store land (it used to be swallowed). */
-    for (i = 0; p && i < size; i++) {
-        p[i] = (val >> (8 * i)) & 0xff;
-    }
-}
-
-/*
  * ATF per-CPU log/console objects.
  *
  * 0x482063e8 returns 0x48253930 (or 0x48253988 when w0==1) only if the
@@ -2039,15 +1976,6 @@ static const MemoryRegionOps mt6895_atflog_ops = {
     .write = mt6895_atflog_write,
     .endianness = DEVICE_NATIVE_ENDIAN,
     .valid = { .min_access_size = 1, .max_access_size = 8 },
-    .impl = { .min_access_size = 1, .max_access_size = 8 },
-};
-
-static const MemoryRegionOps mt6895_atfarg_ops = {
-    .read = mt6895_atfarg_read,
-    .write = mt6895_atfarg_write,
-    .endianness = DEVICE_NATIVE_ENDIAN,
-    .valid = { .min_access_size = 1, .max_access_size = 8 },
-    /* without impl limits QEMU splits an 8-byte load into two 4-byte ones */
     .impl = { .min_access_size = 1, .max_access_size = 8 },
 };
 
@@ -3158,78 +3086,7 @@ static const MemoryRegionOps mt6895_boot_reason_ops = {
  * writes the backing RAM directly and bypasses memory regions, so the blob has
  * to live in the model rather than in guest memory.
  */
-static uint8_t mt6895_atfarg_blob[0x2000];
 /* Structure BL2 hands over in x0: +0x00 is a pointer, +0x18 the descriptor. */
-static uint8_t mt6895_atfarg2_blob[0x100];
-
-static uint64_t mt6895_atfargblob_read(void *opaque, hwaddr off, unsigned size)
-{
-    Mt6895MachineState *s = opaque;
-    uint64_t v = 0;
-    unsigned i;
-
-    /*
-     * 0x4824a100..0x4824a200 is ATF's console object: mirror the model's UART
-     * object there (+0x14 reports TX-ready, other reads return its back-pointer).
-     */
-    if (off >= 0x100 && off < 0x200) {
-        return (off & 0xff) == 0x14 ? 0x20 : 0x4825d000ULL;
-    }
-    /*
-     * The mblock table (count at +0xc10, entries at +0xc18, stride 0x98)
-     * runs to +0x1630 for 17 entries, i.e. past the first 0x1000 bytes and
-     * into the range ATF uses as BSS.  Serve the table from the model blob
-     * but everything else above 0x1000 from the real DRAM backing, so ATF's
-     * own BSS variables are not shadowed by model data.
-     */
-    if (off + size > sizeof(mt6895_atfarg_blob)) {
-        return 0;
-    }
-    if (off == 0x18) {
-        static int n;
-
-        if (n < 5) {
-            n++;
-            fprintf(stderr, "MTK-ATFARG rd 0x18 = %#" PRIx64 "\n",
-                    ldq_le_p(mt6895_atfarg_blob + 0x18));
-        }
-    }
-    for (i = 0; i < size; i++) {
-        v |= (uint64_t)mt6895_atfarg_blob[off + i] << (8 * i);
-    }
-    (void)s;
-    return v;
-}
-
-static void mt6895_atfargblob_write(void *opaque, hwaddr off, uint64_t val,
-                                    unsigned size)
-{
-    (void)opaque;
-    if (off >= 0x100 && off < 0x200) {
-        if (off == 0x100) {
-            static char line[256];
-            static unsigned len;
-            char c = (char)(val & 0xff);
-
-            if (c == '\n' || len == sizeof(line) - 1) {
-                line[len] = '\0';
-                if (len) {
-                    fprintf(stderr, "ATF-CONSOLE: %s\n", line);
-                }
-                len = 0;
-            } else if (c != '\r') {
-                line[len++] = c;
-            }
-        }
-        return;
-    }
-    /*
-     * The blob itself is model-owned: firmware writes must not corrupt it
-     * (ATF's platform code stores scratch state through this window).
-     */
-    (void)val;
-    (void)size;
-}
 
 /*
  * The ATF caches the mblock table pointer (0x482596a8).  The table lives in
@@ -3611,12 +3468,6 @@ static const MemoryRegionOps mt6895_pdn_ops = {
     .endianness = DEVICE_LITTLE_ENDIAN,
 };
 
-static const MemoryRegionOps mt6895_atfargblob_ops = {
-    .read = mt6895_atfargblob_read,
-    .write = mt6895_atfargblob_write,
-    .endianness = DEVICE_NATIVE_ENDIAN,
-    .valid = { .min_access_size = 1, .max_access_size = 8 },
-};
 
 static uint64_t mt6895_atfctx_read(void *opaque, hwaddr off, unsigned size)
 {
@@ -3638,63 +3489,6 @@ static const MemoryRegionOps mt6895_atfctx_ops = {
     .valid = { .min_access_size = 1, .max_access_size = 8 },
 };
 
-static uint64_t mt6895_atfarg2_read(void *opaque, hwaddr off, unsigned size)
-{
-    Mt6895MachineState *s = opaque;
-    uint64_t v = 0;
-    uint64_t real = 0;
-    unsigned i;
-
-    if (off + size > sizeof(mt6895_atfarg2_blob)) {
-        return 0;
-    }
-    for (i = 0; i < size; i++) {
-        v |= (uint64_t)mt6895_atfarg2_blob[off + i] << (8 * i);
-    }
-    {
-        uint8_t *rp = mt6895_guest_ptr(s, 0x7c800000ULL + off, size);
-        static int n;
-
-        for (i = 0; rp && i < size; i++) {
-            real |= (uint64_t)rp[i] << (8 * i);
-        }
-        if (n < 200) {
-            n++;
-            fprintf(stderr, "MTK-ATFARG2-RD off=%#x size=%u synth=%#" PRIx64
-                    " real=%#" PRIx64 " pc=%#" PRIx64 "\n", (unsigned)off,
-                    size, v, real,
-                    current_cpu ? (uint64_t)ARM_CPU(current_cpu)->env.pc : 0);
-        }
-    }
-    return v;
-}
-
-static void mt6895_atfarg2_write(void *opaque, hwaddr off, uint64_t val,
-                                 unsigned size)
-{
-    Mt6895MachineState *s = opaque;
-    uint8_t *p = mt6895_guest_ptr(s, 0x7c800000ULL + off, size);
-    unsigned i;
-
-    /*
-     * BL2 fills this block before it hands BL31 the pointer, so the writes
-     * must land in DRAM: the overlay only exists to keep ATF's reads working
-     * after the firmware has reused the region.
-     */
-    if (!p) {
-        return;
-    }
-    for (i = 0; i < size; i++) {
-        p[i] = (val >> (8 * i)) & 0xff;
-    }
-}
-
-static const MemoryRegionOps mt6895_atfarg2_ops = {
-    .read = mt6895_atfarg2_read,
-    .write = mt6895_atfarg2_write,
-    .endianness = DEVICE_NATIVE_ENDIAN,
-    .valid = { .min_access_size = 1, .max_access_size = 8 },
-};
 
 /*
  * Write watch on ATF's SIP-dispatch mode flag (0x4825abd8). When it reads as 1
@@ -3831,117 +3625,9 @@ static const MemoryRegionOps mt6895_diagg_ops = {
     .valid = { .min_access_size = 1, .max_access_size = 4 },
 };
 
-static void mt6895_plant_atfarg(Mt6895MachineState *s)
-{
-    /*
-     * ATF's atfarg blob, kept in the model (ATF's DC ZVA BSS clear writes the
-     * backing RAM directly, bypassing the memory region, so guest memory is
-     * not a safe home for it):
-     *   +0x000  atfarg            (+0x18 -> descriptor)
-     *   +0x080  descriptor (0x58) (+0x10 -> log buffer)
-     *   +0xc10  mblock count, +0xc18 entries (stride 0x98, name at +0x14)
-     */
-    static const struct {
-        uint64_t start;
-        uint64_t size;
-        const char *name;
-    } ents[] = {
-        /*
-         * The DRAM block must be present: ATF validates the regions its SiP
-         * services are asked to map (APUSYS secure memory, SCP reserved
-         * dram, cmdq buffer) against this table, and rejects them as
-         * "invalid param" when the containing DRAM range is missing.
-         */
-        /*
-         * Only six entries fit in the blob window (count at +0xc10, entries
-         * at +0xc18, stride 0x98, window ends at +0x1000 where ATF's BSS
-         * starts).  "log-reserved" duplicates "atf-log-reserved" (same
-         * range), so it gives up its slot to "me_cmdq_reserved" -- that is
-         * the lookup cmdq_reserved_init performs, and it gates the ADSP
-         * loader (without it LK asserts in app_load_adsp).
-         */
-        /*
-         * The blob window is 0x4824a000..0x4824afff (0x1000) before ATF's BSS
-         * at 0x4824b000, so entries 0..6 are readable (entry 6's name lands
-         * at +0xfbc) and 7..16 read back empty.  A shorter table with
-         * "me_cmdq_reserved" promoted into slot 6 measurably regresses the
-         * boot (LK stops at aee_check_enable), so the full 17-entry layout is
-         * kept: cmdq_reserved_init's lookup of "me_cmdq_reserved" then fails
-         * (its entry is clipped), which is the current ADSP blocker.
-         */
-        { 0x40000000ULL, 0x200000000ULL, "dram" },
-        { 0x48410000ULL, 0x100, "platform_mtksmmu_protpgd" },
-        { 0x10000000ULL, 0x10000000ULL, "peri" },
-        { 0x48200000ULL, 0x200000, "BL31-reserved" },
-        { 0xbfe00000ULL, 0x200000, "atf-log-reserved" },
-        { 0xbfe00000ULL, 0x200000, "log-reserved" },
-        { 0x48080000ULL, 0x10000, "aee_cblock" },
-        { 0x48600000ULL, 0x100000, "pl-boottag" },
-        { 0x7ac00000ULL, 0x400000, "tee-secmem" },
-        { 0x7d800000ULL, 0x100000, "tee-reserved" },
-        { 0x7d900000ULL, 0x100000, "gz" },
-        { 0x7da00000ULL, 0x100000, "sapu-mtee-shm" },
-        { 0x7db00000ULL, 0x100000, "gz-tee-static-shm" },
-        { 0x7dc00000ULL, 0x100000, "RKP" },
-        { 0x7dd00000ULL, 0x100000, "RKP_NS" },
-        { 0x7de00000ULL, 0x100000, "mkp" },
-        { 0x7df00000ULL, 0x100000, "me_cmdq_reserved" },
-    };
-    uint32_t cnt = ARRAY_SIZE(ents);
-    unsigned i;
 
-    (void)s;
-    memset(mt6895_atfarg_blob, 0, sizeof(mt6895_atfarg_blob));
-    /*
-     * atfarg+0x00 is the count of the 0x18-stride array at +0x08. The
-     * firmware computes the end as (count - 1) * 0x18 + start, so a zero
-     * count wraps to 0xffffffff and the walk runs off into unmapped memory.
-     * One empty entry is enough: the walk reads zero start/size and adds 0.
-     */
-    stl_le_p(mt6895_atfarg_blob + 0x00, 1);
-    stq_le_p(mt6895_atfarg_blob + 0x18, 0x4824a080ULL);
-    /* x0-path structure: +0x00 is a pointer, +0x18 the descriptor. */
-    memset(mt6895_atfarg2_blob, 0, sizeof(mt6895_atfarg2_blob));
-    /*
-     * +0x00 is the platform boot-tag pointer ATF's setup reads to learn the
-     * platform configuration (including which SiP ID width BL33 uses).  GZ
-     * normally publishes it; this model does not run GZ, so point it at the
-     * boot tag the preloader builds in its own mblock (pl-boottag).
-     */
-    /*
-     * BL2 builds the ATF boot tag from the preloader's bootconfig: its
-     * memory-block handler copies the mblock table to 0x63002968 and stores
-     * the header/mem pointers at 0x63002950/0x63002958. Point the atfarg at
-     * that real boot tag so ATF's boot_tag_mem_init can build its MMU map.
-     */
-    stq_le_p(mt6895_atfarg2_blob + 0x00,
-             MTK_ENV_CACHED("MTK_ATFARG_BOOTTAG") ? 0x63002950ULL : 0x4824a900ULL);
-    stq_le_p(mt6895_atfarg2_blob + 0x18, 0x4824a080ULL);
-    stq_le_p(mt6895_atfarg_blob + 0x80 + 0x10, 0x4824a900ULL);
-    /*
-     * DIAGNOSTIC (MTK_ATFARG_EPINFO): ATF copies the 0x58-byte block at
-     * atfarg+0x18 into its BSS with a memcpy (0x48206184 -> 0x4820fa7c).
-     * 0x58 is exactly sizeof(entry_point_info_t), so fill it as one and see
-     * whether ATF then derives the 64-bit SiP mode from the AArch64 SPSR.
-     */
-    if (MTK_ENV_CACHED("MTK_ATFARG_EPINFO")) {
-        uint8_t *e = mt6895_atfarg_blob + 0x80;
 
-        e[0x00] = 0x01;                 /* param type */
-        e[0x01] = 0x01;                 /* param version */
-        stl_le_p(e + 0x04, 0x58);       /* param size */
-        stq_le_p(e + 0x08, 0x50f00000ULL);   /* pc: BL33/LK */
-        stl_le_p(e + 0x10, 0x3c5);      /* spsr: EL1h, DAIF, AArch64 */
-        stq_le_p(e + 0x18, 0x48600000ULL);   /* args[0]: preloader boot tag */
-    }
-    stl_le_p(mt6895_atfarg_blob + 0xc10, cnt);
-    for (i = 0; i < cnt; i++) {
-        uint8_t *e = mt6895_atfarg_blob + 0xc08 + i * 0x98;
 
-        stq_le_p(e + 0x10, ents[i].start);
-        stq_le_p(e + 0x18, ents[i].size);
-        strncpy((char *)e + 0x24, ents[i].name, 0x98 - 0x24 - 1);
-    }
 }
 
 static void mt6895_place_device_table(Mt6895MachineState *s)
@@ -14285,21 +13971,11 @@ static const uint8_t stub_cmd_def[0x80] = {
                                       (const uint8_t *)mt6895_bdev_write_stub };
 
         /*
-         * EXPERIMENT (2026-11-03): boot-args struct at 0x020F7D30 is never
-         * initialised; field +0x48 (address 0x020F7D78) is used as a pointer
-         * by the boot-to-LK path (0x02049AF4) and NULL aborts at 0x020497FE.
-         * Default it to the "aee_lk" mblock allocated at 0x50700000.
          */
         static const uint8_t lk_bootarg_def[4] = { 0x00, 0x00, 0x70, 0x50 };
         planted[4] = (Mt6895Planted){ s, 0x020f7d78, 4, lk_bootarg_def };
 
         /*
-         * EXPERIMENT (2026-11-07): bl32_map_bl_params reads a physical base
-         * from the BL2_EXT BSS global at 0x62ff2098 (guest 0x62f1bd70:
-         * ldr x5,[x8,#0x98]; cbz x5 -> Wrong address). In this model GZ is
-         * loaded but never executed, so that global stays zero. The value is
-         * the tee-secmem physical base (0x7c800000); planting it models
-         * the GZ side effect without running GZ.
          */
         static const uint8_t tee_base_def[8] = {
             0x00, 0x00, 0x80, 0x7c, 0x00, 0x00, 0x00, 0x00,
@@ -14531,10 +14207,6 @@ static const uint8_t stub_cmd_def[0x80] = {
          */
         memory_region_add_subregion(sysmem, 0x4824a100ULL,
                                     &s->atf_uartobj_mr);
-        memory_region_init_io(&s->atf_arg_mr, OBJECT(s), &mt6895_atfarg_ops,
-                              s, "mt6895.atf-arg", 8);
-        memory_region_add_subregion_overlap(sysmem, 0x482596a8ULL,
-                                            &s->atf_arg_mr, 2);
         memory_region_init_io(&s->atf_log_mr, OBJECT(s), &mt6895_atflog_ops,
                               s, "mt6895.atf-log", 0xb0);
         if (!MTK_ENV_CACHED("MTK_NO_ATFLOG")) {
@@ -14952,35 +14624,6 @@ static const uint8_t stub_cmd_def[0x80] = {
                     error_get_pretty(err));
         }
         mt6895_place_device_table(s);
-        mt6895_plant_atfarg(s);
-        memory_region_init_io(&s->atfarg_mr, OBJECT(s), &mt6895_atfargblob_ops, s,
-                              "mt6895.atfarg", 0x2000);
-        if (!MTK_ENV_CACHED("MTK_NO_ATFARG")) {
-            static MemoryRegion atfarg_lo;
-
-            static MemoryRegion bss_alias;
-
-            memory_region_init_alias(&atfarg_lo, OBJECT(s), "mt6895.atfarg.lo",
-                                     &s->atfarg_mr, 0, 0x1000);
-            memory_region_add_subregion_overlap(sysmem, 0x4824a000ULL,
-                                                &atfarg_lo, 1);
-            memory_region_init_alias(&bss_alias, OBJECT(s), "mt6895.atfarg.bss",
-                                     s->ddr, 0x824b000, 0x1000);
-            memory_region_add_subregion_overlap(sysmem, 0x4824b000ULL,
-                                                &bss_alias, 2);
-
-            /*
-             * The ATF's BSS starts at 0x4824b000; keep real RAM visible there
-             * (priority 2) so its cold-entry clear still lands in DRAM while
-             * the mblock table can extend past the old 0x1000 window.
-             */
-        }
-        /*
-         * ATF's early platform setup reads the atfarg straight from the
-         * pointer BL2 passes in x0 (0x7c800000), while its later mblock
-         * lookup goes through the global that points at 0x4824a000. Serve
-         * the same blob at both addresses.
-         */
         /*
          * APUSYS peri window: ATF's SMC handler stores per-op records at
          * 0x10355004 + op*0x20 (low/high addr and value), and LK polls the
@@ -14994,12 +14637,6 @@ static const uint8_t stub_cmd_def[0x80] = {
                                    "mt6895.apusys_peri", 0x1000, &error_abort);
             memory_region_add_subregion_overlap(sysmem, 0x10355000ULL,
                                                 &apusys_peri_mr, 2);
-        }
-        memory_region_init_io(&s->atfarg2_mr, OBJECT(s), &mt6895_atfarg2_ops,
-                              s, "mt6895.atfarg2", 0x100);
-        if (!MTK_ENV_CACHED("MTK_NO_ATFARG2")) {
-            memory_region_add_subregion_overlap(sysmem, 0x7c800000ULL,
-                                                &s->atfarg2_mr, 1);
         }
         /*
          * ATF reads a context pointer from 0x4825a110 and dereferences
