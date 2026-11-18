@@ -9,6 +9,7 @@
  */
 
 #include "qemu/osdep.h"
+#include "qemu/mtk-env.h"
 #include "qemu/units.h"
 #include "qapi/error.h"
 #include "qemu/memalign.h"
@@ -178,7 +179,7 @@ static void mtk_ufs_scsi_command_complete(SCSIRequest *scsi_req, size_t resid)
     int16_t status = scsi_req->status;
     uint32_t transfered_len = scsi_req->cmd.xfer - resid;
 
-    if (getenv("MTK_UFS_CDB")) {
+    if (MTK_ENV_CACHED("MTK_UFS_CDB")) {
         static int ncc;
 
         if (ncc < 30) {
@@ -198,7 +199,7 @@ static void mtk_ufs_scsi_command_complete(SCSIRequest *scsi_req, size_t resid)
     mtk_ufs_build_scsi_response_upiu(req, scsi_req->sense, scsi_req->sense_len,
                                  transfered_len, status);
 
-    if (getenv("MTK_UFS_CDB") && status == GOOD && req->sg &&
+    if (MTK_ENV_CACHED("MTK_UFS_CDB") && status == GOOD && req->sg &&
         req->sg->sg && req->sg->nsg) {
         static int ndump;
 
@@ -767,7 +768,7 @@ static UfsReqResult mtk_ufs_emulate_scsi_cmd(UfsLu *lu, UfsRequest *req)
 {
     uint8_t lun = lu->lun;
 
-    if (getenv("MTK_UFS_CDB")) {
+    if (MTK_ENV_CACHED("MTK_UFS_CDB")) {
         static int nw;
 
         if (nw < 60) {
@@ -854,7 +855,7 @@ static UfsReqResult mtk_ufs_process_scsi_cmd(UfsLu *lu, UfsRequest *req)
 {
     uint8_t task_tag = req->req_upiu.header.task_tag;
 
-    if (getenv("MTK_UFS_CDB")) {
+    if (MTK_ENV_CACHED("MTK_UFS_CDB")) {
         static int ncdb;
 
         if (ncdb < 80) {

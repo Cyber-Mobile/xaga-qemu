@@ -34,6 +34,7 @@
 #include "qemu/osdep.h"
 #include "qemu/log.h"
 #include "qemu/module.h"
+#include "qemu/mtk-env.h"
 #include "hw/core/qdev-properties.h"
 #include "hw/core/sysbus.h"
 #include "qom/object.h"
@@ -377,7 +378,7 @@ static uint64_t mtk_scpsys_read(void *opaque, hwaddr offset, unsigned size)
             if (mtk_scpsys_is_mcupm_handshake_reg(o & ~3u)) {
                 reg |= MCUPM_HANDSHAKE_MASK;
             }
-            if (getenv("MTK_SCP0") && (o & ~3u) >= 0xc00 && (o & ~3u) <= 0xc80) {
+            if (MTK_ENV_CACHED("MTK_SCP0") && (o & ~3u) >= 0xc00 && (o & ~3u) <= 0xc80) {
                 static int n;
 
                 if (n < 40) {
@@ -444,7 +445,7 @@ static void mtk_scpsys_write(void *opaque, hwaddr offset, uint64_t value,
             uint32_t mask = 0xffu << shift;
 
             if ((o & ~3u) >= 0x069c && (o & ~3u) <= 0x06b8 &&
-                !getenv("MTK_NO_SEMTOGGLE")) {
+                !MTK_ENV_CACHED("MTK_NO_SEMTOGGLE")) {
                 /*
                  * SPM hardware semaphores: writing 1 toggles ownership
                  * (acquire when free, release when held), so a release
@@ -456,7 +457,7 @@ static void mtk_scpsys_write(void *opaque, hwaddr offset, uint64_t value,
             }
             *reg = (*reg & ~mask) |
                    ((((uint32_t)value >> (8 * i)) & 0xff) << shift);
-            if (getenv("MTK_SCP0") && (o & ~3u) >= 0xc00 && (o & ~3u) <= 0xc80) {
+            if (MTK_ENV_CACHED("MTK_SCP0") && (o & ~3u) >= 0xc00 && (o & ~3u) <= 0xc80) {
                 static int nw;
 
                 if (nw < 40) {

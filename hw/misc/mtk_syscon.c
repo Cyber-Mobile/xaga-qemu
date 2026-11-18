@@ -23,6 +23,7 @@
 #include "qemu/osdep.h"
 #include "qemu/log.h"
 #include "qemu/module.h"
+#include "qemu/mtk-env.h"
 #include "hw/core/irq.h"
 #include "hw/core/qdev-properties.h"
 #include "hw/core/sysbus.h"
@@ -206,7 +207,7 @@ static bool mtk_syscon_bp_decode(MtkSysconState *s, hwaddr off,
      * enable it together with the real PWR_CON state machine, otherwise the
      * legacy constant-ack overlays in mt6895.c stay in charge.
      */
-    if (!getenv("MTK_PWR_STATE")) {
+    if (!MTK_ENV_CACHED("MTK_PWR_STATE")) {
         return false;
     }
 
@@ -313,7 +314,8 @@ static bool mtk_hwv_cg_decode(hwaddr off, int *id, int *kind)
 
 static bool mtk_hwv_cg_active(MtkSysconState *s)
 {
-    return s->name && !strcmp(s->name, "hwv") && getenv("MTK_PWR_STATE");
+    return s->name && !strcmp(s->name, "hwv") &&
+           MTK_ENV_CACHED("MTK_PWR_STATE");
 }
 
 static uint64_t mtk_syscon_read(void *opaque, hwaddr offset, unsigned size)
@@ -321,7 +323,7 @@ static uint64_t mtk_syscon_read(void *opaque, hwaddr offset, unsigned size)
     {
         MtkSysconState *sp = MTK_SYSCON(opaque);
 
-        if (getenv("MTK_PINCTRL_RD") && sp->name &&
+        if (MTK_ENV_CACHED("MTK_PINCTRL_RD") && sp->name &&
             strstr(sp->name, "pinctrl")) {
             static int np;
 
@@ -339,7 +341,7 @@ static uint64_t mtk_syscon_read(void *opaque, hwaddr offset, unsigned size)
         static hwaddr loff;
         static unsigned long cnt;
 
-        if (getenv("MTK_SPIN") && sd->name) {
+        if (MTK_ENV_CACHED("MTK_SPIN") && sd->name) {
             if (sd->name == lname && offset == loff) {
                 cnt++;
                 if (cnt == 20000 || cnt == 50000 || cnt == 100000 ||

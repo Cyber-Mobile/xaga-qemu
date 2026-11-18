@@ -22,6 +22,7 @@
  */
 
 #include "qemu/osdep.h"
+#include "qemu/mtk-env.h"
 #include "qapi/error.h"
 #include "migration/vmstate.h"
 #include "scsi/constants.h"
@@ -1077,7 +1078,7 @@ static uint64_t mtk_ufs_mmio_read(void *opaque, hwaddr addr, unsigned size)
 
     /* MTK_UFSHCI_TRACE: report every register access so the phase a driver
      * first touches the controller in can be identified. */
-    if (getenv("MTK_UFSHCI_TRACE")) {
+    if (MTK_ENV_CACHED("MTK_UFSHCI_TRACE")) {
         static int nrd;
 
         if (nrd < 120) {
@@ -1111,7 +1112,7 @@ static void mtk_ufs_mmio_write(void *opaque, hwaddr addr, uint64_t data,
 {
     UfsHc *u = (UfsHc *)opaque;
 
-    if (getenv("MTK_UFSHCI_TRACE")) {
+    if (MTK_ENV_CACHED("MTK_UFSHCI_TRACE")) {
         static int nwr;
 
         if (nwr < 120) {

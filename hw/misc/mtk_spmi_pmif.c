@@ -42,6 +42,7 @@
 #include "qemu/osdep.h"
 #include "qemu/log.h"
 #include "qemu/module.h"
+#include "qemu/mtk-env.h"
 #include "hw/core/irq.h"
 #include "hw/core/qdev-properties.h"
 #include "hw/core/sysbus.h"
@@ -429,7 +430,7 @@ static void mtk_spmi_pmif_xfer(MtkSpmiPmifState *s, unsigned chan, uint32_t cmd)
     unsigned addr = cmd & 0xffff;
     unsigned i;
 
-    if (getenv("MTK_SPMITRACE") && !rw && sid == 4) {
+    if (MTK_ENV_CACHED("MTK_SPMITRACE") && !rw && sid == 4) {
         static int nr;
 
         if (nr < 260) {
@@ -464,7 +465,7 @@ static void mtk_spmi_pmif_xfer(MtkSpmiPmifState *s, unsigned chan, uint32_t cmd)
              * "spar/alarm clear" step write 0x430c/0x4320 and wait up to
              * 500 ms for both bits to drop.  MTK_NO_RTCRSTSPAR=1 keeps it set.
              */
-            if (!getenv("MTK_NO_RTCRSTSPAR")) {
+            if (!MTK_ENV_CACHED("MTK_NO_RTCRSTSPAR")) {
                 s->pmic[9][0x0588] &= ~0x04;
             }
             if (mt6685_fqmtr_on()) {
@@ -528,7 +529,7 @@ static uint64_t mtk_spmi_pmif_read(void *opaque, hwaddr offset, unsigned size)
      * times during boot and drowns -d unimp, which is what the UFS bring-up
      * investigation needs to see.
      */
-    if (getenv("MTK_SPMI_LOG")) {
+    if (MTK_ENV_CACHED("MTK_SPMI_LOG")) {
         qemu_log_mask(LOG_UNIMP, "%s: read  off=%#x -> %#x\n",
                       TYPE_MTK_SPMI_PMIF, (unsigned)offset,
                       s->pmif_regs[offset / 4]);
@@ -547,7 +548,7 @@ static void mtk_spmi_pmif_write(void *opaque, hwaddr offset, uint64_t value,
         return;
     }
 
-    if (getenv("MTK_SPMI_LOG")) {
+    if (MTK_ENV_CACHED("MTK_SPMI_LOG")) {
         qemu_log_mask(LOG_UNIMP, "%s: write off=%#x val=%#x\n",
                   TYPE_MTK_SPMI_PMIF, (unsigned)offset, (unsigned)value);
     }

@@ -54,6 +54,16 @@ struct MtkUartState {
      * model transmits immediately), and acknowledged by reading IIR.
      */
     bool thre_ip;
+
+    /*
+     * Transmit staging buffer.  The guest writes the console one byte per
+     * register write; handing every byte to the chardev costs one host write
+     * syscall per byte (several microseconds on the Windows build host).  A
+     * line at a time is written instead.  Nothing guest-visible depends on
+     * it: LSR.THRE is raised as soon as the byte is accepted.
+     */
+    uint8_t tx_buf[256];
+    unsigned int tx_len;
 };
 
 #endif /* HW_CHAR_MTK_UART_H */

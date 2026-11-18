@@ -33,6 +33,7 @@
 #include "qemu/log.h"
 #include "qemu/timer.h"
 #include "qemu/module.h"
+#include "qemu/mtk-env.h"
 #include "hw/core/cpu.h"
 #include "hw/core/irq.h"
 #include "hw/core/qdev-properties.h"
@@ -1276,7 +1277,7 @@ static void mtk_ufshci_write(void *opaque, hwaddr offset, uint64_t value,
         s->regs[UFS_MTK_IS / 4] &= ~(uint32_t)value;
         /* EXPERIMENT: keep the UTP completion bit asserted to see whether the
          * guest actually takes interrupts at all (interrupt storm = yes). */
-        if (getenv("MTK_UFS_IRQ_STUCK")) {
+        if (MTK_ENV_CACHED("MTK_UFS_IRQ_STUCK")) {
             s->regs[UFS_MTK_IS / 4] |= 0x1;
         }
         if ((value & 0x400) && s->pwr_mode_pending) {

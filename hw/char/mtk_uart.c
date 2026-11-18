@@ -23,6 +23,7 @@
 #include "system/address-spaces.h"
 #include "qemu/log.h"
 #include "qemu/module.h"
+#include "qemu/mtk-env.h"
 #include "trace.h"
 #include "chardev/char-fe.h"
 #include "hw/char/mtk_uart.h"
@@ -197,6 +198,29 @@ static void mtk_uart_receive(void *opaque, const uint8_t *buf, int size)
     qemu_chr_fe_accept_input(&s->chr);
 }
 
+/* Flush staged transmit bytes to the chardev in one host write. */
+static void mtk_uart_tx_flush(MtkUartState *s)
+{
+    if (!s->tx_len) {
+        return;
+    }
+    qemu_chr_fe_write_all(&s->chr, s->tx_buf, s->tx_len);
+    s->tx_len = 0;
+}
+
+/*
+ * Stage one transmit byte.  Serial output is line oriented, so flush on
+ * newline (and when the staging buffer is full) to keep the console file
+ * readable while QEMU runs and identical at the end of the run.
+ */
+static void mtk_uart_tx(MtkUartState *s, uint8_t ch)
+{
+    s->tx_buf[s->tx_len++] = ch;
+    if (ch == '\n' || s->tx_len == sizeof(s->tx_buf)) {
+        mtk_uart_tx_flush(s);
+    }
+}
+
 static uint64_t mtk_uart_read(void *opaque, hwaddr offset, unsigned size)
 {
     MtkUartState *s = opaque;
@@ -259,7 +283,7 @@ static void mtk_uart_write(void *opaque, hwaddr offset, uint64_t value,
     MtkUartState *s = opaque;
     uint8_t ch = value & 0xff;
 
-    if (getenv("MTK_UART_PC")) {
+    if (MTK_ENV_CACHED("MTK_UART_PC")) {
         static int ncalls;
 
         if (ncalls < 5) {
@@ -287,7 +311,7 @@ static void mtk_uart_write(void *opaque, hwaddr offset, uint64_t value,
          * with the code that ran is the only reliable way to locate routines
          * whose entry points are not separately observable.
          */
-        if (getenv("MTK_UART_PC")) {
+        if (MTK_ENV_CACHED("MTK_UART_PC")) {
             static char line[192];
             static unsigned linelen;
             static int nlines;
@@ -416,7 +440,7 @@ static void mtk_uart_write(void *opaque, hwaddr offset, uint64_t value,
                 linelen = 0;
             }
         }
-        qemu_chr_fe_write_all(&s->chr, &ch, 1);
+        mtk_uart_tx(s, ch);
         /*
          * The byte leaves immediately, so THRE is set again and a THRE
          * interrupt becomes pending if the guest asked for one.
@@ -485,6 +509,7 @@ static void mtk_uart_reset_hold(Object *obj, ResetType type)
 {
     MtkUartState *s = MTK_UART(obj);
 
+    mtk_uart_tx_flush(s);
     mtk_uart_reset_regs(s);
     qemu_set_irq(s->irq, 0);
 }

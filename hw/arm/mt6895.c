@@ -70,6 +70,7 @@
 #include "qemu/main-loop.h"
 #include "hw/core/irq.h"
 #include "exec/cpu-common.h"
+#include "qemu/mtk-env.h"
 
 /*
  * Link-safety stub for arm_psci_set_prefer_el1(): the real (strong)
@@ -137,22 +138,7 @@ extern unsigned mtk_pc_hist_idx;
 #define MT6895_BOOTROM_A32_SERVICE  0x21ULL
 
 /* The BootROM stub, assembled from hw/arm/mt6895_bootrom.S. */
-/*
- * Cached environment probe.
- *
- * getenv() walks the whole environment block on every call, which is much too
- * expensive for the I/O callbacks that run millions of times during a boot.
- * The debug switches are read-once: cache the answer in a function-local
- * static so the hot paths only pay for a branch.
- */
-#define MTK_ENV_CACHED(name)                     \
-    ({                                           \
-        static int mtk_env_cache_ = -1;          \
-        if (mtk_env_cache_ < 0) {                \
-            mtk_env_cache_ = getenv(name) ? 1 : 0; \
-        }                                        \
-        mtk_env_cache_;                          \
-    })
+/* Cached MTK_* environment probes (see qemu/mtk-env.h). */
 
 /*
  * MTK_PCHIT=addr[,addr...] (hex): count how often each guest PC is reached and
@@ -4457,7 +4443,7 @@ static uint64_t mt6895_masp_read(void *opaque, hwaddr off, unsigned size)
         return s->masp_regs[off / 4] | MT6895_MASP_DONE_BITS;
     }
     if (off == MT6895_HACC2_START && mt6895_hacc2_done &&
-        !getenv("MTK_NO_HACC")) {
+        !MTK_ENV_CACHED("MTK_NO_HACC")) {
         return s->masp_regs[off / 4] | MT6895_HACC2_RDY;
     }
 
@@ -4475,7 +4461,7 @@ static void mt6895_masp_write(void *opaque, hwaddr off, uint64_t val,
 
     s->masp_regs[off / 4] = val;
 
-    if (getenv("MTK_NO_HACC")) {
+    if (MTK_ENV_CACHED("MTK_NO_HACC")) {
         return;
     }
     if (off == MT6895_HACC2_CON && !(val & 1)) {
@@ -5943,6 +5929,20 @@ static const MemoryRegionOps mt6895_own_ops = {
     .valid = { .min_access_size = 1, .max_access_size = 4 },
 };
 
+/*
+ * The scan timer only exists to feed the boot-chain diagnostics implemented
+ * below.  When none of them is requested, skip the timer entirely instead of
+ * dumping the ATF/mblock state every 200 ms of guest time for the whole boot.
+ */
+static bool mt6895_scan_diag_wanted(void)
+{
+    return MTK_ENV_CACHED("MTK_TICK") || MTK_ENV_CACHED("MTK_MBDUMP") ||
+           MTK_ENV_CACHED("MTK_NAMETBL_DUMP") ||
+           MTK_ENV_CACHED("MTK_CALMARK") || MTK_ENV_CACHED("MTK_GTA_FIX") ||
+           MTK_ENV_CACHED("MTK_CRYPTOBUF") || MTK_ENV_CACHED("MTK_PARTLIST") ||
+           MTK_ENV_CACHED("MTK_MBSCAN") || MTK_ENV_CACHED("MTK_ATFSCAN");
+}
+
 static void mt6895_clear_crypto_mb(void *opaque)
 {
     Mt6895MachineState *s = opaque;
@@ -6221,6 +6221,12 @@ static void mt6895_clear_crypto_mb(void *opaque)
     timer_mod(s->scan_timer,
               qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + 200000000LL);
 
+    /*
+     * Full ATF/mblock state dump.  This used to run on every 200 ms of guest
+     * time for the whole boot, putting several megabytes on stderr with no
+     * guest-visible effect.  MTK_ATFSCAN=1 restores it.
+     */
+    if (MTK_ENV_CACHED("MTK_ATFSCAN")) {
     {
         uint8_t *a = mt6895_guest_ptr(s, 0x7c800000ULL, 0x20);
         uint8_t *d = mt6895_guest_ptr(s, 0x7c800800ULL, 0x58);
@@ -6338,6 +6344,7 @@ static void mt6895_clear_crypto_mb(void *opaque)
                     "\n", k, ldq_le_p(e), ldq_le_p(e + 8));
         }
     }
+    } /* MTK_ATFSCAN */
     {
         static int pass;
         static const int64_t at[] = { 7000000000LL, 9000000000LL,
@@ -6624,10 +6631,10 @@ static uint64_t mt6895_data_win_read(void *opaque, hwaddr off, unsigned size)
         }
         static uint8_t info[11];
         static int inited;
-        const char *e2 = getenv("MTK_MEMINFO");
         unsigned bi = 0;
 
         if (!inited) {
+            const char *e2 = getenv("MTK_MEMINFO");
             const char *q = e2;
 
             while (q && *q && bi < sizeof(info)) {
@@ -14771,10 +14778,12 @@ static const uint8_t stub_cmd_def[0x80] = {
                           + gms * 1000000LL);
             }
         }
-        s->scan_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL,
-                                     mt6895_clear_crypto_mb, s);
-        timer_mod(s->scan_timer,
-                  qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + 7000000000LL);
+        if (mt6895_scan_diag_wanted()) {
+            s->scan_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL,
+                                         mt6895_clear_crypto_mb, s);
+            timer_mod(s->scan_timer,
+                      qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + 7000000000LL);
+        }
 
         if (!err && !MTK_ENV_CACHED("MTK_NO_NAMETBL")) {
             mt6895_place_name_table(s, &err);
