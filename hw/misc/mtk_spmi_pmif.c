@@ -136,6 +136,231 @@
 #define SPMI_SLV_EINT_BASE          0x20
 #define SPMI_SLV_EINT_REGS          (SPMI_MAX_SID / 4)
 
+/*
+ * Latest-command recorder.
+ *
+ * The preloader dumps the arbiter's recent commands ("[PMIF] Latest cmd
+ * lists before reboot") by reading a block of PMIF registers.  Its own read
+ * sequence (observable with MTK_PMIF_TRACE) is one header pair at 0x4f8/0x4fc
+ * followed by PMIF_CMDQ_NUM entries at 0x50c + 0x14*i, each read as two words:
+ * the command word at +0 and the data word at +4.  The command word packs
+ * exactly the fields the preloader prints:
+ *
+ *   swinf(4) cmd(4) is_write(1) slvid(4) bytecnt(3) addr(16)
+ *
+ * (the printed cmd is the normalised SPMI opcode the driver put in the ACC
+ * register, and is_write is that ACC's rw bit).  The layout is reproduced here
+ * from that read sequence; the exact hardware packing of the "swinf" field is
+ * not established yet, so this model records the physical channel index and
+ * documents it as unresolved rather than inventing a remap.
+ */
+#define PMIF_CMDQ_HDR0          0x04f8
+#define PMIF_CMDQ_HDR1          0x04fc
+#define PMIF_CMDQ_BASE          0x0500
+#define PMIF_CMDQ_ENTRY         0x0014
+#define PMIF_CMDQ_NUM           31
+
+/*
+ * Observational tracing, opt-in through the environment.  MTK_PMIF_TRACE
+ * logs every PMIF/SPMI-master register access; MTK_SPMI_XTRACE logs every
+ * SPMI transaction as it is executed.  Both are diagnostics only: they never
+ * change what the guest sees.
+ */
+static bool mtk_pmif_trace_enabled(void)
+{
+    static int on = -1;
+
+    if (on < 0) {
+        on = getenv("MTK_PMIF_TRACE") != NULL;
+    }
+    return on;
+}
+
+static bool mtk_spmi_xtrace_enabled(void)
+{
+    static int on = -1;
+
+    if (on < 0) {
+        on = getenv("MTK_SPMI_XTRACE") != NULL;
+    }
+    return on;
+}
+
+#define MTK_PMIF_TRACE_BUDGET 200000
+
+/*
+ * PMIC parts behind the SPMI arbiter.  Which part sits at which slave id is a
+ * machine (board) property, not a controller property: the machine passes it
+ * through the "slave-map" property as a list of "sid=part" pairs.
+ *
+ * The power-on register contents of each part come from the real unit's own
+ * boot log (artifacts/r1302/lineage/real_device_boot.txt): the preloader prints
+ * every status register it reads together with the register address and the
+ * value the part returned, e.g.
+ *
+ *   [PMIC]PONSTS[0xC]=0x0   [SECOND_PMIC]POFFSTS0_1[0xD]=0x4
+ *   [MT6319]S6 RG_SLV_ID[0x136]=0xB6   [MT6685]STS_PDN_MODE0_1[0x15]=0xFFFF
+ *
+ * Those values are this part's latched power-on / power-down state, so they
+ * are modelled as the register file's reset contents.
+ *
+ * Provenance of every entry below is one of:
+ *   DIRECT  - the device's own log prints both the register address and the
+ *             value it read back (e.g. "[PMIC]POFFSTS[0xD]=0x400").
+ *   INFERRED- the value is printed by the device but the byte address inside a
+ *             multi-byte or otherwise implicit access is inferred from the SPMI
+ *             transaction trace of the same boot (see the entries marked
+ *             INFERRED below).  Nothing here is a plausible-number guess.
+ *
+ * The rail "latch" reads are INFERRED in exactly that sense: the preloader
+ * prints the rail name and the raw code it read
+ *
+ *   [MT6363] latch VBUCK5 1050000 uV(0xFC)
+ *
+ * and the SPMI trace of the same boot shows which register that latch reads
+ * (VBUCK5 -> SID4 0x1431), so 0x1431 resets to 0xFC.
+ *
+ * Registers that the device never prints are deliberately left at zero rather
+ * than invented; the one value inherited from the previous flat model
+ * (MT6363 0x001e) is marked LEGACY.
+ */
+typedef enum {
+    PMIC_PART_NONE = 0,
+    PMIC_PART_MT6363,           /* main PMIC, SPMI slave 4 */
+    PMIC_PART_MT6368,           /* second PMIC, SPMI slave 5 */
+    PMIC_PART_MT6319,           /* buck, SPMI slaves 6 and 7 */
+    PMIC_PART_MT6685,           /* RTC / auxadc PMIC, SPMI slave 9 */
+} PmicPart;
+
+typedef struct {
+    uint16_t reg;
+    uint8_t val;
+} PmicPowerOnReg;
+
+/*
+ * MT6363 (slave 4), from the real unit's boot log.  Registers 0x000a/0x000b
+ * form the 2-byte chip code the preloader prints as
+ *   [mt6363_check_cid] CHIP Code=0x6330
+ * (the preloader reads SID4 0x000a..0x000b as one 2-byte access).
+ */
+static const PmicPowerOnReg mt6363_power_on[] = {
+    /* Reg 0x09 is DIRECT ("slvid:4 rdata = 0x63"); 0x08/0x0b INFERRED equal. */
+    { 0x0008, 0x63 }, { 0x0009, 0x63 },
+    /*
+     * The preloader reads SID4 0x000a as one 2-byte access; the device prints
+     * the result as CHIP Code=0x6330, so the bytes are 0x30, 0x63.
+     */
+    { 0x000a, 0x30 }, { 0x000b, 0x63 },   /* CHIP Code = 0x6330 */
+    { 0x000c, 0x00 },                     /* PONSTS[0xC] = 0x0 */
+    { 0x000d, 0x00 }, { 0x000e, 0x04 },   /* POFFSTS[0xD] = 0x400 */
+    { 0x000f, 0x00 }, { 0x0010, 0x00 },   /* POFFSTS2_3[0xF] = 0x0 */
+    { 0x0011, 0xff }, { 0x0012, 0xff },   /* POFFSTS4_5[0x11] = 0xFFFF */
+    { 0x0013, 0x0f },                     /* POFFSTS6[0x13] = 0xF */
+    { 0x001e, 0x06 },                     /* LEGACY: not printed by device */
+    { 0x020b, 0xff }, { 0x020c, 0xff },   /* PG_SDN_STS0_1[0x20B] = 0xFFFF */
+    { 0x020d, 0xff }, { 0x020e, 0xff },   /* PG_SDN_STS2_3[0x20D] = 0xFFFF */
+    { 0x020f, 0x80 },                     /* PG_SDN_STS4[0x20F] = 0x80 */
+    { 0x0210, 0x00 }, { 0x0211, 0x00 },   /* OC_SDN_STS0_1[0x210] = 0x0 */
+    { 0x0212, 0x00 }, { 0x0213, 0x00 },   /* OC_SDN_STS2_3[0x212] = 0x0 */
+    { 0x0214, 0x00 }, { 0x0215, 0x00 },   /* VR_SDN_MODE0_1[0x214] = 0x0 */
+    { 0x0216, 0x00 }, { 0x0217, 0x00 },   /* VR_SDN_MODE2_3[0x216] = 0x0 */
+    { 0x0218, 0x00 }, { 0x0219, 0x00 },   /* VR_SDN_MODE4_5[0x218] = 0x0 */
+    { 0x021a, 0x00 }, { 0x021b, 0x00 },   /* VR_SDN_MODE6_7[0x21A] = 0x0 */
+    { 0x0a1a, 0x02 },                     /* STRUP_CON4[0xA1A] = 0x2 */
+    { 0x0a0f, 0x01 },                     /* STRUP_CON12[0xA0F] = 0x1 */
+    { 0x0139, 0x04 },                     /* WDTRSTB[0x139] = 0x4 */
+    /*
+     * Rail VSEL contents latched at boot: values DIRECT from the
+     * "[MT6363] latch <rail> <uV>(<code>)" lines, addresses INFERRED from the
+     * SPMI trace of the same boot (the latch loop reads these in rail order).
+     */
+    { 0x142d, 0x00 },                     /* VBUCK1  0 uV (0x0) */
+    { 0x142e, 0x74 },                     /* VBUCK2  550000 uV (0x74) */
+    { 0x142f, 0x00 },                     /* VBUCK3  0 uV (0x0) */
+    { 0x1430, 0x44 },                     /* VBUCK4  750000 uV (0x44) */
+    { 0x1431, 0xfc },                     /* VBUCK5  1050000 uV (0xFC) */
+    { 0x1432, 0x00 },                     /* VBUCK6  0 uV (0x0) */
+    { 0x1d24, 0x00 },                     /* VSRAM_DIGRF 400000 uV (0x0) */
+    { 0x1da9, 0x60 },                     /* VSRAM_MODEM 800000 uV (0x60) */
+    { 0x1e0e, 0x2c },                     /* VSRAM_CPUB 743750 uV (0x2C) */
+    { 0x1e24, 0x24 },                     /* VSRAM_CPUM 750000 uV (0x24) */
+    { 0x1e8e, 0x24 },                     /* VSRAM_CPUL 750000 uV (0x24) */
+};
+
+/*
+ * MT6368 (slave 5): status values DIRECT from the "[SECOND_PMIC]..." lines,
+ * rail latch values DIRECT from "[MT6368] latch ...", latch addresses INFERRED
+ * from the SPMI trace (0x1423..0x1429 read in rail order).
+ */
+static const PmicPowerOnReg mt6368_power_on[] = {
+    /* 0x09 DIRECT (spmi_read_check slvid 5); 0x08/0x0b INFERRED equal. */
+    { 0x0008, 0x68 }, { 0x0009, 0x68 },
+    /* 2-byte read at 0x000a; device prints CHIP Code=0x6830. */
+    { 0x000a, 0x30 }, { 0x000b, 0x68 },   /* CHIP Code = 0x6830 */
+    { 0x000c, 0x00 },                     /* PONSTS[0xC] = 0x0 */
+    { 0x000d, 0x04 }, { 0x000e, 0x00 },   /* POFFSTS0_1[0xD] = 0x4 */
+    { 0x000f, 0x00 }, { 0x0010, 0x00 },   /* POFFSTS2_3[0xF] = 0x0 */
+    { 0x0011, 0xff }, { 0x0012, 0xff },   /* POFFSTS4_5[0x11] = 0xFFFF */
+    { 0x0013, 0x0f },                     /* POFFSTS6[0x13] = 0xF */
+    { 0x0209, 0xff }, { 0x020a, 0xf8 },   /* PG_SDN_STS0_1[0x209] = 0xF8FF */
+    { 0x020b, 0x00 }, { 0x020c, 0x00 },   /* OC_SDN_STS0_1[0x20B] = 0x0 */
+    { 0x020d, 0x00 }, { 0x020e, 0x00 },   /* VR_SDN_MODE0_1[0x20D] = 0x0 */
+    { 0x020f, 0x00 }, { 0x0210, 0x00 },   /* VR_SDN_MODE2_3[0x20F] = 0x0 */
+    { 0x0211, 0x00 }, { 0x0212, 0x00 },   /* VR_SDN_MODE4_5[0x211] = 0x0 */
+    { 0x0213, 0x00 },                     /* VR_SDN_MODE6[0x213] = 0x0 */
+    { 0x0139, 0x04 },                     /* WDTRSTB[0x139] = 0x4 */
+    { 0x0240, 0x0c },
+    /* Rail VSEL latches: VBUCK1..6 at 0x1423..0x1428, VPA at 0x1429. */
+    { 0x1423, 0x00 },                     /* VBUCK1 0 uV (0x0) */
+    { 0x1424, 0x00 },                     /* VBUCK2 0 uV (0x0) */
+    { 0x1425, 0x00 },                     /* VBUCK3 0 uV (0x0) */
+    { 0x1426, 0x00 },                     /* VBUCK4 0 uV (0x0) */
+    { 0x1427, 0x78 },                     /* VBUCK5 500000 uV (0x78) */
+    { 0x1428, 0x5c },                     /* VBUCK6 650000 uV (0x5C) */
+    { 0x1429, 0x03 },                     /* VPA 600000 uV (0x3) */
+};
+
+/* MT6319 buck (slaves 6 and 7): status + the two latched rails of each die. */
+static const PmicPowerOnReg mt6319_s6_power_on[] = {
+    /* 0x09 DIRECT (spmi_read_check slvid 6); 0x0b INFERRED equal. */
+    { 0x0009, 0x15 }, { 0x000b, 0x15 },
+    { 0x0136, 0xb6 },                     /* RG_SLV_ID[0x136] = 0xB6 */
+    { 0x000c, 0x00 },                     /* POFFSTS[0xC] = 0x0 */
+    { 0x0a0f, 0x00 },                     /* RGS_POFFSTS[0xA0F] = 0x0 */
+    { 0x000f, 0x0f },                     /* PG_SDN_STS0[0xF] = 0xF */
+    { 0x0010, 0x00 },                     /* OC_SDN_STS0[0x10] = 0x0 */
+    { 0x1416, 0x00 },                     /* BUCK_OC_SDN_STS[0x1416] = 0x0 */
+    { 0x1451, 0x1f },                     /* BUCK_OC_SDN_EN[0x1451] = 0x1F */
+    { 0x0126, 0x04 },                     /* TOP_RST_MISC[0x126] = 0x4 */
+    { 0x1419, 0x68 },                     /* latch vcpub 493750 uV (0x68) */
+    { 0x141d, 0x00 },                     /* latch vmm 0 uV (0x0) */
+};
+
+static const PmicPowerOnReg mt6319_s7_power_on[] = {
+    /* 0x09 DIRECT (spmi_read_check slvid 7); 0x0b INFERRED equal. */
+    { 0x0009, 0x15 }, { 0x000b, 0x15 },
+    { 0x0136, 0xb7 },                     /* RG_SLV_ID[0x136] = 0xB7 */
+    { 0x000c, 0x00 },
+    { 0x0a0f, 0x00 },
+    { 0x000f, 0x0f },
+    { 0x0010, 0x00 },
+    { 0x1416, 0x00 },
+    { 0x1451, 0x1f },
+    { 0x0126, 0x04 },
+    { 0x1419, 0x78 },                     /* latch vcpum 500000 uV (0x78) */
+    { 0x141d, 0x74 },                     /* latch vcpul 550000 uV (0x74) */
+};
+
+/* MT6685 RTC/auxadc PMIC (slave 9), from the "[MT6685]..." lines. */
+static const PmicPowerOnReg mt6685_power_on[] = {
+    /* 0x09 DIRECT (spmi_read_check slvid 9); 0x08/0x0b INFERRED equal. */
+    { 0x0008, 0x85 }, { 0x0009, 0x85 }, { 0x000b, 0x85 },
+    { 0x000c, 0x00 },                     /* PONSTS[0xC] = 0x0 */
+    { 0x000d, 0x00 }, { 0x000e, 0x00 },   /* POFFSTS0_1[0xD] = 0x0 */
+    { 0x0013, 0x7f },                     /* PG_OC_SDN_STS0[0x13] = 0x7F */
+    { 0x0015, 0xff }, { 0x0016, 0xff },   /* STS_PDN_MODE0_1[0x15] = 0xFFFF */
+};
+
 struct MtkSpmiPmifState {
     SysBusDevice parent_obj;
 
@@ -148,10 +373,73 @@ struct MtkSpmiPmifState {
     /* One register space per SPMI slave id: 16-bit address, 8-bit value */
     uint8_t pmic[SPMI_MAX_SID][SPMI_PMIC_REG_SPACE];
 
+    /* Board description: which PMIC part responds at each slave id. */
+    char *slave_map;
+    PmicPart slave_part[SPMI_MAX_SID];
+
+    /* Latest-command log: ring of the last PMIF_CMDQ_NUM commands. */
+    unsigned cmdq_head;
+    unsigned cmdq_count;
+
+    /* Realisation index; only used to tell the two PMIF instances apart in the
+     * MTK_PMIF_TRACE diagnostic. */
+    unsigned inst;
+
     /* SPMI RCS interrupt output (level, to the EINT controller). */
     qemu_irq rcs_irq;
     bool trace;
 };
+
+static void mtk_spmi_pmif_seed(MtkSpmiPmifState *s, unsigned sid,
+                               const PmicPowerOnReg *regs, unsigned n)
+{
+    unsigned i;
+
+    for (i = 0; i < n; i++) {
+        s->pmic[sid][regs[i].reg] = regs[i].val;
+    }
+}
+
+/*
+ * Load each described part's power-on register contents.
+ */
+static void mtk_spmi_pmif_seed_parts(MtkSpmiPmifState *s)
+{
+    unsigned sid;
+
+    for (sid = 0; sid < SPMI_MAX_SID; sid++) {
+        switch (s->slave_part[sid]) {
+        case PMIC_PART_MT6363:
+            mtk_spmi_pmif_seed(s, sid, mt6363_power_on,
+                               ARRAY_SIZE(mt6363_power_on));
+            break;
+        case PMIC_PART_MT6368:
+            mtk_spmi_pmif_seed(s, sid, mt6368_power_on,
+                               ARRAY_SIZE(mt6368_power_on));
+            break;
+        case PMIC_PART_MT6319:
+            /*
+             * The two MT6319 dies are different instances of the same part;
+             * the board identifies them by slave id, and each die's latched
+             * register contents differ (real log S6/S7 sections).
+             */
+            if (sid == 6) {
+                mtk_spmi_pmif_seed(s, sid, mt6319_s6_power_on,
+                                   ARRAY_SIZE(mt6319_s6_power_on));
+            } else {
+                mtk_spmi_pmif_seed(s, sid, mt6319_s7_power_on,
+                                   ARRAY_SIZE(mt6319_s7_power_on));
+            }
+            break;
+        case PMIC_PART_MT6685:
+            mtk_spmi_pmif_seed(s, sid, mt6685_power_on,
+                               ARRAY_SIZE(mt6685_power_on));
+            break;
+        default:
+            break;
+        }
+    }
+}
 
 void mtk_spmi_pmif_set_pmic_reg(DeviceState *dev, unsigned sid,
                                 unsigned reg, uint8_t val)
@@ -224,69 +512,29 @@ static void mtk_spmi_pmif_reset(DeviceState *dev)
     }
 
     /*
-     * INIT_DONE reads as 1: the driver only gates on the channel handshake,
-     * but a zero here would look like "the arbiter never came out of reset".
+     * The arbiter reports "not initialised" until software runs its enable
+     * sequence; the real device's first is_pmif_spmi_init_done() call reads 0
+     * and only the post-enable call reads 1
+     *   ([PMIF] is_pmif_spmi_init_done ret = 0 -> ...enable steps... -> ret = 1).
+     * mtk_spmi_pmif_write() completes the handshake when the enable registers
+     * are written.
      */
-    s->pmif_regs[PMIF_INIT_DONE / 4] = 1;
+    s->pmif_regs[PMIF_INIT_DONE / 4] = 0;
 
     memset(s->pmic, 0, sizeof(s->pmic));
+    s->cmdq_head = 0;
+    s->cmdq_count = 0;
 
     /*
-     * SPMI calibration check table values (Preloader platform/mt6895/src/drivers/spmi.c):
-     * Check 0: slvid 4 (MT6363 / main PMIC), reg 0x09: exp 0x63, mask 0xf0
-     * Check 1: slvid 9 (sub PMIC),           reg 0x09: exp 0x85, mask 0xf0
-     * Check 2: slvid 6 (PMIC),               reg 0x09: exp 0x15, mask 0xf0
-     * Check 3: slvid 7 (PMIC),               reg 0x09: exp 0x15, mask 0xf0
-     * Check 4: slvid 5 (MT6368 PMIC),        reg 0x09: exp 0x68, mask 0xf0
-     * Check 5: slvid 5 (MT6368 PMIC),        reg 0x240: exp 0x0c, mask 0x0c
+     * Load the power-on register contents of the PMIC parts the board puts on
+     * this SPMI bus.  Besides the latched status/rail values, this supplies the
+     * part ids that the preloader's SPMI calibration check table validates:
+     *   slvid 4 reg 0x09 = 0x63, slvid 9 = 0x85, slvid 6/7 = 0x15,
+     *   slvid 5 = 0x68 and reg 0x240 = 0x0c,
+     * and the 2-byte chip codes the PMIC drivers print ([mt6363_check_cid]
+     * CHIP Code=0x6330, [second_pmic_check_cid] CHIP Code=0x6830).
      */
-    /* Slave 4: MT6363 main PMIC */
-    /*
-     * MTK_PMIC_VDD2L: give the buck-core register window a plausible voltage
-     * so the boot chain's "get vdd2l" step succeeds.  The preloader reads
-     * PMIC SID-4 registers 0x1a1b..0x1a4c to obtain the VDD2L setting; with
-     * them at zero it reports
-     *   "Need reset vdd2l for fist time!" / "get vdd2l fail"
-     * and the DRAM description it builds is invalid ("dram info unset"),
-     * which makes every boot look cold and loops the DRAM retrain.
-     */
-    if (getenv("MTK_PMIC_VDD2L")) {
-        unsigned r;
-
-        for (r = 0x1a00; r < 0x1b00; r++) {
-            s->pmic[4][r] = 0x50;
-        }
-        for (r = 0x1400; r < 0x1500; r++) {
-            s->pmic[4][r] = 0x50;
-        }
-    }
-
-    s->pmic[4][0x0008] = MT6363_CHIP_ID;
-    s->pmic[4][0x0009] = MT6363_CHIP_ID;
-    s->pmic[4][0x000a] = 0x00;
-    s->pmic[4][0x000b] = MT6363_CHIP_ID;
-    s->pmic[4][0x001e] = 0x06;
-
-    /* Slave 9: sub PMIC */
-    s->pmic[9][0x0008] = 0x85;
-    s->pmic[9][0x0009] = 0x85;
-    s->pmic[9][0x000b] = 0x85;
-
-    /* Slave 6 */
-    s->pmic[6][0x0008] = 0x15;
-    s->pmic[6][0x0009] = 0x15;
-    s->pmic[6][0x000b] = 0x15;
-
-    /* Slave 7 */
-    s->pmic[7][0x0008] = 0x15;
-    s->pmic[7][0x0009] = 0x15;
-    s->pmic[7][0x000b] = 0x15;
-
-    /* Slave 5: MT6368 PMIC */
-    s->pmic[5][0x0008] = 0x68;
-    s->pmic[5][0x0009] = 0x68;
-    s->pmic[5][0x000b] = 0x68;
-    s->pmic[5][0x0240] = 0x0c;
+    mtk_spmi_pmif_seed_parts(s);
 }
 
 /*
@@ -422,8 +670,33 @@ static void mt6685_fqmtr_write(MtkSpmiPmifState *s, unsigned addr,
     r[MT6685_FQMTR_CON0] &= ~0x08;
 }
 
+/*
+ * Append one completed transaction to the latest-command recorder.
+ */
+static void mtk_spmi_pmif_record_cmd(MtkSpmiPmifState *s, unsigned chan,
+                                     unsigned opc, unsigned rw, unsigned sid,
+                                     unsigned len, unsigned addr, uint32_t data)
+{
+    unsigned slot = PMIF_CMDQ_BASE + s->cmdq_head * PMIF_CMDQ_ENTRY;
+    uint32_t word;
+
+    word = ((chan & 0xf) << 28) |
+           ((opc & 0xf) << 24) |
+           ((rw & 0x1) << 23) |
+           ((sid & 0xf) << 19) |
+           (((len - 1) & 0x7) << 16) |
+           (addr & 0xffff);
+
+    s->pmif_regs[(slot + 0xc) / 4] = word;
+    s->pmif_regs[(slot + 0x10) / 4] = data;
+
+    s->cmdq_head = (s->cmdq_head + 1) % PMIF_CMDQ_NUM;
+    s->cmdq_count++;
+}
+
 static void mtk_spmi_pmif_xfer(MtkSpmiPmifState *s, unsigned chan, uint32_t cmd)
 {
+    unsigned opc = (cmd >> 30) & 0x3;
     unsigned rw = (cmd >> 29) & 0x1;
     unsigned sid = (cmd >> 24) & 0xf;
     unsigned len = ((cmd >> 16) & 0xff) + 1;
@@ -498,6 +771,11 @@ static void mtk_spmi_pmif_xfer(MtkSpmiPmifState *s, unsigned chan, uint32_t cmd)
             }
         }
 
+        if (mtk_spmi_xtrace_enabled()) {
+            fprintf(stderr, "MTK-SPMI[%u] wr ch=%u sid=%u addr=%#x len=%u data=%#x\n",
+                    s->inst, chan, sid, addr, len, data);
+        }
+        mtk_spmi_pmif_record_cmd(s, chan, opc, rw, sid, len, addr, data);
         /*
          * A write has no payload for the guest to collect, so the channel is
          * done as soon as the command is accepted. Only a read parks in
@@ -513,6 +791,11 @@ static void mtk_spmi_pmif_xfer(MtkSpmiPmifState *s, unsigned chan, uint32_t cmd)
         }
         s->pmif_regs[PMIF_SWINF_RDATA(chan) / 4] = data;
         s->pmif_regs[PMIF_SWINF_STA(chan) / 4] = SWINF_WFVLDCLR_VAL;
+        if (mtk_spmi_xtrace_enabled()) {
+            fprintf(stderr, "MTK-SPMI[%u] rd ch=%u sid=%u addr=%#x len=%u data=%#x\n",
+                    s->inst, chan, sid, addr, len, data);
+        }
+        mtk_spmi_pmif_record_cmd(s, chan, opc, rw, sid, len, addr, data);
     }
 }
 
@@ -534,6 +817,16 @@ static uint64_t mtk_spmi_pmif_read(void *opaque, hwaddr offset, unsigned size)
                       TYPE_MTK_SPMI_PMIF, (unsigned)offset,
                       s->pmif_regs[offset / 4]);
     }
+    if (mtk_pmif_trace_enabled()) {
+        static int budget;
+
+        if (budget < MTK_PMIF_TRACE_BUDGET) {
+            budget++;
+            fprintf(stderr, "MTK-PMIF[%u] rd off=%#x size=%u -> %#x\n",
+                    s->inst, (unsigned)offset, size,
+                    s->pmif_regs[offset / 4]);
+        }
+    }
 
     return s->pmif_regs[offset / 4];
 }
@@ -552,6 +845,15 @@ static void mtk_spmi_pmif_write(void *opaque, hwaddr offset, uint64_t value,
         qemu_log_mask(LOG_UNIMP, "%s: write off=%#x val=%#x\n",
                   TYPE_MTK_SPMI_PMIF, (unsigned)offset, (unsigned)value);
     }
+    if (mtk_pmif_trace_enabled()) {
+        static int budget;
+
+        if (budget < MTK_PMIF_TRACE_BUDGET) {
+            budget++;
+            fprintf(stderr, "MTK-PMIF[%u] wr off=%#x size=%u val=%#x\n",
+                    s->inst, (unsigned)offset, size, (unsigned)value);
+        }
+    }
 
     for (chan = 0; chan < PMIF_NUM_CHANS; chan++) {
         if (offset == PMIF_SWINF_ACC(chan)) {
@@ -567,6 +869,18 @@ static void mtk_spmi_pmif_write(void *opaque, hwaddr offset, uint64_t value,
     }
 
     s->pmif_regs[offset / 4] = value;
+
+    /*
+     * Init handshake: the enable sequence (force normal mode, enable the
+     * software interfaces, the command issue path and the arbiter) is what
+     * brings the block out of reset; complete INIT_DONE once those registers
+     * have been driven, the way the real arbiter does.
+     */
+    if ((offset == PMIF_INF_EN || offset == PMIF_ARB_EN ||
+         offset == PMIF_CMDISSUE_EN || offset == PMIF_SPI_MODE_CTRL) &&
+        value) {
+        s->pmif_regs[PMIF_INIT_DONE / 4] |= 1;
+    }
 }
 
 static const MemoryRegionOps mtk_spmi_pmif_ops = {
@@ -596,6 +910,15 @@ static uint64_t mtk_spmi_mst_read(void *opaque, hwaddr offset, unsigned size)
     if (offset + 4 > sizeof(s->mst_regs)) {
         return 0;
     }
+    if (mtk_pmif_trace_enabled()) {
+        static int budget;
+
+        if (budget < MTK_PMIF_TRACE_BUDGET) {
+            budget++;
+            fprintf(stderr, "MTK-SPMIMST rd off=%#x size=%u -> %#x\n",
+                    (unsigned)offset, size, s->mst_regs[offset / 4]);
+        }
+    }
     return s->mst_regs[offset / 4];
 }
 
@@ -606,6 +929,15 @@ static void mtk_spmi_mst_write(void *opaque, hwaddr offset, uint64_t value,
 
     if (offset + 4 > sizeof(s->mst_regs)) {
         return;
+    }
+    if (mtk_pmif_trace_enabled()) {
+        static int budget;
+
+        if (budget < MTK_PMIF_TRACE_BUDGET) {
+            budget++;
+            fprintf(stderr, "MTK-SPMIMST wr off=%#x size=%u val=%#x\n",
+                    (unsigned)offset, size, (unsigned)value);
+        }
     }
 
     /*
@@ -641,9 +973,68 @@ static const MemoryRegionOps mtk_spmi_mst_ops = {
     },
 };
 
+static PmicPart mtk_spmi_pmif_part_by_name(const char *name, size_t len)
+{
+    static const struct {
+        const char *name;
+        PmicPart part;
+    } names[] = {
+        { "mt6363", PMIC_PART_MT6363 },
+        { "mt6368", PMIC_PART_MT6368 },
+        { "mt6319", PMIC_PART_MT6319 },
+        { "mt6685", PMIC_PART_MT6685 },
+    };
+    size_t i;
+
+    for (i = 0; i < ARRAY_SIZE(names); i++) {
+        if (strlen(names[i].name) == len &&
+            memcmp(names[i].name, name, len) == 0) {
+            return names[i].part;
+        }
+    }
+    return PMIC_PART_NONE;
+}
+
+/*
+ * "slave-map" is the board's description of which PMIC part responds at which
+ * SPMI slave id, e.g. "4=mt6363,5=mt6368,6=mt6319,7=mt6319,9=mt6685".
+ */
+static void mtk_spmi_pmif_parse_slave_map(MtkSpmiPmifState *s)
+{
+    const char *p = s->slave_map;
+
+    memset(s->slave_part, 0, sizeof(s->slave_part));
+    while (p && *p) {
+        char *end;
+        char name[16];
+        unsigned sid;
+        size_t n = 0;
+
+        sid = strtoul(p, &end, 10);
+        if (end == p || *end != '=') {
+            break;
+        }
+        p = end + 1;
+        while (*p && *p != ',' && n < sizeof(name) - 1) {
+            name[n++] = *p++;
+        }
+        name[n] = 0;
+        if (sid < SPMI_MAX_SID) {
+            s->slave_part[sid] = mtk_spmi_pmif_part_by_name(name, n);
+        }
+        if (*p == ',') {
+            p++;
+        }
+    }
+}
+
 static void mtk_spmi_pmif_realize(DeviceState *dev, Error **errp)
 {
     MtkSpmiPmifState *s = MTK_SPMI_PMIF(dev);
+    static unsigned next_inst;
+
+    s->inst = next_inst++;
+    mtk_spmi_pmif_parse_slave_map(s);
 
     memory_region_init_io(&s->pmif, OBJECT(s), &mtk_spmi_pmif_ops, s,
                           TYPE_MTK_SPMI_PMIF ".pmif", 0x1000);
@@ -657,11 +1048,16 @@ static void mtk_spmi_pmif_realize(DeviceState *dev, Error **errp)
     s->trace = getenv("MTK_PMICLOG") != NULL;
 }
 
+static const Property mtk_spmi_pmif_props[] = {
+    DEFINE_PROP_STRING("slave-map", MtkSpmiPmifState, slave_map),
+};
+
 static void mtk_spmi_pmif_class_init(ObjectClass *klass, const void *data)
 {
     DeviceClass *dc = DEVICE_CLASS(klass);
 
     dc->realize = mtk_spmi_pmif_realize;
+    device_class_set_props(dc, mtk_spmi_pmif_props);
     device_class_set_legacy_reset(dc, mtk_spmi_pmif_reset);
     dc->desc = "MediaTek SPMI PMIC arbiter";
 }
