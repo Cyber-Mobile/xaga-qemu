@@ -5195,6 +5195,7 @@ typedef struct MtkBl2PcSample {
 } MtkBl2PcSample;
 
 #define MTK_BL2PC_RING 256
+#define MTK_BL2PC_ANY 64
 static struct {
     bool enabled;
     QEMUTimer *timer;
@@ -5210,11 +5211,22 @@ static struct {
     bool blr_seen;
     uint64_t blr_pc, blr_x0, blr_x1, blr_x2, blr_x3, blr_x4, blr_x25;
     uint64_t blr_esr, blr_elr, blr_spsr, blr_vbar, blr_sctlr, blr_tcr;
+    bool pc200_seen;
+    unsigned pc200_count;
+    bool stub_seen;
+    uint64_t stub_pc, stub_x0, stub_x1, stub_x2, stub_x3, stub_x4, stub_x25;
+    bool atf_seen, brom_seen, atf_left;
+    uint64_t atf_first_ns, atf_last_ns, brom_first_ns, pc200_first_ns;
+    uint64_t atf_left_ns, atf_left_last_pc;
+    uint64_t atf_left_esr, atf_left_elr, atf_left_spsr;
+    uint64_t atf_left_vbar, atf_left_sctlr, atf_left_tcr, atf_left_pc;
+    uint64_t atf_hist_key[64];
+    unsigned atf_hist_cnt[64];
     bool have_mmio;
     uint64_t mmio_pa, mmio_val;
     unsigned mmio_write;
     MtkBl2PcSample ring[MTK_BL2PC_RING];
-    MtkBl2PcSample any[16];
+    MtkBl2PcSample any[MTK_BL2PC_ANY];
     unsigned any_head, any_count;
 } mtk_bl2pc;
 
@@ -5255,6 +5267,34 @@ static void mtk_bl2pc_print(unsigned n, const char *why)
                 "\n", mtk_bl2pc.mmio_write ? 'W' : 'R',
                 mtk_bl2pc.mmio_pa, mtk_bl2pc.mmio_val);
     }
+    {
+        CPUState *cs = qemu_get_cpu(0);
+        CPUARMState *env = cs ? cpu_env(cs) : NULL;
+
+        if (env) {
+            fprintf(stderr, "  now-el3 esr=%#" PRIx64 " elr=%016" PRIx64
+                    " spsr=%#" PRIx64 " vbar=%016" PRIx64 " sctlr=%016"
+                    PRIx64 " tcr=%016" PRIx64 " pc=%016" PRIx64 "\n",
+                    env->cp15.esr_el[3], env->elr_el[3],
+                    (uint64_t)(env->pstate | env->daif),
+                    env->cp15.vbar_el[3], env->cp15.sctlr_el[3],
+                    env->cp15.tcr_el[3], (uint64_t)env->pc);
+        }
+    }
+    fprintf(stderr, "  markers pc200=%s(%u) stub=%s"
+            " walker_path=%s\n",
+            mtk_bl2pc.pc200_seen ? "yes" : "no", mtk_bl2pc.pc200_count,
+            mtk_bl2pc.stub_seen ? "yes" : "no",
+            mtk_bl2pc.walker_path == 1 ? "fail(returned0)" :
+            mtk_bl2pc.walker_path == 2 ? "ok" : "unseen");
+    if (mtk_bl2pc.stub_seen) {
+        fprintf(stderr, "  stub pc=%016" PRIx64 " x0=%016" PRIx64
+                " x1=%016" PRIx64 " x2=%016" PRIx64 " x3=%016" PRIx64
+                " x4=%016" PRIx64 " x25=%016" PRIx64 "\n",
+                mtk_bl2pc.stub_pc, mtk_bl2pc.stub_x0, mtk_bl2pc.stub_x1,
+                mtk_bl2pc.stub_x2, mtk_bl2pc.stub_x3, mtk_bl2pc.stub_x4,
+                mtk_bl2pc.stub_x25);
+    }
     fprintf(stderr, "  el3 vbar=%016" PRIx64 " vbar_changes=%u"
             " walker_path=%s\n", mtk_bl2pc.vbar_last,
             mtk_bl2pc.vbar_changes,
@@ -5272,6 +5312,43 @@ static void mtk_bl2pc_print(unsigned n, const char *why)
                 " tcr=%016" PRIx64 "\n", mtk_bl2pc.blr_esr,
                 mtk_bl2pc.blr_elr, mtk_bl2pc.blr_spsr, mtk_bl2pc.blr_vbar,
                 mtk_bl2pc.blr_sctlr, mtk_bl2pc.blr_tcr);
+    }
+    fprintf(stderr, "  timeline atf_seen=%u first_ns=%" PRId64
+            " last_ns=%" PRId64 " brom_seen=%u brom_first_ns=%" PRId64
+            " pc200_first_ns=%" PRId64 "\n",
+            mtk_bl2pc.atf_seen, mtk_bl2pc.atf_first_ns, mtk_bl2pc.atf_last_ns,
+            mtk_bl2pc.brom_seen, mtk_bl2pc.brom_first_ns,
+            mtk_bl2pc.pc200_first_ns);
+    if (mtk_bl2pc.atf_left) {
+        fprintf(stderr, "  atf-left at_ns=%" PRId64 " last_pc=%016" PRIx64
+                " esr=%#" PRIx64 " elr=%016" PRIx64 " spsr=%#" PRIx64
+                " vbar=%016" PRIx64 " sctlr=%016" PRIx64
+                " tcr=%016" PRIx64 "\n", mtk_bl2pc.atf_left_ns,
+                mtk_bl2pc.atf_left_last_pc, mtk_bl2pc.atf_left_esr,
+                mtk_bl2pc.atf_left_elr, mtk_bl2pc.atf_left_spsr,
+                mtk_bl2pc.atf_left_vbar, mtk_bl2pc.atf_left_sctlr,
+                mtk_bl2pc.atf_left_tcr);
+    }
+    {
+        uint64_t keys[64];
+        unsigned cnts[64], hi, hj;
+
+        memcpy(keys, mtk_bl2pc.atf_hist_key, sizeof(keys));
+        memcpy(cnts, mtk_bl2pc.atf_hist_cnt, sizeof(cnts));
+        for (hi = 0; hi < 64; hi++) {
+            for (hj = hi + 1; hj < 64; hj++) {
+                if (cnts[hj] > cnts[hi]) {
+                    uint64_t tk = keys[hi]; unsigned tc = cnts[hi];
+                    keys[hi] = keys[hj]; cnts[hi] = cnts[hj];
+                    keys[hj] = tk; cnts[hj] = tc;
+                }
+            }
+        }
+        fprintf(stderr, "  atf-hist top:");
+        for (hi = 0; hi < 8 && cnts[hi]; hi++) {
+            fprintf(stderr, " %016" PRIx64 "x%u", keys[hi], cnts[hi]);
+        }
+        fprintf(stderr, "\n");
     }
 }
 
@@ -5291,7 +5368,7 @@ static void mtk_bl2pc_tick(void *opaque)
     }
     env = cpu_env(cs);
     timer_mod(mtk_bl2pc.timer,
-              qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + 1000000);
+              qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + 100000);
     pc = env->pc;
     {
         uint64_t lopc = pc & 0x0000ffffffffffffULL;
@@ -5300,6 +5377,20 @@ static void mtk_bl2pc_tick(void *opaque)
         if (vb != mtk_bl2pc.vbar_last) {
             mtk_bl2pc.vbar_last = vb;
             mtk_bl2pc.vbar_changes++;
+        }
+        if (lopc == 0x200ULL && !mtk_bl2pc.pc200_seen) {
+            mtk_bl2pc.pc200_seen = true;
+            mtk_bl2pc.pc200_count = mtk_bl2pc.any_count;
+        }
+        if (lopc >= 0x62f05c00ULL && lopc < 0x62f05d00ULL) {
+            mtk_bl2pc.stub_seen = true;
+            mtk_bl2pc.stub_pc = pc;
+            mtk_bl2pc.stub_x0 = env->xregs[0];
+            mtk_bl2pc.stub_x1 = env->xregs[1];
+            mtk_bl2pc.stub_x2 = env->xregs[2];
+            mtk_bl2pc.stub_x3 = env->xregs[3];
+            mtk_bl2pc.stub_x4 = env->xregs[4];
+            mtk_bl2pc.stub_x25 = env->xregs[25];
         }
         if (lopc >= 0x62f0c5b8ULL && lopc < 0x62f0c5dcULL) {
             mtk_bl2pc.walker_path = 1;
@@ -5323,11 +5414,49 @@ static void mtk_bl2pc_tick(void *opaque)
             mtk_bl2pc.blr_tcr = env->cp15.tcr_el[3];
         }
     }
+    {
+        uint64_t lopc = pc & 0x0000ffffffffffffULL;
+        uint64_t now_ns = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+        bool in_atf = lopc >= 0x48200000ULL && lopc < 0x48300000ULL;
+
+        if (in_atf) {
+            unsigned idx = (unsigned)(((lopc >> 4) * 2654435761u) & 63);
+
+            if (!mtk_bl2pc.atf_seen) {
+                mtk_bl2pc.atf_seen = true;
+                mtk_bl2pc.atf_first_ns = now_ns;
+            }
+            mtk_bl2pc.atf_last_ns = now_ns;
+            if (mtk_bl2pc.atf_hist_cnt[idx] == 0) {
+                mtk_bl2pc.atf_hist_key[idx] = lopc;
+            }
+            mtk_bl2pc.atf_hist_cnt[idx]++;
+        } else if (mtk_bl2pc.atf_seen && !mtk_bl2pc.atf_left &&
+                   lopc < 0x48200000ULL) {
+            mtk_bl2pc.atf_left = true;
+            mtk_bl2pc.atf_left_ns = now_ns;
+            mtk_bl2pc.atf_left_last_pc = lopc;
+            mtk_bl2pc.atf_left_esr = env->cp15.esr_el[3];
+            mtk_bl2pc.atf_left_elr = env->elr_el[3];
+            mtk_bl2pc.atf_left_spsr = env->pstate | env->daif;
+            mtk_bl2pc.atf_left_vbar = env->cp15.vbar_el[3];
+            mtk_bl2pc.atf_left_sctlr = env->cp15.sctlr_el[3];
+            mtk_bl2pc.atf_left_tcr = env->cp15.tcr_el[3];
+            mtk_bl2pc.atf_left_pc = lopc;
+        }
+        if (lopc < 0x100000ULL && !mtk_bl2pc.brom_seen) {
+            mtk_bl2pc.brom_seen = true;
+            mtk_bl2pc.brom_first_ns = now_ns;
+        }
+        if (lopc == 0x200ULL && !mtk_bl2pc.pc200_first_ns) {
+            mtk_bl2pc.pc200_first_ns = now_ns ? now_ns : 1;
+        }
+    }
     mtk_bl2pc.any[mtk_bl2pc.any_head] = (MtkBl2PcSample){ pc, env->xregs[30],
                                                         env->xregs[31],
                                                         env->daif };
-    mtk_bl2pc.any_head = (mtk_bl2pc.any_head + 1) % 16;
-    if (mtk_bl2pc.any_count < 16) {
+    mtk_bl2pc.any_head = (mtk_bl2pc.any_head + 1) % MTK_BL2PC_ANY;
+    if (mtk_bl2pc.any_count < MTK_BL2PC_ANY) {
         mtk_bl2pc.any_count++;
     }
     if (mtk_bl2pc_pc_in_range(pc)) {
@@ -5359,11 +5488,11 @@ static void mtk_bl2pc_tick(void *opaque)
                 " sp=%016" PRIx64 " daif=%#" PRIx64 "\n", pc,
                 env->xregs[30], env->xregs[31], env->daif);
         if (mtk_bl2pc.any_count) {
-            unsigned k, start = (mtk_bl2pc.any_head + 16 -
+            unsigned k, start = (mtk_bl2pc.any_head + MTK_BL2PC_ANY -
                                  mtk_bl2pc.any_count) % 16;
             for (k = 0; k < mtk_bl2pc.any_count; k++) {
                 MtkBl2PcSample *a =
-                    &mtk_bl2pc.any[(start + k) % 16];
+                    &mtk_bl2pc.any[(start + k) % MTK_BL2PC_ANY];
                 fprintf(stderr, "  after[%u] pc=%016" PRIx64 " lr=%016"
                         PRIx64 " sp=%016" PRIx64 " daif=%#" PRIx64 "\n",
                         k, a->pc, a->lr, a->sp, a->daif);
@@ -5408,7 +5537,7 @@ static void mtk_bl2pc_init(void)
     mtk_bl2pc.enabled = true;
     mtk_bl2pc.timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, mtk_bl2pc_tick, NULL);
     timer_mod(mtk_bl2pc.timer,
-              qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + 1000000);
+              qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + 100000);
     atexit(mtk_bl2pc_exit_dump);
     fprintf(stderr, "mt6895: MTK_BL2PC sampler enabled "
             "(BL2_EXT 0x62f00000..0x64efffff)\n");
