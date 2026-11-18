@@ -120,6 +120,7 @@ OBJECT_DECLARE_SIMPLE_TYPE(MtkGceState, MTK_GCE)
 #define CMDQ_CODE_WRITE_S       0x90
 #define CMDQ_CODE_WRITE_S_MASK  0x91
 #define CMDQ_CODE_LOGIC         0xa0
+#define CMDQ_CODE_JUMPC         0xb0
 
 /*
  * Wait-for-event (WFE) option bits, as encoded by the vendor CMDQ helpers
@@ -616,6 +617,7 @@ static bool mtk_gce_op_known(uint64_t raw)
     case CMDQ_CODE_WRITE_S:
     case CMDQ_CODE_WRITE_S_MASK:
     case CMDQ_CODE_LOGIC:
+    case CMDQ_CODE_JUMPC:
         return true;
     default:
         return false;
@@ -843,14 +845,69 @@ static void mtk_gce_exec(MtkGceState *s, unsigned idx)
             break;
         }
         case CMDQ_CODE_LOGIC: {
-            /* GPR assignment / logic op; only the plain assign is needed. */
+            /*
+             * LOGIC (vendor cmdq_pkt_assign / cmdq_pkt_logic), decoded from the
+             * guest's own CMDQ dumps:
+             *   bits 55..48 s_op: 0x80 = assign immediate, 0xeb = AND
+             *   bits 47..32 destination GPR
+             *   bits 31..16 GPR A (AND) / immediate high half (assign)
+             *   bits 15..0  GPR B (AND) / immediate low half (assign)
+             * The DRM ESD ready-poll packet uses assign GPR0 = 0x80000000
+             * (mask) followed by "Reg2 = Reg2 & Reg0" (test bit 31); the old
+             * assign-only model destroyed the value being tested.
+             */
             unsigned dst = (raw >> 32) & 0xffff;
-            bool dst_t = (raw >> 55) & 1;
+            unsigned s_op = (raw >> 48) & 0xff;
 
-            if (dst_t) {
+            if (s_op == 0x80) {
+                t->spr[dst & (MTK_GCE_SPR_NUM - 1)] = val;
+            } else if (s_op == 0xeb) {
+                unsigned src_a = (raw >> 16) & 0xffff;
+                unsigned src_b = raw & 0xffff;
+
+                t->spr[dst & (MTK_GCE_SPR_NUM - 1)] =
+                    t->spr[src_a & (MTK_GCE_SPR_NUM - 1)] &
+                    t->spr[src_b & (MTK_GCE_SPR_NUM - 1)];
+            } else if ((raw >> 55) & 1) {
                 t->spr[dst & (MTK_GCE_SPR_NUM - 1)] = val;
             }
             pc += step;
+            break;
+        }
+        case CMDQ_CODE_JUMPC: {
+            /*
+             * Conditional absolute jump (vendor cmdq_pkt_cond_jump_eq), decoded
+             * from the guest dump "Jumpc absolute if (Reg Index 2 == Reg Index 1)
+             * jump Reg Index 0":
+             *   bits 47..32 target-address GPR
+             *   bits 31..16 GPR A
+             *   bits 15..0  GPR B
+             * The DRM ESD packet uses it as the exit of its ready-poll loop.
+             * Without it the model spun to the instruction step limit and raised
+             * a false CMDQ error IRQ, which the kernel turned into the
+             * "aee not ready" / cmdq_task_handle_error / emidbg flood.
+             */
+            unsigned reg_t = (raw >> 32) & 0xffff;
+            unsigned reg_a = (raw >> 16) & 0xffff;
+            unsigned reg_b = raw & 0xffff;
+            uint32_t from = pc;
+            uint32_t a = t->spr[reg_a & (MTK_GCE_SPR_NUM - 1)];
+            uint32_t b = t->spr[reg_b & (MTK_GCE_SPR_NUM - 1)];
+
+            if (a == b) {
+                pc = t->spr[reg_t & (MTK_GCE_SPR_NUM - 1)];
+            } else {
+                pc += step;
+            }
+            s->n_jumps++;
+            t->n_jumps++;
+            if (s->log && s->n_logged < 20000 && logged < 600) {
+                fprintf(stderr,
+                        "MTK-GCE-I thr%u pc=%08x JUMPC %s a=%08x b=%08x -> %08x\n",
+                        idx, from, a == b ? "taken" : "not", a, b, pc);
+                s->n_logged++;
+                logged++;
+            }
             break;
         }
         case CMDQ_CODE_WRITE: {
