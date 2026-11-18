@@ -8548,6 +8548,53 @@ static const CPUArchIdList *mt6895_possible_cpu_arch_ids(MachineState *ms)
     return ms->possible_cpus;
 }
 
+/*
+ * PSCI routing for multi-vCPU guests.
+ *
+ * The faithful hardware path for CPU_ON is guest SMC -> ATF's `psci_on` ->
+ * CPC power-on -> core released at BL31's warm-boot entry.  This model
+ * implements the CPC bridge, but the secondary's ATF warm boot does not
+ * complete: only the cold-boot core ever initialises the per-CPU ATF data
+ * blocks, and every core started at 0x48200100 faults inside EL3 during its
+ * per-CPU init (see artifacts/r1302/lineage/notes_mttcg.md, CPC/ATF section).
+ *
+ * With more than one vCPU, answer the guest's PSCI calls in QEMU instead
+ * (SMC conduit stays, so ATF keeps serving every MTK SiP SMC) and start the
+ * secondaries at EL1 -- this machine's non-secure world only ever runs at EL1.
+ * The target vCPU's EL3 state that ATF's warm boot would have set up is
+ * planted lazily on its first SiP SMC (see mtk_secondary_atf_init()).
+ *
+ * This is an interim measure, not the modelled behaviour: it exists so the
+ * multi-core configuration can be used at all while BL31's per-CPU cold-boot
+ * initialisation is missing.  Multi-vCPU guests therefore do not exercise
+ * ATF's own CPU_ON path yet; the single-vCPU configuration, which is the
+ * default, keeps the historical ATF-owned PSCI path unchanged.
+ *
+ * MTK_NO_HOST_PSCI=1 forces the ATF-owned path for A/B runs.
+ */
+static bool mt6895_host_psci_mode(MachineState *ms)
+{
+    static bool announced;
+
+    if (MTK_ENV_CACHED("MTK_PSCI_HOST")) {
+        return true;
+    }
+    if (MTK_ENV_CACHED("MTK_NO_HOST_PSCI")) {
+        return false;
+    }
+    if (ms->smp.cpus > 1) {
+        if (!announced) {
+            announced = true;
+            warn_report("mt6895: %d vCPUs requested; PSCI is answered by QEMU "
+                        "because BL31 per-CPU cold-boot initialisation is not "
+                        "modelled yet (MTK_NO_HOST_PSCI=1 forces the ATF path)",
+                        ms->smp.cpus);
+        }
+        return true;
+    }
+    return false;
+}
+
 static void mt6895_create_cpus(Mt6895MachineState *s, Error **errp)
 {
     MachineState *ms = MACHINE(s);
@@ -8581,12 +8628,11 @@ static void mt6895_create_cpus(Mt6895MachineState *s, Error **errp)
          * ATF entry run) does not walk into unmapped space. */
         ARM_CPU(cpuobj)->env.cp15.tpidr_el[3] = 0x4824b000ULL + (uint64_t)n * 0x80;
         /*
-         * MTK_PSCI_HOST=1: let QEMU answer the guest's PSCI calls (SMC
-         * conduit) instead of forwarding them to ATF.  Off by default, so
-         * the historical ATF-owned PSCI path is unchanged.
+         * Let QEMU answer the guest's PSCI calls (SMC conduit) whenever the
+         * multi-vCPU bring-up needs it; see mt6895_host_psci_mode().
          */
         object_property_set_uint(cpuobj, "psci-conduit",
-                                 MTK_ENV_CACHED("MTK_PSCI_HOST")
+                                 mt6895_host_psci_mode(ms)
                                      ? QEMU_PSCI_CONDUIT_SMC
                                      : QEMU_PSCI_CONDUIT_HVC,
                                  &error_fatal);
@@ -14892,7 +14938,7 @@ static const uint8_t stub_cmd_def[0x80] = {
      * intercepting the guest's SMCs, so ATF keeps serving every non-PSCI
      * SMC (MTK SiP calls) exactly as before.
      */
-    if (MTK_ENV_CACHED("MTK_PSCI_HOST") ||
+    if (mt6895_host_psci_mode(machine) ||
         MTK_ENV_CACHED("MTK_DT_HVC_PSCI")) {
         arm_psci_set_prefer_el1(true);
         /*
@@ -14910,7 +14956,9 @@ static const uint8_t stub_cmd_def[0x80] = {
             arm_psci_set_eager_plant(true);
         }
         if (MACHINE(s)->smp.cpus > 1 &&
-            MTK_ENV_CACHED("MTK_ATF_LAZY_PLANT")) {
+            (MTK_ENV_CACHED("MTK_ATF_LAZY_PLANT") ||
+             (mt6895_host_psci_mode(machine) &&
+              !MTK_ENV_CACHED("MTK_NO_ATF_PLANT")))) {
             arm_psci_set_secondary_hook(mtk_secondary_atf_init);
             arm_psci_set_lazy_plant(true);
         }
@@ -15245,7 +15293,7 @@ static const uint8_t stub_cmd_def[0x80] = {
     if (s->direct_boot) {
         s->binfo.ram_size = machine->ram_size;
         s->binfo.loader_start = MT6895_DRAM_BASE;
-        s->binfo.psci_conduit = MTK_ENV_CACHED("MTK_PSCI_HOST")
+        s->binfo.psci_conduit = mt6895_host_psci_mode(machine)
                                     ? QEMU_PSCI_CONDUIT_SMC
                                     : QEMU_PSCI_CONDUIT_HVC;
         arm_load_kernel(ARM_CPU(first_cpu), machine, &s->binfo);
@@ -15362,26 +15410,6 @@ static void mt6895_set_gpt(Object *obj, const char *value, Error **errp)
     s->gpt_path = g_strdup(value);
 }
 
-/*
- * Read-only board marker consumed by the TCG accelerator (accel/tcg/tcg-all.c):
- * this machine emulates MTK firmware stubs (preloader / ATF doorbells / CPC
- * bridge / early DMA windows) that are not safe when MTTCG runs the vCPUs in
- * parallel threads, so TCG is kept single-threaded for this board unless the
- * user asks for -accel tcg,thread=multi explicitly.
- */
-static bool mt6895_get_single_thread_tcg(Object *obj, Error **errp)
-{
-    /*
-     * MTK_MTTCG=1 is a diagnostic escape hatch: allow the TCG accelerator to
-     * run the vCPUs in parallel threads anyway, to check whether the device
-     * model is really MTTCG-safe (the default is to keep it single-threaded).
-     */
-    if (MTK_ENV_CACHED("MTK_MTTCG")) {
-        return false;
-    }
-    return true;
-}
-
 static void mt6895_machine_instance_init(Object *obj)
 {
     Mt6895MachineState *s = MT6895_MACHINE(obj);
@@ -15443,11 +15471,6 @@ static void mt6895_machine_instance_init(Object *obj)
     s->stage_entry_patch = 1;
     s->boot_lr = 0;
     s->data_path = NULL;
-
-    object_property_add_bool(obj, "mtk-single-thread-tcg",
-                             mt6895_get_single_thread_tcg, NULL);
-    object_property_set_description(obj, "mtk-single-thread-tcg",
-        "Board marker: this machine's firmware-stub devices are not MTTCG-safe");
 }
 
 static void mt6895_machine_class_init(ObjectClass *oc, const void *data)
