@@ -7071,35 +7071,36 @@ static void mt6895_place_gpt(Mt6895MachineState *s, Error **errp)
 
 
 /*
- * Genuine BootROM boot-argument block.
+ * Genuine BootROM boot-argument hand-off block.
  *
- * On hardware the BROM builds a boot-argument record list in SRAM, stores a
- * pointer to it where its AArch32 hand-off expects it (r4), and the preloader's
- * SRAM stage writes that r4 value into [0x02001000]; the DRAM stage then copies
- * 0x93C bytes from it into its own block at 0x020F3740 and walks it as a TLV
- * list ("u32 size; u32 type; data at +8; advance by size; size==0 terminates")
- * with record types 0x779F0000 + id.  This machine used to hand the preloader
- * the A32 service entry (0x21) in r4 instead, so the 0x93C-byte copy came from
- * BROM stub code and every downstream consumer saw garbage/zero boot args.
+ * The BROM hands the preloader a pointer in r4; the SRAM stage stores it at
+ * [0x02001000] and the DRAM stage copies 0x93C bytes from it into 0x020F3740,
+ * where the fields are consumed as fixed offsets (notes section 18): the block
+ * is a descriptor, not the TLV list it was first assumed to be.
  *
- * Only records whose value genuinely comes from this machine's modelled boot
- * state are emitted here:
- *   id 0x00 BOOT_TAG_VERSION : this platform's boot-argument format version (1)
- *   id 0x01 BOOT_REASON      : the same power-on reason the model presents to
- *                              the boot dispatcher (default NORMAL_BOOT = 1;
- *                              MTK_BOOT_REASON overrides, as elsewhere)
- *   id 0x02 BOOT_MODE        : 0 (cold boot from power-on)
- *   id 0x0c EFLAG            : 0 (cold boot, no early flag)
- *   id 0x12 SRAM start/size  : SoC SRAM map (0x10DC00/0x12400)
- * Records whose genuine source is not modelled yet are deliberately NOT
- * synthesised: META_COM, DA_INFO, PLAT_DBG_INFO, the DRAM/EMI + mblock +
- * orig_dram record (id 0x20), FG/ADC, ram_console and AEE exception info.
+ * Real BootROM does not zero the whole window: fields it does not write keep
+ * whatever SRAM already held (stale/non-zero content), and the preloader copes
+ * with that.  The prime test showed a fully zeroed window stalls before LK
+ * prints "Booting Linux" while stale content takes a benign path, so this
+ * builder never memsets: in "control" mode it writes nothing at all, and in
+ * fill mode it writes only fields whose value has a genuine modelled source
+ * (BOOT_TAG_VERSION/REASON/MODE/EFLAG/SRAM start/size).
+ *
+ * This is a MODEL-SIDE experiment about how the preloader reacts to zeroed
+ * versus stale descriptor fields; the window address is not claimed to be the
+ * hardware layout.
+ *
+ * The window deliberately sits inside the preloader payload's string/rodata
+ * table (image spans 0x02000F10..0x0207AFC0), which is non-zero and not
+ * executed: 0x02040000 was rejected after disassembly showed it is live Thumb
+ * code, so writing justified fields there would crash the preloader instead of
+ * testing the descriptor-content hypothesis.
  */
-#define MT6895_BROM_BOOTARGS_PA   0x02081000ULL
+#define MT6895_BROM_BOOTARGS_PA   0x02065000ULL
 #define MT6895_BROM_BOOTARGS_SIZE 0x00001000ULL
 #define MT6895_BROM_TLV_TYPE      0x779f0000U
 
-static void mt6895_build_brom_bootargs(Mt6895MachineState *s)
+static void mt6895_build_brom_bootargs(Mt6895MachineState *s, bool fill)
 {
     uint8_t *p = mt6895_guest_ptr(s, MT6895_BROM_BOOTARGS_PA,
                                   MT6895_BROM_BOOTARGS_SIZE);
@@ -7110,7 +7111,13 @@ static void mt6895_build_brom_bootargs(Mt6895MachineState *s)
     if (!p) {
         return;
     }
-    memset(p, 0, MT6895_BROM_BOOTARGS_SIZE);
+    /*
+     * No memset (see the block comment): control mode writes nothing and lets
+     * the pre-existing bytes stand; fill mode writes only justified fields.
+     */
+    if (!fill) {
+        return;
+    }
 
     e = getenv("MTK_BOOT_REASON");
     if (e) {
@@ -7930,19 +7937,26 @@ static void mt6895_load_boot_lun(Mt6895MachineState *s, Error **errp,
         s->boot_r4 = MT6895_BOOTROM_A32_SERVICE;
     }
     /*
-     * Genuine BROM boot-argument block: built unconditionally (the builder is
-     * kept compiled and syntax-checked), but handed to the preloader only when
-     * MTK_BROMARGS_BLOCK=1.  The block fields are load-bearing: handing over a
-     * block whose memory/power descriptors are absent stalls the preloader
-     * before LK prints "Booting Linux" (prime test, 2026-11-18).  The default
-     * OFF keeps the tree bootable until every field emitted by
-     * mt6895_build_brom_bootargs() has a genuine source.
+     * Model-side experiment switch (default OFF keeps the tree bootable):
+     *   unset        -> r4 = A32 service entry, builder writes nothing;
+     *   "control"    -> r4 = descriptor window, builder writes NOTHING
+     *                   (isolates zero-vs-stale descriptor content);
+     *   "1"/"fill"   -> r4 = descriptor window, builder writes the justified
+     *                   fields only (never a memset).
      */
-    mt6895_build_brom_bootargs(s);
-    if (MTK_ENV_CACHED("MTK_BROMARGS_BLOCK")) {
-        s->boot_r4 = MT6895_BROM_BOOTARGS_PA;
-    } else {
-        s->boot_r4 = MT6895_BOOTROM_A32_SERVICE;
+    {
+        const char *m = getenv("MTK_BROMARGS_BLOCK");
+
+        if (m && !strcmp(m, "control")) {
+            mt6895_build_brom_bootargs(s, false);
+            s->boot_r4 = MT6895_BROM_BOOTARGS_PA;
+        } else if (m && *m && strcmp(m, "0")) {
+            mt6895_build_brom_bootargs(s, true);
+            s->boot_r4 = MT6895_BROM_BOOTARGS_PA;
+        } else {
+            mt6895_build_brom_bootargs(s, false);
+            s->boot_r4 = MT6895_BOOTROM_A32_SERVICE;
+        }
     }
     s->boot_valid = true;
 
