@@ -440,11 +440,11 @@ static bool mtk_syscon_bp_decode(MtkSysconState *s, hwaddr off,
     *grp = 0;
 
     /*
-     * Bus protection belongs to the MTK_PWR_STATE model (see mtk_scpsys.c):
-     * enable it together with the real PWR_CON state machine, otherwise the
-     * legacy constant-ack overlays in mt6895.c stay in charge.
+     * Bus protection is part of the real power model (see mtk_scpsys.c) and is
+     * on by default, matching the vendor scpsys driver's SET/CLR/STA polls.
+     * MTK_LEGACY_PWR_STATE=1 restores the old constant-ack overlays.
      */
-    if (!MTK_ENV_CACHED("MTK_PWR_STATE")) {
+    if (MTK_ENV_CACHED("MTK_LEGACY_PWR_STATE")) {
         return false;
     }
 
@@ -513,7 +513,8 @@ static bool mtk_syscon_bp_decode(MtkSysconState *s, hwaddr off,
  * keeps the stale vote and clk-mux.c times out, which is exactly the
  * CLK_EVT_HWV_CG_TIMEOUT that makes clkchk-mt6895.c BUG().
  *
- * MTK_PWR_STATE=1 selects the state machine, matching mtk-scpsys.c.
+ * The state machine is on by default (matching mtk-scpsys.c);
+ * MTK_LEGACY_PWR_STATE=1 restores the old plain-storage behaviour.
  */
 enum {
     MTK_HWV_CG_SET = 0,
@@ -552,7 +553,7 @@ static bool mtk_hwv_cg_decode(hwaddr off, int *id, int *kind)
 static bool mtk_hwv_cg_active(MtkSysconState *s)
 {
     return s->name && !strcmp(s->name, "hwv") &&
-           MTK_ENV_CACHED("MTK_PWR_STATE");
+           !MTK_ENV_CACHED("MTK_LEGACY_PWR_STATE");
 }
 
 /*
@@ -1161,7 +1162,7 @@ static const MemoryRegionOps mtk_syscon_ops = {
 static void mtk_syscon_bp_presets(MtkSysconState *s)
 {
     memset(s->bprot, 0, sizeof(s->bprot));
-    if (!getenv("MTK_PWR_STATE") || !s->name) {
+    if (MTK_ENV_CACHED("MTK_LEGACY_PWR_STATE") || !s->name) {
         return;
     }
     if (!strcmp(s->name, "infracfg_ao_clk")) {

@@ -16680,13 +16680,13 @@ static const uint8_t stub_cmd_def[0x80] = {
 
         /*
          * 0x1c001e00 is the SPM PWR_CON/PWR_STATUS half of the scpsys
-         * window (ctls at 0xE00..0xEE8, status at 0xF34/0xF38).  This
-         * constant-ack overlay serves the BL2/LK clkmgr flows, which
-         * read-modify-write the run, so it stays installed by default.
-         * MTK_PWR_STATE=1 removes it and lets mtk-scpsys own the window with
-         * the real PWR_CON/PWR_STATUS state machine.
+         * window (ctls at 0xE00..0xEE8, status at 0xF34/0xF38).  The real
+         * mtk-scpsys PWR_CON/PWR_STATUS state machine owns that window by
+         * default (the vendor kernel's scpsys driver polls its SRAM sleep
+         * acknowledge and per-domain status bits).  The old constant-ack
+         * overlay is kept only for MTK_LEGACY_PWR_STATE=1 A/B runs.
          */
-        if (!MTK_ENV_CACHED("MTK_PWR_STATE")) {
+        if (MTK_ENV_CACHED("MTK_LEGACY_PWR_STATE")) {
             static MemoryRegion vlp_mr;
 
             memory_region_init_io(&vlp_mr, OBJECT(s), &mt6895_vlp_pwr_ops,
@@ -16717,12 +16717,12 @@ static const uint8_t stub_cmd_def[0x80] = {
 
         /*
          * VLP PLL/ack block the clkmgr flows poll at 0x1c00c210/0x1c00c220.
-         * Installed by default (MTK_NO_VLPPLL=1 disables it); with
-         * MTK_PWR_STATE=1 the 0x1c00c000 window is served by mtk-syscon's
-         * VLP bus-protection state machine instead.
+         * The 0x1c00c000 window is served by mtk-syscon's VLP bus-protection
+         * state machine by default; this constant-ack overlay is legacy-only
+         * (MTK_LEGACY_PWR_STATE=1, MTK_NO_VLPPLL=1 still disables it).
          */
         if (!MTK_ENV_CACHED("MTK_NO_VLPPLL") &&
-            !MTK_ENV_CACHED("MTK_PWR_STATE")) {
+            MTK_ENV_CACHED("MTK_LEGACY_PWR_STATE")) {
             static MemoryRegion vlp_pll_mr;
             uint8_t *p2;
 
@@ -16735,7 +16735,7 @@ static const uint8_t stub_cmd_def[0x80] = {
         }
 
         if (!MTK_ENV_CACHED("MTK_NO_INFRAPWR") &&
-            !MTK_ENV_CACHED("MTK_PWR_STATE")) {
+            MTK_ENV_CACHED("MTK_LEGACY_PWR_STATE")) {
         memory_region_init_ram(&infra_pwr_mr, NULL, "mt6895.infra_pwr",
                                0x100, &error_abort);
         ram = memory_region_get_ram_ptr(&infra_pwr_mr);
@@ -16746,7 +16746,7 @@ static const uint8_t stub_cmd_def[0x80] = {
                                             &infra_pwr_mr, 2);
         }
         if (!MTK_ENV_CACHED("MTK_NO_READY") &&
-            !MTK_ENV_CACHED("MTK_PWR_STATE")) {
+            MTK_ENV_CACHED("MTK_LEGACY_PWR_STATE")) {
             static MemoryRegion ready_mr;
 
             memory_region_init_io(&ready_mr, OBJECT(s),

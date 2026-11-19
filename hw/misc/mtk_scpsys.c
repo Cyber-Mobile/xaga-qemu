@@ -123,18 +123,19 @@ OBJECT_DECLARE_SIMPLE_TYPE(MtkScpsysState, MTK_SCPSYS)
  */
 
 /*
- * MTK_PWR_STATE=1 switches the block from the legacy constant-PWR_ACK model
- * (the 0xe10..0xe74 status run) to the real PWR_CON/PWR_STATUS state machine.
- * It is an environment switch so that a regression round can be compared
- * against the previous boot chains without rebuilding; the vendor kernel and
- * the BL2/LK flows must both be verified on the real model first.
+ * The real PWR_CON/PWR_STATUS state machine is the default: the vendor kernel
+ * (mtk-scpsys.c + pd_chk-mt6895.c) polls the SRAM sleep acknowledge (bit 13)
+ * and the per-domain PWR_STATUS bits, and only this model produces them.
+ * MTK_LEGACY_PWR_STATE=1 restores the old constant-PWR_ACK behaviour (the
+ * 0xe10..0xe74 status run) for A/B comparison; MTK_PWR_STATE=1 is still
+ * accepted and now selects what is already the default.
  */
 static bool mtk_scpsys_real_pwr(void)
 {
     static int cached = -1;
 
     if (cached < 0) {
-        cached = getenv("MTK_PWR_STATE") != NULL;
+        cached = !MTK_ENV_CACHED("MTK_LEGACY_PWR_STATE");
     }
     return cached;
 }
@@ -372,7 +373,7 @@ static uint64_t mtk_scpsys_read(void *opaque, hwaddr offset, unsigned size)
                     reg = mtk_scpsys_xpu_status(s->regs);
                 }
             } else if ((o & ~3u) >= 0x0e10 && (o & ~3u) <= 0x0e74) {
-                /* Legacy constant PWR_ACK, kept for the pre-MTK_PWR_STATE model. */
+                /* Legacy constant PWR_ACK (MTK_LEGACY_PWR_STATE=1 only). */
                 reg |= SCPSYS_STATUS_MASK;
             }
             if (mtk_scpsys_is_mcupm_handshake_reg(o & ~3u)) {
