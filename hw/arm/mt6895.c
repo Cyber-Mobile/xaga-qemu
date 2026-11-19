@@ -10440,7 +10440,154 @@ static void mt6895_infra_cg_init(void)
     memory_region_add_subregion_overlap(get_system_memory(), 0x10001080ULL,
                                         &mr, 1000);
 }
-/* ===== end TRNG ===== */
+/* ===== ADCC (CPU DCDC calibration) ===== */
+/*
+ * The preloader's adcc_pre_init() is LUA_1 VA 0x0203F608; the failing print is
+ * at 0x0203F84E ("adcc_pre_init():868"), reached from the calibration poll
+ * loop at 0x0203F820..0x0203F84C:
+ *
+ *   for (cpu = 0; cpu < 8; cpu++) {
+ *       timeout = 2000002;                       // literal 0x001E8482
+ *       while (--timeout)
+ *           if (readl(0x00115000 + cpu * 0x10) & 0x10000)
+ *               goto calib_done;
+ *       printf("ADCC CPU%d Auto-calibation fail.", cpu);
+ *   }
+ *
+ * i.e. the block is eight per-CPU register sets 0x10 bytes apart at
+ * 0x00115000, and bit 16 of each set's word 0 is the "calibration complete"
+ * status the firmware waits for (the dump at 0x0203F510 prints the same bit
+ * as SW_nFlag).  The unit's log has no failure line and completes the dump
+ * immediately (real_device_boot.txt:2187 "#T#adcc_pre_init=1"), so hardware
+ * sets the bit before the first poll.
+ *
+ * SRAM0 is modelled as 4 MiB of plain RAM starting at 0x00100000, which covers
+ * 0x00115000: the firmware's configuration writes landed in RAM, the status
+ * bit read back 0 and the poll timed out, so cpu_type stayed 0 and GZ panicked
+ * at mt_smcall.c:626 (cpu_type != 0).  Model the register file here instead
+ * and report the calibration as already complete.
+ *
+ * MTK_NO_ADCC=1 disables the overlay and restores the plain-RAM behaviour.
+ */
+#define MT6895_ADCC_BASE 0x00115000ULL
+#define MT6895_ADCC_SIZE 0x00000080ULL      /* 8 CPUs x 0x10 */
+
+static uint32_t mt6895_adcc_regs[MT6895_ADCC_SIZE / 4];
+
+static uint64_t mt6895_adcc_read(void *opaque, hwaddr off, unsigned size)
+{
+    uint32_t v;
+
+    if (off + size > MT6895_ADCC_SIZE) {
+        return 0;
+    }
+    v = mt6895_adcc_regs[off >> 2];
+    if ((off & 0xf) == 0) {
+        /* word 0 bit 16: calibration complete (see the block comment) */
+        v |= 0x00010000u;
+    }
+    return extract64(v, (off & 3) * 8, size * 8);
+}
+
+static void mt6895_adcc_write(void *opaque, hwaddr off, uint64_t val,
+                              unsigned size)
+{
+    unsigned shift, bits;
+    uint32_t mask;
+
+    if (off + size > MT6895_ADCC_SIZE) {
+        return;
+    }
+    shift = (off & 3) * 8;
+    bits = size * 8;
+    mask = (bits >= 32) ? 0xffffffffu : ((1u << bits) - 1);
+    mt6895_adcc_regs[off >> 2] =
+        (mt6895_adcc_regs[off >> 2] & ~(mask << shift)) |
+        (((uint32_t)val & mask) << shift);
+}
+
+static const MemoryRegionOps mt6895_adcc_ops = {
+    .read = mt6895_adcc_read,
+    .write = mt6895_adcc_write,
+    .endianness = DEVICE_LITTLE_ENDIAN,
+    .valid = { .min_access_size = 1, .max_access_size = 4 },
+};
+
+static void mt6895_adcc_init(void)
+{
+    static MemoryRegion mr;
+
+    if (getenv("MTK_NO_ADCC")) {
+        return;
+    }
+    memory_region_init_io(&mr, NULL, &mt6895_adcc_ops, NULL, "mt6895.adcc",
+                          MT6895_ADCC_SIZE);
+    memory_region_add_subregion_overlap(get_system_memory(), MT6895_ADCC_BASE,
+                                        &mr, 1000);
+}
+/* ===== end ADCC ===== */
+
+
+/* ===== GZ hw code (low halfword at 0x08000000) ===== */
+/*
+ * The preloader's GZ platform-config builder (LUA_1 VA 0x020323BA..0x020323C8)
+ * fills the GZ atag "hw code" / "hw sub code" fields from the low halfwords of
+ * the words at 0x08000000 and 0x08000004:
+ *
+ *   0x020323BA  mov.w r0, #0x8000000
+ *   0x020323BE  ldr   r0, [r0]
+ *   0x020323C0  strh.w r0, [r4, #0x70]     ; GZ atag hw code
+ *   0x020323C4  ldr   r0, =0x08000004
+ *   0x020323C6  ldr   r0, [r0]
+ *   0x020323C8  strh.w r0, [r4, #0x72]     ; GZ atag hw sub code
+ *
+ * GZ copies that atag verbatim (VA 0x7F804A04, 0x100 bytes) and uses the hw
+ * code halfword as cpu_type: the getter at VA 0x7F8047AC returns it and
+ * mtee_sapu_init (VA 0x7F81B630) prints "mtee_sapu_init cpu_type=0x%x" and
+ * stores it.  On the unit cpu_type is 0x2, i.e. the low halfword at 0x08000000
+ * reads 2.  Our 0x08000000 is an unimplemented device returning 0, so cpu_type
+ * stayed 0 and GZ asserted at mt_smcall.c:626 (cpu_type != 0).
+ *
+ * Model the documented device state: low halfword 2.  Only that halfword is
+ * documented; the upper halfword and 0x08000004 (hw sub code) are left 0.
+ * MTK_NO_HWCODE=1 restores the old all-zero behaviour.
+ */
+static uint64_t mt6895_hwcode_read(void *opaque, hwaddr off, unsigned size)
+{
+    uint32_t v = 0;
+
+    if (off < 4) {
+        v = 0x00000002u;
+    }
+    return extract64(v, (off & 3) * 8, size * 8);
+}
+
+static void mt6895_hwcode_write(void *opaque, hwaddr off, uint64_t val,
+                                unsigned size)
+{
+    /* Read-only device-state register. */
+}
+
+static const MemoryRegionOps mt6895_hwcode_ops = {
+    .read = mt6895_hwcode_read,
+    .write = mt6895_hwcode_write,
+    .endianness = DEVICE_LITTLE_ENDIAN,
+    .valid = { .min_access_size = 1, .max_access_size = 4 },
+};
+
+static void mt6895_hwcode_init(void)
+{
+    static MemoryRegion mr;
+
+    if (getenv("MTK_NO_HWCODE")) {
+        return;
+    }
+    memory_region_init_io(&mr, NULL, &mt6895_hwcode_ops, NULL, "mt6895.hwcode",
+                          4);
+    memory_region_add_subregion_overlap(get_system_memory(), 0x08000000ULL,
+                                        &mr, 1000);
+}
+/* ===== end GZ hw code ===== */
 
 
 static void mt6895_create_msdc(Mt6895MachineState *s, Error **errp)
@@ -15290,6 +15437,11 @@ static void mt6895_init(MachineState *machine)
                                mt6895_sram[i].size, &error_fatal);
         memory_region_add_subregion(sysmem, mt6895_sram[i].base, &s->sram[i]);
     }
+
+    /* ADCC register block inside the SRAM0 window (see mt6895_adcc_init). */
+    mt6895_adcc_init();
+    /* GZ hw code register at 0x08000000 (see mt6895_hwcode_init). */
+    mt6895_hwcode_init();
 
     /*
      * Initial state of the SCMI shared memory.

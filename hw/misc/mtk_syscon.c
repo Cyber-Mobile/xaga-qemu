@@ -169,6 +169,19 @@ static const struct MtkEfuseWord {
      */
     { 0x060, 0x2, "secure-boot fuse bit1 (LK direct read 0x11f10060)" },
     /*
+     * "devinfo header" word.  The preloader's devinfo dispatcher (VA
+     * 0x02054860, table VA 0x0206E874) returns, for index 0x1e, the low byte
+     * of this word (VA 0x020548DE: uxtb r4,r4).  The GZ init code calls it as
+     * get(0x1e) at VA 0x020323CC and stores the result into the GZ devinfo
+     * struct at +0x84, printed as
+     *   "[GZINIT] gz devinfo area30: 0x%x"      (print site VA 0x0203247A)
+     * Getter index 7 returns the whole word and prints it as "s4: 0x%x".
+     * Device log: "s4: 0xA002" (real_device_boot.txt:231/2911/3226) and
+     * "[GZINIT] gz devinfo area30: 0x2" (:2221), so the unit's word is
+     * 0xA002 and its low byte is the area30 = 2 that GZ needs for cpu_type.
+     */
+    { 0x050, 0xa002, "devinfo header s4 (device log s4: 0xA002); low byte = GZ devinfo area30 = 2" },
+    /*
      * RID words 0..3.  LK's shadow indices 0x0c..0x0f map to these offsets
      * (direct table reads, not synthesised) and LK prints them as
      * "dump rid, ...".  Values are this unit's own, from its boot log.

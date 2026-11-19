@@ -811,6 +811,62 @@ static unsigned mt6319_vsel_monitor(unsigned reg)
     }
 }
 
+/*
+ * MT6363 SDMADC (sigma-delta ADC) conversion window.
+ *
+ * The preloader reads the two board-identification voltages through the
+ * "main_pmic_sdmadc" auxadc device (registered in LUA_1 by mt6363_auxadc_init;
+ * the reader is LUA_1 VA 0x020384A0 and prints "project id volt"/"build id
+ * volt").  The channel descriptor table at LUA_1 0x0206C54C gives the access
+ * protocol (read op at 0x0203AFA8):
+ *
+ *   write 0x11C4 = 0x80 | mux | (len << 3)   channel select / enable
+ *   write 0x1109 = 0x10                      start conversion
+ *   poll 0x10D2 bit15 until set, then read 0x10D2 as a 16-bit little-endian
+ *                                            value: bit15 = done, [14:0] = code
+ *
+ * and the code-to-millivolt conversion (LUA_1 0x0203B05A) is
+ *
+ *   mV = (code * 0x730) >> 15                (0x730 = 1840)
+ *
+ * The board-id reader asks for channels 18 and 19, which the driver's channel
+ * table maps to mux 1 and mux 2.  The analog inputs are board resistors that no
+ * artefact exposes, so the two codes are seeded from the unit's own boot log
+ * (real_device_boot.txt:2075-2076):
+ *
+ *   project id volt = 475 mv, projectId_channel = 18
+ *   build  id volt =  71 mv, buildId_channel  = 19
+ *
+ * mux 1 therefore returns the smallest code that converts to 475 mV
+ * (ceil(475 * 32768 / 1840) = 8460) and mux 2 the one for 71 mV (1265); every
+ * other mux reads code 0.  The conversion is reported complete on the first
+ * poll, as on the unit, where the whole auxadc read is far below the retry
+ * budget.
+ */
+#define MT6363_SDMADC_CFG    0x11c4
+#define MT6363_SDMADC_START  0x1109
+#define MT6363_SDMADC_DATA   0x10d2
+#define MT6363_SDMADC_DONE   0x8000
+
+static uint16_t mtk_spmi_pmif_sdmadc(MtkSpmiPmifState *s, unsigned sid)
+{
+    unsigned mux = s->pmic[sid][MT6363_SDMADC_CFG] & 0x7;
+    uint16_t code;
+
+    switch (mux) {
+    case 1:     /* project id channel 18: 475 mV on the unit */
+        code = 8460;
+        break;
+    case 2:     /* build id channel 19: 71 mV on the unit */
+        code = 1265;
+        break;
+    default:
+        code = 0;
+        break;
+    }
+    return MT6363_SDMADC_DONE | code;
+}
+
 static void mtk_spmi_pmif_xfer(MtkSpmiPmifState *s, unsigned chan, uint32_t cmd)
 {
     unsigned opc = (cmd >> 30) & 0x3;
@@ -939,6 +995,19 @@ static void mtk_spmi_pmif_xfer(MtkSpmiPmifState *s, unsigned chan, uint32_t cmd)
                  * latch.  Contents are the device's own eight words.
                  */
                 uint16_t w = mtk_spmi_pmif_mt6319_efuse(s, sid);
+
+                v = (w >> (8 * i)) & 0xff;
+            } else if (addr == MT6363_SDMADC_DATA && len == 2 &&
+                       s->slave_part[sid] == PMIC_PART_MT6363 &&
+                       (s->pmic[sid][MT6363_SDMADC_START] & 0x10)) {
+                /*
+                 * Board-identification SDMADC data window: conversion is
+                 * already complete when the payload polls it, and the mux was
+                 * selected by the last 0x11C4 write (see the block comment
+                 * above).  The start register gates the window so unrelated
+                 * reads of this address keep their old all-zero behaviour.
+                 */
+                uint16_t w = mtk_spmi_pmif_sdmadc(s, sid);
 
                 v = (w >> (8 * i)) & 0xff;
             } else {
