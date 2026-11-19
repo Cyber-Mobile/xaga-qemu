@@ -424,6 +424,10 @@ struct MtkSpmiPmifState {
      * MTK_PMIF_TRACE diagnostic. */
     unsigned inst;
 
+    /* PMIC OTP/efuse windows: word index latches (see xfer()). */
+    uint8_t otp_addr[SPMI_MAX_SID];      /* 0x42d latch: MT6363 / MT6368 OTP */
+    uint8_t mt6319_efuse_idx[SPMI_MAX_SID]; /* 0x38c latch: MT6319 efuse */
+
     /* SPMI RCS interrupt output (level, to the EINT controller). */
     qemu_irq rcs_irq;
     bool trace;
@@ -734,6 +738,39 @@ static void mtk_spmi_pmif_record_cmd(MtkSpmiPmifState *s, unsigned chan,
 }
 
 /*
+ * PMIC OTP/efuse word read.
+ *
+ * MT6363 and MT6368 expose their OTP through a banked window: the word address
+ * is written to 0x42d and the 16-bit word is read back at 0x42b (the preloader
+ * walks words 0x00..0x1f with a second bank at 0x10+n).  However no raw word
+ * contents for these two parts exist in any device artefact we have (the log
+ * only carries derived values such as VCORE VB_INFO1), so every word reads 0
+ * for them - same behaviour as before, but through a real address latch.
+ *
+ * The MT6319 dies use a different interface: word index written to 0x38c and
+ * data read at 0x39b; only their eight efuse words are device-sourced.
+ */
+static uint16_t mtk_spmi_pmif_otp_word(MtkSpmiPmifState *s, unsigned sid)
+{
+    return 0;   /* MT6363/MT6368: contents not available from the device */
+}
+
+/*
+ * MT6319 efuse data at 0x39b, selected by the 0x38c word-index latch.
+ *
+ * The real unit's log prints eight decoded words per die (S6:
+ * 0xFFFF:0xFFFF:0xFFFF:0xFFFF:0xF5A4:0x8CFF:0xFA67:0xE678, S7: ...), but those
+ * are the payload's DECODED output, not raw efuse contents (feeding them back
+ * double-applies the decode: 0xFFFF in -> 0xFFFD out).  Raw contents are not
+ * available from any device artefact, so every word reads 0 until the payload's
+ * decode is inverted by disassembly (notes_pmic_round1.md section 16).
+ */
+static uint16_t mtk_spmi_pmif_mt6319_efuse(MtkSpmiPmifState *s, unsigned sid)
+{
+    return 0;
+}
+
+/*
  * MT6319 rail register aliases.
  *
  * The payload reaches each MT6319 buck's voltage-select register under two
@@ -815,6 +852,14 @@ static void mtk_spmi_pmif_xfer(MtkSpmiPmifState *s, unsigned chan, uint32_t cmd)
                 if (alias) {
                     s->pmic[sid][alias] = v;
                 }
+                if (r == 0x38c) {
+                    /* MT6319 efuse word-index latch (data read at 0x39b). */
+                    s->mt6319_efuse_idx[sid] = v;
+                }
+            }
+            if (r == 0x42d) {
+                /* MT6363/MT6368 OTP word-address latch (data read at 0x42b). */
+                s->otp_addr[sid] = v;
             }
             mtk_spmi_ring_add(sid, r, v, 0);
         }
@@ -877,13 +922,33 @@ static void mtk_spmi_pmif_xfer(MtkSpmiPmifState *s, unsigned chan, uint32_t cmd)
 
         for (i = 0; i < len; i++) {
             unsigned r = addr + i;
-            uint8_t v = s->pmic[sid][r];
+            uint8_t v;
 
-            if (s->slave_part[sid] == PMIC_PART_MT6319) {
-                unsigned src = mt6319_vsel_monitor(r);
+            if (addr == 0x42b && len == 2) {
+                /*
+                 * MT6363/MT6368 OTP data window: 16-bit word selected by the
+                 * 0x42d latch, returned little-endian over the two bytes.
+                 */
+                uint16_t w = mtk_spmi_pmif_otp_word(s, sid);
 
-                if (src) {
-                    v = s->pmic[sid][src];
+                v = (w >> (8 * i)) & 0xff;
+            } else if (addr == 0x39b && len == 2 &&
+                       s->slave_part[sid] == PMIC_PART_MT6319) {
+                /*
+                 * MT6319 efuse data window: 16-bit word selected by the 0x38c
+                 * latch.  Contents are the device's own eight words.
+                 */
+                uint16_t w = mtk_spmi_pmif_mt6319_efuse(s, sid);
+
+                v = (w >> (8 * i)) & 0xff;
+            } else {
+                v = s->pmic[sid][r];
+                if (s->slave_part[sid] == PMIC_PART_MT6319) {
+                    unsigned src = mt6319_vsel_monitor(r);
+
+                    if (src) {
+                        v = s->pmic[sid][src];
+                    }
                 }
             }
             data |= (uint32_t)v << (8 * i);
