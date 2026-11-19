@@ -9440,15 +9440,22 @@ static void mt6895_machine_reset(MachineState *machine, ResetType type)
                 (int)type, (int)arm_mt6895_warm_reset,
                 ac ? (unsigned)ac->env.regs[15] : 0);
     }
-    if (!mt6895_warm_reset_requested) {
-        qemu_devices_reset(type);
-        s->atfctx_val = 0;
-    } else {
-        /*
-         * Warm reset: the peripheral domain keeps its state, so only the
-         * CPUs are restarted below.
-         */
-        fprintf(stderr, "mt6895: warm reset -- peripheral state preserved\n");
+    /*
+     * On MT6895 hardware, a Watchdog Software Reset (WDT SWRST key 0x1209)
+     * asserts system reset to all digital peripheral controllers, GIC,
+     * and CPU cores. Preserved across warm reset are DRAM contents (retained
+     * in self-refresh), RGU NONRST registers (in s->wdt_store), PMIC/RTC
+     * always-on registers, and SRAM. Skipping device reset left Linux's GIC
+     * redistributor PPI enables (0x880207f) and active timers running, and left
+     * mtk_ufs_lk_stage true, which routed UFS completion interrupts into
+     * BL2_EXT as Group 1 NS FIQs and triggered the platform_fiq panic.
+     * Always reset devices and reset mtk_ufs_lk_stage to false.
+     */
+    qemu_devices_reset(type);
+    s->atfctx_val = 0;
+    mtk_ufs_lk_stage = false;
+    if (mt6895_warm_reset_requested) {
+        fprintf(stderr, "mt6895: WDT software reset -- devices reset, PMIC/DRAM preserved\n");
     }
     mt6895_cpc_state_reset();
     {
