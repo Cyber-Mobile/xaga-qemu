@@ -9429,6 +9429,9 @@ static void mtk_secondary_atf_init(ARMCPU *cpu, unsigned n)
     }
 }
 
+extern uint64_t mtk_bl_params_ptr;
+extern bool mtk_gz_skip_active;
+
 static void mt6895_machine_reset(MachineState *machine, ResetType type)
 {
     Mt6895MachineState *s = MT6895_MACHINE(machine);
@@ -9450,10 +9453,32 @@ static void mt6895_machine_reset(MachineState *machine, ResetType type)
      * mtk_ufs_lk_stage true, which routed UFS completion interrupts into
      * BL2_EXT as Group 1 NS FIQs and triggered the platform_fiq panic.
      * Always reset devices and reset mtk_ufs_lk_stage to false.
+     * Also reset load-bearing model-side state across warm reset:
+     * bl_params pointer, GZ skip flag, DSI streaming engine and timers,
+     * HACC2 crypto done flag, GPUEB and SPM request flags.
      */
     qemu_devices_reset(type);
     s->atfctx_val = 0;
     mtk_ufs_lk_stage = false;
+    mtk_bl_params_ptr = 0;
+    mtk_gz_skip_active = false;
+    if (s->dsi_frame_timer) {
+        timer_del(s->dsi_frame_timer);
+    }
+    s->dsi_streaming = false;
+    s->dsi_irq_level = false;
+    if (s->dsi_irq) {
+        qemu_irq_lower(s->dsi_irq);
+    }
+    memset(s->dsi_regs, 0, sizeof(s->dsi_regs));
+    memset(s->dsi_rx, 0, sizeof(s->dsi_rx));
+    s->dsi_ulps_done = false;
+    s->dsi_sleep_out = false;
+    s->dsi_display_on = false;
+    s->dsi_cmdq_ready = false;
+    mt6895_hacc2_done = false;
+    mt6895_gpueb_started = false;
+    mt6895_spm_req_pending = false;
     if (mt6895_warm_reset_requested) {
         fprintf(stderr, "mt6895: WDT software reset -- devices reset, PMIC/DRAM preserved\n");
     }

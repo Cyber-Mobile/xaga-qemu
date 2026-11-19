@@ -1182,6 +1182,9 @@ static void mtk_syscon_reset_hold(Object *obj, ResetType type)
     memset(s->hwv_vote, 0, sizeof(s->hwv_vote));
     memset(s->hwv_done, 0, sizeof(s->hwv_done));
     s->efuse_unlocked = false;
+    mtk_infracfg_b4_ctl = false;
+    mtk_infracfg_b0_ctl = false;
+    mtk_hwv_pll_on = 0;
     mtk_syscon_bp_presets(s);
     mtk_efuse_apply_state(s);
 }
