@@ -660,9 +660,12 @@ void HELPER(exception_return)(CPUARMState *env, uint64_t new_pc)
         new_pc = 0x50f00000ULL;
     }
     /*
-     * MTK_GZ_SKIP=1: the gz_a payload is ciphertext in DRAM , so ATF's BL33 entry into GenieZone at the VMID1
-     * remap address would run garbage.  Stand-in: send that one hand-off to
-     * LK instead, through the EL3 -> LK fix-up below.  Off by default.
+     * MTK_GZ_SKIP=1: named bypass, off by default.  The DXCC-SEC model now
+     * executes the preloader's AES-128-CTR descriptors, so gz_a/gz_b really
+     * are plaintext in DRAM and this redirect exists only for the aided boot
+     * path while the GenieZone stage is still being brought up.  It sends that
+     * one hand-off to LK instead, through the EL3 -> LK fix-up below, and says
+     * so on stderr when it fires.  Listed in the injection-debt register.
      */
     if (new_pc == 0x87f800000ULL && arm_current_el(env) == 3 &&
         getenv("MTK_GZ_SKIP")) {

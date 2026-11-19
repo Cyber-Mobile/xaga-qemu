@@ -2,7 +2,7 @@
 
 **A full-system, scriptable simulator for the Xiaomi xaga (Redmi Note 11T Pro / POCO X4 GT, MediaTek MT6895).**
 
-Goal: boot the *real* device firmware stack — preloader → BL2_EXT → ATF → TEE → LK → Linux → Android —
+Goal: boot the *real* device firmware stack — preloader → BL2_EXT → ATF → TEE → GZ → LK → Linux → Android —
 and faithfully emulate the hardware around it, so that recovery, fastboot, adb and the Android UI run
 against the emulated phone instead of a model of it.
 
@@ -10,31 +10,68 @@ This project is implemented as a QEMU machine model (`-M mt6895`) on top of
 [QEMU](https://www.qemu.org/) (fork at branch `xaga`, based on `v11.1.1`). **QEMU is the substrate;
 the emulator is the project.**
 
+A hard rule shapes everything below: the model never patches guest images or plants guest state to get
+past a check. Workarounds are allowed only as clearly named, default-off diagnostics, and every one of
+them is listed in the injection-debt register and worked off.
+
 ![Recovery](docs/xaga/images/recovery-ui.png)
 
 ## What already works
 
 | Area | State |
 |---|---|
-| Preloader → BL2_EXT → ATF → TEE → LK → Linux 5.10 boot chain | ✅ |
-| Vendor Android userspace (boot to UI) | ✅ |
-| Recovery mode (`MTK_BOOT_MODE=2`) + Xiaomi HyperOS Recovery UI (full screen, no blit artifacts) | ✅ |
-| SMP: up to 8 cores online (lazy EL3 plant unlocks TEE/SiP SMC on secondary CPUs) | ✅ 4-core TEE path; A78 TEE path WIP |
+| BROM stub, preloader, BL2_EXT, ATF (TF-A v2.4) — real images, no image patching | ✅ |
+| TEE (Soter450 / ISEE450, plaintext BL32) runs its own bootstrap and SiP path | ✅ |
+| GZ (GenieZone hypervisor, EL2): `gz_a`/`gz_b` are decrypted **in the guest** by the DXCC AES model | 🧪 GZ executes and initialises itself; stops at a board-id ADC assertion (see roadmap) |
+| LK → Linux 5.10 → vendor Android userspace (UI) | ✅ via the temporary GZ bypass described below |
+| Recovery mode (`MTK_BOOT_MODE=2`) + Xiaomi recovery UI (full screen, no blit artifacts) | ✅ |
+| Touchscreen: MTK SPI controller + Novatek NVT36672C (`MTK_TOUCH=1`) | ✅ driver binds as `input2`, real coordinates through EINT → GIC |
+| PMIC/SPMI: MT6363 / MT6368 / MT6319, SPMI-PMIF, regulators and VSEL monitor aliases | ✅ all 15 main rails match the unit's own boot log |
+| PMIC OTP/efuse windows and the fuse state the unit reports | ✅ mechanism; contents only where the unit's log documents them |
+| Fuel gauge: bq28z610 (I2C) | ✅ |
 | Display: OVL composition, dual-pipe half swap, MIPI DSI command queue, GCE/CMDQ execution, SimpleFB fallback | ✅ |
 | Storage: UFS host controller (UIC/UTP/UCD), 4 KiB LUs, GPT, RPMB, block-backend (raw/snapshot/CoW) | ✅ |
 | USB host: xHCI with keyboard / network / audio enumeration | ✅ |
 | USB device mode: mtu3-style UDC + QMU, bridged to a host fastboot client (`getvar`, `download`, `flash`) | ✅ |
-| KPD, RTC, PMIC/SPMI, regulators, clocks | ✅ partial (strict vendor power/clock checks WIP) |
-| LineageOS: flash `boot`/`vendor_boot`/`dtbo`/`vbmeta`, boot to **recovery** (userspace + `adbd` started) | ✅ via `MTK_PWR_STATE=1` real power/clock modeling; default path unchanged |
+| Crypto engines: DXCC-SEC (AES-128-CTR, SHA-256) and MASP/HACC | ✅ execute the guest's descriptors |
+| Secure address alias (`0x800000000 + PA`) for the TEE/GZ view, topckgen ULPOSC calibration, KPD, RTC | ✅ |
+| SMP | 🚧 PSCI CPU_ON and CPC power-state ordering are modelled; the shipping run path uses `-smp 1` and 8-core bring-up is still open |
 | Audio: AFE model + 440 Hz self-test | 🧪 model ready |
+
+## Zero-injection status
+
+"Zero injection" means: no guest-visible state is invented and no firmware image is patched. The boot
+advances by modelling hardware correctly. Where that is not yet done, the model stops honestly instead
+of faking the next step. The ladder currently reaches:
+
+```
+BROM → preloader → BL2_EXT → ATF → TEE (real) → GZ (real code, EL2) → …
+```
+
+GZ gets through its own relocator, page tables and SMC-handler registration, and stops on
+`ASSERT FAILED at mt_smcall.c:626 (cpu_type!=0)`. That field comes from the preloader's board-ID ADC
+path: the model's ADCC auto-calibration fails, so the board ID reads as zero and the platform atag
+carries `devinfo.area30 = 0` instead of the unit's `0x2`. That is the next piece of hardware to model.
+
+To reach the UI today the project still uses **one named bypass**, `MTK_GZ_SKIP=1`, which redirects
+ATF's BL32 hand-off straight to LK. It is default-off, it prints a line when it fires, and it exists
+only while the GZ stage is being brought up. Everything else that used to be faked (ATF boot arguments,
+the synthetic name table, the fabricated BL2_EXT entry, the BROM boot-argument block, PMIC register
+values, the GZ ciphertext) has already been replaced by real models or real device data.
 
 ## Roadmap
 
 - [x] Boot chain, display, UFS, USB, recovery UI
 - [x] LK fastboot over emulated USB device mode (host-side client included)
 - [x] LineageOS kernel boot to recovery (`MTK_PWR_STATE=1` power/clock/bus-protection modeling)
-- [ ] Full LineageOS/Android boot and `adb sideload`
+- [x] Real GZ decryption: DXCC-SEC AES engine executes the preloader's descriptors, `gz_a`/`gz_b` come out plaintext
+- [x] Touchscreen end to end (driver bind, EINT, GIC, real coordinates)
+- [x] PMIC rails matching the unit, OTP/efuse windows, ULPOSC calibration
+- [ ] Board-ID ADC model so GZ gets `cpu_type != 0` and the zero-injection boot passes GZ
+- [ ] Remove the last named bypasses (GZ hand-off, EL3 plant, LK boot-arg plant)
+- [ ] Full LineageOS/Android boot and `adb sideload` without any bypass
 - [ ] Kernel USB gadget: `fastbootd`, `adb`, `adb sideload` in recovery
+- [ ] SMP: 8 cores online with the TEE/SiP path working on every core
 - [ ] Audio path end-to-end (AFE + MT6368 codec + smart PA)
 - [ ] Networking (Wi-Fi/BT connectivity stack), sensors, camera, and automation/CI hooks
 - [ ] Deterministic record/replay and regression suites for every subsystem
@@ -57,39 +94,76 @@ The emulator boots **your own device dumps** (none are distributed here):
 - `fw/gpt_512.bin` — GPT blob used by the BootROM stub
 - `data/lu2.img` — raw UFS user-data LUN (sparse raw image recommended)
 
+Recovery boot, the path that is exercised today (6 GiB, one core, deterministic timing):
+
 ```bash
-export MTK_MEM=8G MTK_ICOUNT=off MTK_LU2_SNAP=1
-export MTK_NO_NAMETBL=1 MTK_KINFO_FLAG0=1 MTK_LU2_RO=1 MTK_WDT_STATUS_VAL=1
-export MTK_NO_ATFLOG=1 MTK_NO_ATFARG=1 MTK_NO_ATFARG2=1 MTK_GZ_SKIP=1 MTK_NO_GTAPLANT=1
+export MTK_MEM=6G MTK_KINFO_FLAG0=1 MTK_WDT_STATUS_VAL=1 MTK_LU2_SNAP=1
+export MTK_BOOT_MODE=2 MTK_PWR_STATE=1
+export MTK_NO_ATFLOG=1 MTK_NO_GTAPLANT=1 MTK_NO_XHCI=1 MTK_GZ_SKIP=1   # see zero-injection status
 
 ./build/qemu-system-aarch64 \
   -M mt6895,preloader=fw/LUA_1,gpt=fw/gpt_512.bin,data=data/lu2.img,entry-bytes=3072 \
-  -m 8G -smp 1 -display none -monitor none -accel tcg,tb-size=256 \
+  -m 6G -smp 1 -display none -monitor none \
+  -icount shift=6,sleep=off -accel tcg,tb-size=256 \
   -serial file:OUT.log
 ```
 
+Drop `MTK_GZ_SKIP` (and the other diagnostics) to run the zero-injection ladder; it currently stops
+inside GZ as described above. `-icount shift=4` trades timing fidelity for speed (~70 s to recovery on
+a desktop CPU); `shift=6` is the slower, more conservative default used for comparisons.
+
 ### Useful environment switches
+
+Boot and platform:
 
 | Variable | Effect |
 |---|---|
 | `MTK_BOOT_MODE=2` | boot recovery |
+| `MTK_PWR_STATE=1` | real power/clock/bus-protection sequencing (required by the LineageOS kernel) |
+| `MTK_MEM=6G\|8G` | DRAM size presented to the guest |
+| `MTK_LU2_SNAP=1` | user-data LUN snapshot mode |
+| `MTK_TOUCH=1` | instantiate the MTK SPI controller and the Novatek NVT36672C touch client (`0`/unset = off) |
+
+Display and input:
+
+| Variable | Effect |
+|---|---|
 | `MTK_FBDUMP=<prefix>` | dump composed frames as PPM |
 | `MTK_DISP_SRC=simplefb\|drm` | select display path |
 | `MTK_GCE_EXEC=on` | execute GCE/CMDQ instructions |
-| `MTK_USB_HOSTMODE=1` | expose mtu3 as xHCI host with emulated devices |
-| `MTK_USBDEV=1 MTK_USBDEV_TCP=4444` | device-mode UDC + TCP bridge for fastboot |
-| `MTK_IOMMU=0` | disable the **default-on** M4U/IOMMU translation and let clients program physical addresses; when enabled the model uses ARMv7 short-descriptor page tables + the MTK 34-bit IOVA/35-bit PA extension, and the DRM/GCE clients program IOVAs whose DMA reads are translated |
-| `MTK_IOMMU_LOG=1` | trace the M4U page-table base, TLB invalidations and identity/fault translations |
-| `MTK_DT_NOIOMMU=1` | **deprecated** legacy bring-up hack: NOP the device-tree `iommus` properties so DRM/GCE fall back to physical addresses; the M4U model is enabled by default and is the supported path |
-| `MTK_KCMDLINE_SUBST='old:new'` | same-length kernel cmdline substitution (diagnostic); the \`cma=256M\` workaround it was used for is **deprecated** - the IOMMU model removes the contiguous-CMA requirement |
-| `MTK_DISP_VBLANK=0` | **A/B:** disable the default-on DISP mutex frame-EOF model (plain register window, no vblank IRQ) |
-| `MTK_NO_DSI_MODEL=1` | **A/B:** disable the DSI controller model; the DSI interrupt stays a plain level IRQ |
+| `MTK_DISP_VBLANK=0` | **A/B:** disable the default-on DISP mutex frame-EOF model |
+| `MTK_NO_DSI_MODEL=1` | **A/B:** disable the DSI controller model |
 | `MTK_NO_DISPMUTEX=1` | **A/B:** disable the DISP mutex acquire/EOF model |
-| `MTK_BL_LOG=1` | log KTZ8863A backlight/bias updates (diagnostic) |
-| `MTK_SMPDBG=1` | per-CPU debug trail |
-| `MTK_ATF_LAZY_PLANT=1` | plant EL3 context before first non-PSCI SMC (secondary TEE) |
+| `MTK_BL_LOG=1` | log KTZ8863A backlight/bias updates |
 
-## Host-side fastboot client
+USB and memory:
+
+| Variable | Effect |
+|---|---|
+| `MTK_USB_HOSTMODE=1` | expose mtu3 as an xHCI host with emulated devices |
+| `MTK_USBDEV=1 MTK_USBDEV_TCP=4444` | device-mode UDC + TCP bridge for fastboot/adb |
+| `MTK_IOMMU=0` | disable the **default-on** M4U/IOMMU translation and let clients program physical addresses |
+| `MTK_IOMMU_LOG=1` | trace the M4U page-table base, TLB invalidations and translations |
+| `MTK_DT_NOIOMMU=1` | **deprecated** legacy bring-up hack (NOPs the DT `iommus` properties) |
+| `MTK_KCMDLINE_SUBST='old:new'` | same-length kernel cmdline substitution (diagnostic) |
+
+Diagnostics (observation only; none of them change guest-visible behaviour):
+
+| Variable | Effect |
+|---|---|
+| `MTK_EFUSE_TRACE=1`, `MTK_EFUSE_STATE=xaga\|blank`, `MTK_EFUSE_FILE=<path>` | efuse/OTP contents and access trace |
+| `MTK_DXCCLOG=1`, `MTK_DXCC_AESLOG=1`, `MTK_GZ_DUMP=<prefix>` | DXCC-SEC register/descriptor trace and buffer dumps |
+| `MTK_SMPDBG=1` | per-CPU debug trail |
+
+Named bypasses (default off; listed in the debt register, being removed):
+
+| Variable | Effect |
+|---|---|
+| `MTK_GZ_SKIP=1` | redirect ATF's BL32 hand-off to LK instead of GenieZone |
+| `MTK_NO_GTAPLANT=1` | disable the ATF/GTA EL3 plant |
+| `MTK_ATF_LAZY_PLANT=1` | plant the EL3 context before the first non-PSCI SMC |
+
+## Host-side fastboot / adb client
 
 `contrib/xaga-host/` contains a standalone Python client for the emulated UDC bridge:
 
@@ -98,19 +172,22 @@ python3 contrib/xaga-host/fastboot_cli.py --host 127.0.0.1 --port 4444 getvar ve
 python3 contrib/xaga-host/fastboot_cli.py --host 127.0.0.1 --port 4444 --flash boot_a=boot.img
 ```
 
-It implements USB enumeration, fastboot `download:`/`flash:` with 16 KiB chunking and a mock device
-for offline testing (`contrib/xaga-host/lib/mock_device.py`).
+It implements USB enumeration, fastboot `download:`/`flash:` with 16 KiB chunking, an adb client
+(CNXN/AUTH, shell, reboot, sideload, push) and a mock device for offline testing
+(`contrib/xaga-host/lib/mock_device.py`).
 
 ## Repository layout
 
 ```
-hw/arm/mt6895.c           SoC machine model and boot chain integration
-hw/misc/mtk_*.c           syscon, IOMMU, GCE, UFS, SPMI, UDC, …
-hw/display/mtk_disp.c     OVL/DSI display model
-include/hw/arm/mt6895.h   machine defines
-host/                     host-side fastboot client and mock device
-docs/                     architecture and usage notes (images in docs/images)
-scripts/                  build/run helpers
+hw/arm/mt6895.c            SoC machine model and boot-chain integration
+hw/misc/mtk_*.c            syscon/efuse, IOMMU, GCE, UFS, SPMI-PMIC, EINT, UDC, KPD, RTC, …
+hw/ssi/mtk_spi.c           MTK SPI controller (touch bus)
+hw/i2c/mtk_i2c.c           I2C controller (fuel gauge and friends)
+hw/display/mtk_disp.c      OVL/DSI display model
+include/hw/arm/mt6895.h    machine defines and register maps
+contrib/xaga-host/         host-side fastboot/adb client and mock device
+docs/xaga/                 architecture and usage notes (images in docs/xaga/images)
+scripts/                   build/run helpers
 ```
 
 ## Legal & provenance
