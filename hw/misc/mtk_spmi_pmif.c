@@ -270,6 +270,24 @@ static const PmicPowerOnReg mt6363_power_on[] = {
     { 0x0a0f, 0x01 },                     /* STRUP_CON12[0xA0F] = 0x1 */
     { 0x0139, 0x04 },                     /* WDTRSTB[0x139] = 0x4 */
     /*
+     * Power-on reset defaults for two rail registers the get-voltage phase
+     * reads before anything writes them (verified against the SPMI trace: their
+     * first access is the read at serial "get volt", no earlier write exists in
+     * preloader/BL2_EXT/LK).
+     *   SID4 0x24e : reset default, value 0x78 from device get-volt line
+     *                "[MT6363] get volt 1, 120, 0, 750000", address from trace
+     *                15602 -> INFERRED.
+     *   SID4 0x258 : reset default, value 0x48 from device get-volt line
+     *                "[MT6363] get volt 6, 72, 0, 850000", address from trace
+     *                15596 -> INFERRED.
+     * If a stage we do not model would have written them on the device, these
+     * seeds would mask that gap; that is recorded as an INFERRED debt item.
+     * BROM is not modelled, so a BROM write to these addresses cannot be
+     * excluded (the trace proof covers preloader onward only).
+     */
+    { 0x024e, 0x78 },                     /* vcore readback 120 (750000 uV) */
+    { 0x0258, 0x48 },                     /* vsram_digrf readback 72 (850000 uV) */
+    /*
      * Rail VSEL contents latched at boot: values DIRECT from the
      * "[MT6363] latch <rail> <uV>(<code>)" lines, addresses INFERRED from the
      * SPMI trace of the same boot (the latch loop reads these in rail order).
@@ -310,6 +328,16 @@ static const PmicPowerOnReg mt6368_power_on[] = {
     { 0x0213, 0x00 },                     /* VR_SDN_MODE6[0x213] = 0x0 */
     { 0x0139, 0x04 },                     /* WDTRSTB[0x139] = 0x4 */
     { 0x0240, 0x0c },
+    /*
+     * Power-on reset default for the vapu rail register: the get-voltage phase
+     * reads SID5 0x250 before anything writes it (verified in the SPMI trace:
+     * first access is the read at trace 15632, and the only write in the whole
+     * boot is much later at trace 41390).  Value 0x78 from device get-volt line
+     * "[MT6368] get volt 20, 120, 0, 750000", address from trace -> INFERRED
+     * reset-default seed.  BROM is not modelled, so a BROM write to this
+     * address cannot be excluded (the trace proof covers preloader onward only).
+     */
+    { 0x0250, 0x78 },
     /* Rail VSEL latches: VBUCK1..6 at 0x1423..0x1428, VPA at 0x1429. */
     { 0x1423, 0x00 },                     /* VBUCK1 0 uV (0x0) */
     { 0x1424, 0x00 },                     /* VBUCK2 0 uV (0x0) */
@@ -332,8 +360,15 @@ static const PmicPowerOnReg mt6319_s6_power_on[] = {
     { 0x1416, 0x00 },                     /* BUCK_OC_SDN_STS[0x1416] = 0x0 */
     { 0x1451, 0x1f },                     /* BUCK_OC_SDN_EN[0x1451] = 0x1F */
     { 0x0126, 0x04 },                     /* TOP_RST_MISC[0x126] = 0x4 */
-    { 0x1419, 0x68 },                     /* latch vcpub 493750 uV (0x68) */
-    { 0x141d, 0x00 },                     /* latch vmm 0 uV (0x0) */
+    /*
+     * Rail VSEL registers of this die.  The payload uses two aliases for the
+     * same register (0x1419/0x1449 and 0x141d/0x144d) and reads the monitor
+     * aliases 0x1499/0x1599 for the current voltage; see the MT6319 mirror
+     * handling in mtk_spmi_pmif_xfer().  Values are the device's own latched
+     * codes ("[MT6319]latch vcpub 493750 uV(0x68)", "... vmm 0 uV(0x0)").
+     */
+    { 0x1419, 0x68 }, { 0x1449, 0x68 },   /* vcpub 493750 uV (0x68) */
+    { 0x141d, 0x00 }, { 0x144d, 0x00 },   /* vmm 0 uV (0x0) */
 };
 
 static const PmicPowerOnReg mt6319_s7_power_on[] = {
@@ -347,8 +382,12 @@ static const PmicPowerOnReg mt6319_s7_power_on[] = {
     { 0x1416, 0x00 },
     { 0x1451, 0x1f },
     { 0x0126, 0x04 },
-    { 0x1419, 0x78 },                     /* latch vcpum 500000 uV (0x78) */
-    { 0x141d, 0x74 },                     /* latch vcpul 550000 uV (0x74) */
+    /*
+     * VSEL/monitor aliases for this die; values are the device's latches
+     * ("[MT6319]latch vcpum 500000 uV(0x78)", "... vcpul 550000 uV(0x74)").
+     */
+    { 0x1419, 0x78 }, { 0x1449, 0x78 },   /* vcpum 500000 uV (0x78) */
+    { 0x141d, 0x74 }, { 0x144d, 0x74 },   /* vcpul 550000 uV (0x74) */
 };
 
 /* MT6685 RTC/auxadc PMIC (slave 9), from the "[MT6685]..." lines. */
@@ -694,6 +733,47 @@ static void mtk_spmi_pmif_record_cmd(MtkSpmiPmifState *s, unsigned chan,
     s->cmdq_count++;
 }
 
+/*
+ * MT6319 rail register aliases.
+ *
+ * The payload reaches each MT6319 buck's voltage-select register under two
+ * addresses (0x1419/0x1449 for buck A, 0x141d/0x144d for buck B on both dies)
+ * and reads the current setting through separate monitor addresses (0x1499 for
+ * buck A, 0x1599 for buck B).  Addresses come from the preloader's own SPMI
+ * sequence: it writes 0x1449/0x144d for the set phase and reads 0x1499/0x1599
+ * in the get-voltage phase; the device's get lines (vcpub 120=0x78,
+ * vcpum 95=0x5f, vcpul 97=0x61) are the codes that must appear there.  A write
+ * through either alias therefore has to be visible through all of them.
+ */
+static unsigned mt6319_vsel_alias(unsigned reg)
+{
+    switch (reg) {
+    case 0x1419:
+        return 0x1449;
+    case 0x1449:
+        return 0x1419;
+    case 0x141d:
+        return 0x144d;
+    case 0x144d:
+        return 0x141d;
+    default:
+        return 0;
+    }
+}
+
+/* Monitor address -> VSEL register it reports. */
+static unsigned mt6319_vsel_monitor(unsigned reg)
+{
+    switch (reg) {
+    case 0x1499:
+        return 0x1449;
+    case 0x1599:
+        return 0x144d;
+    default:
+        return 0;
+    }
+}
+
 static void mtk_spmi_pmif_xfer(MtkSpmiPmifState *s, unsigned chan, uint32_t cmd)
 {
     unsigned opc = (cmd >> 30) & 0x3;
@@ -725,8 +805,18 @@ static void mtk_spmi_pmif_xfer(MtkSpmiPmifState *s, unsigned chan, uint32_t cmd)
         uint8_t fq_en_before = s->pmic[sid][MT6685_FQMTR_CON0_H];
 
         for (i = 0; i < len; i++) {
-            s->pmic[sid][addr + i] = (data >> (8 * i)) & 0xff;
-            mtk_spmi_ring_add(sid, addr + i, (data >> (8 * i)) & 0xff, 0);
+            unsigned r = addr + i;
+            uint8_t v = (data >> (8 * i)) & 0xff;
+
+            s->pmic[sid][r] = v;
+            if (s->slave_part[sid] == PMIC_PART_MT6319) {
+                unsigned alias = mt6319_vsel_alias(r);
+
+                if (alias) {
+                    s->pmic[sid][alias] = v;
+                }
+            }
+            mtk_spmi_ring_add(sid, r, v, 0);
         }
 
         /* RTC auto-clearing trigger / busy bits */
@@ -786,8 +876,18 @@ static void mtk_spmi_pmif_xfer(MtkSpmiPmifState *s, unsigned chan, uint32_t cmd)
         uint32_t data = 0;
 
         for (i = 0; i < len; i++) {
-            data |= (uint32_t)s->pmic[sid][addr + i] << (8 * i);
-            mtk_spmi_ring_add(sid, addr + i, s->pmic[sid][addr + i], 1);
+            unsigned r = addr + i;
+            uint8_t v = s->pmic[sid][r];
+
+            if (s->slave_part[sid] == PMIC_PART_MT6319) {
+                unsigned src = mt6319_vsel_monitor(r);
+
+                if (src) {
+                    v = s->pmic[sid][src];
+                }
+            }
+            data |= (uint32_t)v << (8 * i);
+            mtk_spmi_ring_add(sid, r, v, 1);
         }
         s->pmif_regs[PMIF_SWINF_RDATA(chan) / 4] = data;
         s->pmif_regs[PMIF_SWINF_STA(chan) / 4] = SWINF_WFVLDCLR_VAL;
