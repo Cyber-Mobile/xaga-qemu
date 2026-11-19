@@ -189,6 +189,40 @@ static const struct MtkEfuseWord {
      * bits[1:0] being non-zero.
      */
     { 0x490, 0x1, "blow status: already blown (gate: bits[1:0]!=0)" },
+    /*
+     * VB info words read by the preloader through the dispatcher at VA
+     * 0x02054860 (table VA 0x0206E874): getter index 0x4b returns the u32 at
+     * efuse offset 0xcb8 and it is printed with %x as
+     *   "[PMIF] VCORE VB_INFO1 = %x"     (print site VA 0x020400c4)
+     * getter index 0x26 returns offset 0x8f8 and prints
+     *   "[PMIF] OPP4 VB INFO = %x"        (print site VA 0x020400fc)
+     * Values are this unit's own words exactly as printed by its boot log
+     * (device: 0x1539f09b and 0x0db50000).  This is documented device state,
+     * not an inference: the console line IS the word.
+     */
+    { 0xcb8, 0x1539f09b, "VCORE VB_INFO1 (device log %x, getter idx 0x4b)" },
+    { 0x8f8, 0x0db50000, "OPP4 VB INFO (device log %x, getter idx 0x26)" },
+    /*
+     * GPU AVS per-OPP words.  Preloader VA 0x0203151c loops OPPs
+     * [0,1,9,0x11,0x21,0x29] (table VA 0x0206be30) and reads getter indices
+     * [0x4c,0x30,0x31,0x32,0x33,0x35] (table VA 0x0206be48), which resolve
+     * through the dispatcher table to efuse offsets 0xd74, 0x5d4, 0x5d8,
+     * 0x5dc, 0x5e0, 0x5e4.  The decode there is
+     *   comb = (v & 0x30) + ((v >> 14) & 0xf) + ((v & 0xc) << 4)
+     *   volt = comb * 625
+     * and the device log gives 78750, 67500, 66250, 62500, 52500, 48750 uV,
+     * i.e. comb = 126, 108, 106, 100, 84, 78 in that same OPP order (the
+     * ordering is pinned by the OPP table, not guessed).  comb fixes only
+     * bits [5:4], [17:14] and [3:2] of the word; the other bits are NOT
+     * determined by the logged voltage, so they are left zero here.
+     * INFERRED-partial; unknown bits per word: [31:18], [13:6], [1:0].
+     */
+    { 0xd74, 0x00038034, "GPU AVS OPP0 comb=126 (INFERRED-partial: bits[31:18],[13:6],[1:0] unknown)" },
+    { 0x5d4, 0x00030024, "GPU AVS OPP1 comb=108 (INFERRED-partial: bits[31:18],[13:6],[1:0] unknown)" },
+    { 0x5d8, 0x00028024, "GPU AVS OPP9 comb=106 (INFERRED-partial: bits[31:18],[13:6],[1:0] unknown)" },
+    { 0x5dc, 0x00010024, "GPU AVS OPP17 comb=100 (INFERRED-partial: bits[31:18],[13:6],[1:0] unknown)" },
+    { 0x5e0, 0x00010014, "GPU AVS OPP33 comb=84 (INFERRED-partial: bits[31:18],[13:6],[1:0] unknown)" },
+    { 0x5e4, 0x00038004, "GPU AVS OPP41 comb=78 (INFERRED-partial: bits[31:18],[13:6],[1:0] unknown)" },
 };
 
 static void mtk_efuse_trace(char rw, hwaddr off, unsigned size, uint64_t val)
