@@ -1059,116 +1059,6 @@ static const MemoryRegionOps mt6895_planted_ops = {
 };
 
 
-/* ATF head: reads return fake node address, writes ignored (ATF
- * registration must not resurrect garbage nodes). */
-static uint64_t mt6895_atf_head_read(void *opaque, hwaddr off, unsigned size)
-{
-    (void)opaque;
-    /*
-     * Report an EMPTY console handler list.
-     *
-     * The real head lives in ATF's BSS and comes up holding stale DRAM
-     * (observed 0xb311dad, not a pointer) in this model, so putc walked it
-     * and took ~922k data aborts at 0x482057ec. An empty list makes putc
-     * return immediately: ATF's console output is dropped, but ATF no longer
-     * dies in its own console path, which is what matters for boot progress.
-     */
-    if (off == 0 && size <= 8) {
-        return 0x48253b58ULL;
-    }
-    return 0;
-}
-static void mt6895_atf_head_write(void *opaque, hwaddr off, uint64_t val,
-                                  unsigned size)
-{
-    (void)opaque; (void)off; (void)val; (void)size;
-}
-static const MemoryRegionOps mt6895_atf_head_ops = {
-    .read = mt6895_atf_head_read,
-    .write = mt6895_atf_head_write,
-    .endianness = DEVICE_NATIVE_ENDIAN,
-    .valid = {
-        .min_access_size = 1,
-        .max_access_size = 8,
-    },
-};
-
-/*
- * Write watch on the ATF console handler-list head (0x48253b50).
- *
- * QEMU itself only zeroes this slot at reset, yet by the time ATF's
- * mtk_console registers its node the slot holds 0x48200300 -- an ATF .text
- * address, not a node pointer -- so registration fails and ATF panics at
- * mtk_console.c:71. This overlay logs who writes it (PC + value) and then
- * writes through to DRAM, so behaviour is unchanged.
- */
-;
-
-/* Fake ATF node (0x48253b58, 0x38 bytes): {next=0,flags=5,func=0x48204d40
- * mailbox,ctx=0x1c351000}. Write-ignored so ATF BSS clear can't wipe it. */
-static const uint64_t mt6895_atf_node_def[7] = {
-    0, 5, 0x48204d40ULL, 0, 0, 0x1c351000ULL, 0x1c351000ULL
-};
-/*
- * Shadow copy of the console node.
- *
- * The node cannot live in plain DRAM: ATF's cold-entry BSS clear (DC ZVA
- * over 0x4824b000..0x4825e000) wipes 0x48253b58 after reset. It cannot be a
- * read-only overlay either: mtk_console's node constructor (0x48204d48)
- * stores the uart context into node+0x28 and then validates it, so dropping
- * those writes makes the constructor fail and mtk_console takes its panic
- * path (mtk_console.c:71). So keep a shadow buffer: seeding writes of zero
- * (the BSS clear) are ignored, every other write is applied.
- */
-static uint8_t mt6895_atf_node_shadow[0x38];
-static bool mt6895_atf_node_shadow_ready;
-
-static void mt6895_atf_node_shadow_init(void)
-{
-    if (!mt6895_atf_node_shadow_ready) {
-        memcpy(mt6895_atf_node_shadow, mt6895_atf_node_def, 0x38);
-        mt6895_atf_node_shadow_ready = true;
-    }
-}
-
-static uint64_t mt6895_atf_node_read(void *opaque, hwaddr off, unsigned size)
-{
-    size_t i;
-    uint64_t v = 0;
-
-    (void)opaque;
-    mt6895_atf_node_shadow_init();
-    if (off + size > 0x38) {
-        return 0;
-    }
-    for (i = 0; i < size; i++) {
-        v |= (uint64_t)mt6895_atf_node_shadow[off + i] << (8 * i);
-    }
-    return v;
-}
-
-static void mt6895_atf_node_write(void *opaque, hwaddr off, uint64_t val,
-                                  unsigned size)
-{
-    size_t i;
-
-    (void)opaque;
-    mt6895_atf_node_shadow_init();
-    if (off + size > 0x38) {
-        return;
-    }
-    /*
-     * Ignore zero stores: ATF's cold-entry BSS clear (DC ZVA and the
-     * surrounding zeroing loop) runs over this address before the tag is
-     * consumed, in chunks of 4, 8 and 16 bytes depending on the path.
-     */
-    if (val == 0) {
-        return;
-    }
-    for (i = 0; i < size; i++) {
-        mt6895_atf_node_shadow[off + i] = (val >> (8 * i)) & 0xff;
-    }
-}
 /*
  * Platform tag area (GTA) for ATF.
  *
@@ -1339,15 +1229,6 @@ static void mt6895_atf_uartobj_write(void *opaque, hwaddr off, uint64_t val,
     }
 }
 
-static const MemoryRegionOps mt6895_atf_node_ops = {
-    .read = mt6895_atf_node_read,
-    .write = mt6895_atf_node_write,
-    .endianness = DEVICE_NATIVE_ENDIAN,
-    .valid = {
-        .min_access_size = 1,
-        .max_access_size = 8,
-    },
-};
 
 
 /*
@@ -15706,28 +15587,6 @@ static const uint8_t stub_cmd_def[0x80] = {
 
 
         /*
-         * ATF SMC handler list: ATF cold entry registers nodes into bss at
-         * 0x48253b58 (layout {next,flags,func_smc,pad,func_early,ctx,
-         * ctx2}), but warm-reset skips cold entry so the list is poison.
-         * Plant one fake node whose func is a bare `ret` (ATF dispatcher
-         * returns w0=id echo, so BL2 sees the mailbox id echoed as success)
-         * and whose ctx fields are dead (func never touches them).
-         */
-        static const uint8_t atf_list_head_def[8] = {
-            0x58, 0x3b, 0x25, 0x48, 0x00, 0x00, 0x00, 0x00,
-        };
-
-        /*
-         * This slot was declared but never actually assigned, so planted[6]
-         * stayed a zero-size region and intercepted nothing: ATF's console
-         * list head fell through to plain DRAM, where it is zero after ATF's
-         * own BSS clear. putc then walks an empty list, drops every
-         * character, and ATF sits in its print loop forever (measured:
-         * PC=0x482057e4 with w0=' ' / '0') -- which is why every ATF panic
-         * looked silent. Point the head at the fake node below.
-         */
-        planted[6] = (Mt6895Planted){ s, 0x48253b50, 8, atf_list_head_def };
-        /*
          * NOTE: 0x48253b50.. (ATF bss) live inside 12G DRAM, so a sysmem
          *     subregion at priority 0 does NOT reliably shadow DRAM reads:
          *     CPU still sees DRAM leftovers. Head/node/ack are therefore
@@ -15862,8 +15721,7 @@ static const uint8_t stub_cmd_def[0x80] = {
         }
 
         for (int i = 0; i < 8; i++) {
-            const MemoryRegionOps *ops = (i == 6) ? &mt6895_atf_head_ops
-                                                  : &mt6895_planted_ops;
+            const MemoryRegionOps *ops = &mt6895_planted_ops;
 
             /*
              * MTK_NO_FAKE_DEVO: drop the planted block-device object and its
@@ -15880,7 +15738,7 @@ static const uint8_t stub_cmd_def[0x80] = {
                            MTK_ENV_CACHED("MTK_BDEV_NOSTUB"))) {
                 continue;
             }
-            if (i == 5) {
+            if (i == 5 || i == 6) {
                 continue;
             }
             if (0) {
@@ -15892,15 +15750,6 @@ static const uint8_t stub_cmd_def[0x80] = {
                                   planted[i].size);
             memory_region_add_subregion(sysmem, planted[i].base, &s->planted[i]);
         }
-        /*
-         * The console node the head points at. Served from a read-only
-         * overlay (not RAM) because ATF's cold-entry BSS clear -- DC ZVA
-         * over 0x4824b000..0x4825e000 -- wipes 0x48253b58 after reset, so
-         * a node written into DRAM at reset does not survive.
-         */
-        memory_region_init_io(&s->atf_node_mr, OBJECT(s), &mt6895_atf_node_ops,
-                              NULL, "mt6895.atf-node", 0x38);
-        memory_region_add_subregion(sysmem, 0x48253b58ULL, &s->atf_node_mr);
         /*
          * ATF's UART object pointer.
          *
