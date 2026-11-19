@@ -1058,29 +1058,6 @@ static const MemoryRegionOps mt6895_planted_ops = {
     },
 };
 
-/* ATF lock byte 0x48245ff4: acquire returns 1 and dispatches only
- * when ldarb sees 0 (ATF sets it). Returning 0 here makes ATF
- * acquire+dispatch every SMC; later clear-lock write is ignored so
- * next SMC still acquires. */
-static uint64_t mt6895_atf_lock_read(void *opaque, hwaddr off, unsigned size)
-{
-    (void)opaque; (void)off; (void)size;
-    return 0;
-}
-static void mt6895_atf_lock_write(void *opaque, hwaddr off, uint64_t val,
-                                 unsigned size)
-{
-    (void)opaque; (void)off; (void)val; (void)size;
-}
-static const MemoryRegionOps mt6895_atf_lock_ops = {
-    .read = mt6895_atf_lock_read,
-    .write = mt6895_atf_lock_write,
-    .endianness = DEVICE_NATIVE_ENDIAN,
-    .valid = {
-        .min_access_size = 1,
-        .max_access_size = 8,
-    },
-};
 
 /* ATF head: reads return fake node address, writes ignored (ATF
  * registration must not resurrect garbage nodes). */
@@ -1372,82 +1349,6 @@ static const MemoryRegionOps mt6895_atf_node_ops = {
     },
 };
 
-/*
- * ATF per-CPU log/console objects.
- *
- * 0x482063e8 returns 0x48253930 (or 0x48253988 when w0==1) only if the
- * object's +8 field is non-zero; otherwise it returns NULL and its caller
- * dereferences NULL+8 and takes a translation fault at 0x48227754. Those
- * objects are normally built by the debug-buffer init, which fails here
- * because BL2 never reserved the "atf-log-reserved" mblock. Supply objects
- * whose +8 field points at a zeroed scratch page in ATF's mapped gap, so the
- * caller has a valid (if empty) log object to work with.
- */
-static uint64_t mt6895_atflog_read(void *opaque, hwaddr off, unsigned size)
-{
-    Mt6895MachineState *s = opaque;
-    uint8_t *p = mt6895_guest_ptr(s, 0x48253930ULL + off, size);
-    uint64_t v = 0;
-    unsigned i;
-
-    /*
-     * BL31 keeps its next-image entry_point_info_t in this BSS slot and
-     * writes it itself (0x4821ad74 / 0x4821ad0c in the image: +0 header,
-     * +8 pc, +0x10 spsr).  Reads must return what the firmware wrote --
-     * the earlier revision answered with a hardcoded pc/spsr here, which
-     * discarded BL31's own AArch64 SPSR and made it treat BL33 as AArch32
-     * (ERET spsr=0x1d3), leaving the SiP dispatcher in 32-bit mode.
-     *
-     * The same slot doubles as a debug-log object whose +8 field is tested
-     * for non-zero before the log is set up; until BL31 fills it, answer
-     * that probe with the BL33 entry so the log path has a valid object.
-     */
-    if (MTK_ENV_CACHED("MTK_ATFLOG_PROBE")) {
-        return 0xdeadbe00ULL | (off & 0xff);
-    }
-    {
-        static int nr;
-
-        if (nr < 24) {
-            nr++;
-            fprintf(stderr, "MTK-ATFLOG-RD off=%#x size=%u pc=%#" PRIx64 "\n",
-                    (unsigned)off, size,
-                    current_cpu ? (uint64_t)ARM_CPU(current_cpu)->env.pc : 0);
-        }
-    }
-    for (i = 0; p && i < size; i++) {
-        v |= (uint64_t)p[i] << (8 * i);
-    }
-    if (v != 0) {
-        return v;
-    }
-    if (off == 8 || off == 0x60) {
-        return 0x50f00000ULL;          /* BL33 (LK) entry, log-object probe */
-    }
-    if (off == 0x10 || off == 0x68) {
-        return 0x3c5ULL;               /* SPSR: EL1h, DAIF masked, AArch64 */
-    }
-    return 0;
-}
-
-static void mt6895_atflog_write(void *opaque, hwaddr off, uint64_t val,
-                                unsigned size)
-{
-    Mt6895MachineState *s = opaque;
-    uint8_t *p = mt6895_guest_ptr(s, 0x48253930ULL + off, size);
-    unsigned i;
-
-    /*
-     * Let BL31's own writes land: this slot holds the next-image
-     * entry_point_info_t it builds at run time.
-     */
-    if (!p) {
-        return;
-    }
-    for (i = 0; i < size; i++) {
-        p[i] = (val >> (8 * i)) & 0xff;
-    }
-}
 
 /*
  * MTK CPC/SMP power controller bridge (dcm-mp-cpusys-top block, 0x0C538000).
@@ -1991,13 +1892,6 @@ static const MemoryRegionOps mt6895_cpc_entry_ops = {
     .impl = { .min_access_size = 4, .max_access_size = 4 },
 };
 
-static const MemoryRegionOps mt6895_atflog_ops = {
-    .read = mt6895_atflog_read,
-    .write = mt6895_atflog_write,
-    .endianness = DEVICE_NATIVE_ENDIAN,
-    .valid = { .min_access_size = 1, .max_access_size = 8 },
-    .impl = { .min_access_size = 1, .max_access_size = 8 },
-};
 
 static const MemoryRegionOps mt6895_atf_uart_ops = {
     .read = mt6895_atf_uart_read,
@@ -9789,31 +9683,6 @@ static void mt6895_machine_reset(MachineState *machine, ResetType type)
                 "SRAM contents kept\n");
     }
     /*
-     * ATF SMC handler list, in the configuration that was measured to work
-     * (see docs/xaga/architecture.md): BL2's SMC service enumeration is
-     * dispatched by walking the list at 0x48253b50, so the model supplies a
-     * single node whose handler is ATF's own mailbox writer (0x48204d40)
-     * with the tinysys mailbox as its context. With this in place BL2
-     * proceeds to BL33/LK; without it the dispatcher walks a stale/garbage
-     * list and ATF panics.
-     *
-     * NOTE: this is a model stand-in for ATF's own cold-boot registration,
-     * which never runs because this machine hands off warm.
-     */
-    {
-        /* Stand-in ATF SMC node (kept: ATF's own list is still empty here). */
-        AddressSpace *as = &address_space_memory;
-        uint64_t node[7] = { 0, 5, 0x48204d40ULL, 0, 0, 0x1c351000ULL,
-                             0x1c351000ULL };
-
-        address_space_stq_le(as, 0x48253b50ULL, 0x48253b58ULL,
-                             MEMTXATTRS_UNSPECIFIED, NULL);
-        for (unsigned i = 0; i < 7; i++) {
-            address_space_stq_le(as, 0x48253b58ULL + i * 8, node[i],
-                                 MEMTXATTRS_UNSPECIFIED, NULL);
-        }
-    }
-    /*
      * The device reset above puts the GIC back to all-zero, which would undo
      * the BL2-style bring-up. Re-apply it here, after the reset.
      */
@@ -15835,16 +15704,6 @@ static const uint8_t stub_cmd_def[0x80] = {
         static const uint8_t lk_bootarg_def[4] = { 0x00, 0x00, 0x70, 0x50 };
         planted[4] = (Mt6895Planted){ s, 0x020f7d78, 4, lk_bootarg_def };
 
-        /*
-         * REMAINING INJECTION (B2): bl32_map_bl_params reads the tee-secmem
-         * physical base from the BL2_EXT BSS global at 0x62ff2098; GZ is
-         * loaded but never executed, so that global stays zero in the model.
-         * Kept until BL32/GZ execution or the genuine BL2 step is modelled.
-         */
-        static const uint8_t tee_base_def[8] = {
-            0x00, 0x00, 0x80, 0x7c, 0x00, 0x00, 0x00, 0x00,
-        };
-        planted[5] = (Mt6895Planted){ s, 0x62ff2098, 8, tee_base_def };
 
         /*
          * ATF SMC handler list: ATF cold entry registers nodes into bss at
@@ -16021,6 +15880,9 @@ static const uint8_t stub_cmd_def[0x80] = {
                            MTK_ENV_CACHED("MTK_BDEV_NOSTUB"))) {
                 continue;
             }
+            if (i == 5) {
+                continue;
+            }
             if (0) {
                 continue;
             }
@@ -16029,12 +15891,6 @@ static const uint8_t stub_cmd_def[0x80] = {
                                   planted_names[i],
                                   planted[i].size);
             memory_region_add_subregion(sysmem, planted[i].base, &s->planted[i]);
-        }
-        {
-            static MemoryRegion atf_lock;
-            memory_region_init_io(&atf_lock, OBJECT(s), &mt6895_atf_lock_ops,
-                                  NULL, "mt6895.atf-lock", 1);
-            memory_region_add_subregion(sysmem, 0x48245ff4ULL, &atf_lock);
         }
         /*
          * The console node the head points at. Served from a read-only
@@ -16071,11 +15927,6 @@ static const uint8_t stub_cmd_def[0x80] = {
          */
         memory_region_add_subregion(sysmem, 0x4824a100ULL,
                                     &s->atf_uartobj_mr);
-        memory_region_init_io(&s->atf_log_mr, OBJECT(s), &mt6895_atflog_ops,
-                              s, "mt6895.atf-log", 0xb0);
-        if (!MTK_ENV_CACHED("MTK_NO_ATFLOG")) {
-            memory_region_add_subregion(sysmem, 0x48253930ULL, &s->atf_log_mr);
-        }
         /*
          * CPC/SMP power controller: the per-CPU power-state register (read by
          * ATF's mt_smp wait), the per-CPU power-on request register and the
