@@ -989,6 +989,7 @@ struct Mt6895MachineState {
     MemoryRegion atfarg_mr;
     MemoryRegion atfarg2_mr;
     MemoryRegion atfctx_mr;
+    uint64_t atfctx_val;
     MemoryRegion atfflag_mr;
     MemoryRegion bl33flag_mr;
     /* DISP mutex register block (0x14001000): EN/MUTEX/RST state machine so

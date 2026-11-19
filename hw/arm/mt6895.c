@@ -3289,15 +3289,43 @@ static const MemoryRegionOps mt6895_pdn_ops = {
 
 static uint64_t mt6895_atfctx_read(void *opaque, hwaddr off, unsigned size)
 {
-    (void)opaque; (void)size;
-    /* The firmware reads this pointer as two 32-bit halves. */
-    return (off & 4) ? 0x0ULL : 0x4824a900ULL;
+    Mt6895MachineState *s = opaque;
+    uint64_t val = s->atfctx_val ? s->atfctx_val : 0x4824a900ULL;
+
+    if (size == 8 && off == 0) {
+        return val;
+    }
+    return (off & 4) ? (val >> 32) : (val & 0xffffffffULL);
 }
 
 static void mt6895_atfctx_write(void *opaque, hwaddr off, uint64_t val,
                                 unsigned size)
 {
-    (void)opaque; (void)off; (void)val; (void)size;
+    Mt6895MachineState *s = opaque;
+    uint64_t cur = s->atfctx_val ? s->atfctx_val : 0x4824a900ULL;
+
+    if (size == 8 && off == 0) {
+        s->atfctx_val = val;
+    } else if (size == 4) {
+        if (off == 0) {
+            s->atfctx_val = (cur & ~0xffffffffULL) | (val & 0xffffffffULL);
+        } else if (off == 4) {
+            s->atfctx_val = (cur & 0xffffffffULL) | (val << 32);
+        }
+    } else {
+        s->atfctx_val = val;
+    }
+    uint8_t *p = mt6895_guest_ptr(s, 0x4825a110ULL + off, size);
+    if (p) {
+        for (unsigned i = 0; i < size; i++) {
+            p[i] = (val >> (i * 8)) & 0xff;
+        }
+    }
+    if (MTK_ENV_CACHED("MTK_WDTTRACE") || MTK_ENV_CACHED("MTK_RGUTRACE")) {
+        fprintf(stderr, "mt6895: ATF rgu_impl (0x4825a110+%u) write val=%#" PRIx64
+                " -> ctx=%#" PRIx64 "\n",
+                (unsigned)off, val, s->atfctx_val);
+    }
 }
 
 static const MemoryRegionOps mt6895_atfctx_ops = {
@@ -9639,6 +9667,7 @@ static void mt6895_machine_reset(MachineState *machine, ResetType type)
     }
     if (!mt6895_warm_reset_requested) {
         qemu_devices_reset(type);
+        s->atfctx_val = 0;
     } else {
         /*
          * Warm reset: the peripheral domain keeps its state, so only the
@@ -16519,9 +16548,12 @@ static const uint8_t stub_cmd_def[0x80] = {
                                                 &apusys_peri_mr, 2);
         }
         /*
-         * ATF reads a context pointer from 0x4825a110 and dereferences
-         * +0x18; on real hardware the platform setup fills it in. Point it at
-         * a zeroed scratch page so the callback slot reads as NULL.
+         * ATF reads a context pointer from 0x4825a110 (rgu_impl) and
+         * dereferences +0x18 / +0x10. On real hardware platform setup fills
+         * it in (mtk_rgu_driver_init -> mtk_rgu_driver_register). Default to
+         * a zeroed scratch page until BL31's driver init writes &rgu_impl_mt6895
+         * so early panics see NULL callbacks, but preserve guest writes so
+         * rgu_sw_reset works at PSCI SYSTEM_RESET.
          */
         if (MTK_ENV_CACHED("MTK_DIAG_G8CC")) {
             memory_region_init_io(&s->diagg_mr, OBJECT(s), &mt6895_diagg_ops, s,
