@@ -4578,6 +4578,14 @@ static const MemoryRegionOps mt6895_dramc_cmd_ops = {
  */
 /* Last window/trigger word written to the frequency meter (topckgen 0x224). */
 static uint32_t mt6895_topckgen_meter_cfg;
+/*
+ * Set when the PMIF clock-manager starts a ULPOSC measurement (write to 0x220
+ * with bit 4 set) after programming the ULPOSC window word (0x400) into 0x224.
+ * Cleared on any 0x224 write: the preloader writes the previous RESULT back
+ * into 0x224 after each measurement, which is exactly what must end one armed
+ * measurement.
+ */
+static bool mt6895_ulposc_armed;
 
 /*
  * ULPOSC1 frequency meter (topckgen meter channel 63).
@@ -4603,9 +4611,22 @@ static uint32_t mt6895_topckgen_meter_cfg;
  * 26 MHz, i.e. kHz = count * 26000 / 256.  That is the same arithmetic the old
  * fixed count 1024 reproduced as 104000 kHz.
  *
- * CON0 bit 8, which the search also toggles, is NOT modelled: the device log
- * provides only one or two measurements for it, and inventing the extra
- * dimension would be guessing.  It is an open item (needs a trim sweep).
+ * Trim-field and arming rule, both derived from the preloader's own trace
+ * (SPMI-syscon CON0 writes paired with the serial "cali_val=... KHz" prints):
+ *
+ *   - Every calibration write to ULPOSC_CON0 is 0x2829200 | (0x100 | cali[6:0]),
+ *     i.e. the applied value is 0x100 | (cali & 0x7F).  Bit 8 is a constant
+ *     band bit during the search, so the effective trim is CON0[6:0] and the
+ *     curve table above (keyed 0x3f..0x7f) is exactly the device's curve.
+ *   - A measurement is started by writing 0x220 with bit 4 set (the trace shows
+ *     rds 0x220, wr 0x220=0x8000, wr 0x220=0x9010, rd 0x220, rd 0x224).  The
+ *     driver then writes the measured value back into 0x224, so a read of 0x224
+ *     only reports a measurement while the block is armed; the old check
+ *     (window word still == 0x400 on read) stopped working after the first
+ *     write-back.
+ *   - The later 135-iteration PLL-meter block programs 0x224 = 0x3ff0400, so
+ *     arming additionally requires the last 0x224 window word to be 0x400 and
+ *     the PLL path is untouched.
  */
 static const struct {
     uint32_t code;
@@ -4651,6 +4672,7 @@ static uint32_t mt6895_ulposc_khz(uint32_t code)
 /* Meter result: ULPOSC1 frequency for the trim code currently programmed. */
 static uint32_t mt6895_ulposc_meter_count(void)
 {
+    /* Applied CON0 = 0x100 | cali[6:0]; bit 8 is the constant band bit. */
     uint32_t code = mtk_vlp_ulposc_con0 & 0x7f;
     uint32_t khz = mt6895_ulposc_khz(code);
     uint32_t count = (khz * 256u + 13000u) / 26000u;
@@ -4678,12 +4700,12 @@ static uint64_t mt6895_topckgen_read(void *opaque, hwaddr off, unsigned size)
         break;
     case 0x224:
         /*
-         * ULPOSC measurement window (0x400) -> report the measured ULPOSC1
-         * frequency.  The PLL-meter path programs a different window word,
-         * which is left to the plain register model until the PLL tree is
+         * Armed ULPOSC measurement -> report the measured ULPOSC1 frequency.
+         * The PLL-meter path programs a different window word and never arms,
+         * so it is left to the plain register model until the PLL tree is
          * modelled.
          */
-        if (mt6895_topckgen_meter_cfg == 0x400) {
+        if (mt6895_ulposc_armed) {
             v = mt6895_ulposc_meter_count();
         } else {
             v = s->topckgen_regs[off / 4] == 0 ? 1024 :
@@ -4726,6 +4748,15 @@ static void mt6895_topckgen_write(void *opaque, hwaddr off, uint64_t val,
 
     if (off == 0x224) {
         mt6895_topckgen_meter_cfg = (uint32_t)val;
+        /* Any window/result write ends the previous measurement. */
+        mt6895_ulposc_armed = false;
+    } else if (off == 0x220 && (val & 0x10) &&
+               mt6895_topckgen_meter_cfg == 0x400) {
+        /*
+         * bit 4 = start measurement.  Only the ULPOSC calibration path (window
+         * word 0x400) is armed; the PLL-meter path (0x3ff0400) is untouched.
+         */
+        mt6895_ulposc_armed = true;
     }
 
     s->topckgen_regs[off / 4] = val;
