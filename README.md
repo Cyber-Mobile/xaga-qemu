@@ -42,16 +42,21 @@ them is listed in the injection-debt register and worked off.
 
 "Zero injection" means: no guest-visible state is invented and no firmware image is patched. The boot
 advances by modelling hardware correctly. Where that is not yet done, the model stops honestly instead
-of faking the next step. The ladder currently reaches:
+of faking the next step. With no `MTK_*` variables set at all, the ladder currently runs the entire
+real stack into the Linux kernel:
 
 ```
-BROM → preloader → BL2_EXT → ATF → TEE (real) → GZ (real code, EL2) → …
+BROM → preloader → BL2_EXT → ATF → TEE → GZ (EL2) → LK (fastboot/recovery platform) → Linux 5.10
 ```
 
-GZ gets through its own relocator, page tables and SMC-handler registration, and stops on
-`ASSERT FAILED at mt_smcall.c:626 (cpu_type!=0)`. That field comes from the preloader's board-ID ADC
-path: the model's ADCC auto-calibration fails, so the board ID reads as zero and the platform atag
-carries `devinfo.area30 = 0` instead of the unit's `0x2`. That is the next piece of hardware to model.
+The vendor kernel boots (`Linux version 5.10.269-g56de8342020a`, `Booting Linux on physical CPU 0x0`)
+and stops in the power-domain path: `mtk-scpsys` fails to power on several domains (-110) and
+`mtk-pd-chk-mt6895` raises `kernel BUG at drivers/clk/mediatek/mtk-pd-chk-mt6895.c:622` during the
+first `genpd` power-off. That is the next piece of hardware to model (the SPM/SCPSYS status window the
+vendor power-domain checker reads).
+
+Two divergences from the unit are known and recorded: LK's RPMB check fails in the model (non-fatal,
+the unit passes it), and `__apu_are_init` reports a SRAM1 FSM idle timeout the unit does not print.
 
 To reach the UI today the project still uses **one named bypass**, `MTK_GZ_SKIP=1`, which redirects
 ATF's BL32 hand-off straight to LK. It is default-off, it prints a line when it fires, and it exists
@@ -67,7 +72,9 @@ values, the GZ ciphertext) has already been replaced by real models or real devi
 - [x] Real GZ decryption: DXCC-SEC AES engine executes the preloader's descriptors, `gz_a`/`gz_b` come out plaintext
 - [x] Touchscreen end to end (driver bind, EINT, GIC, real coordinates)
 - [x] PMIC rails matching the unit, OTP/efuse windows, ULPOSC calibration
-- [ ] Board-ID ADC model so GZ gets `cpu_type != 0` and the zero-injection boot passes GZ
+- [x] Board-ID ADC model so GZ gets `cpu_type != 0` and the zero-injection boot passes GZ
+- [x] Remove the synthetic ATF GTA tag (the model's own tag overlapped BL31's page tables and hung LK's CMDQ SMC)
+- [ ] SPM/SCPSYS power-domain status so the kernel's power-domain checker stops tripping
 - [ ] Remove the last named bypasses (GZ hand-off, EL3 plant, LK boot-arg plant)
 - [ ] Full LineageOS/Android boot and `adb sideload` without any bypass
 - [ ] Kernel USB gadget: `fastbootd`, `adb`, `adb sideload` in recovery
