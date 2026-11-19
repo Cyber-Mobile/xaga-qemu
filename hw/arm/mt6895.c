@@ -9582,7 +9582,6 @@ static void mtk_secondary_atf_init(ARMCPU *cpu, unsigned n)
 }
 
 extern uint64_t mtk_bl_params_ptr;
-extern bool mtk_gz_skip_active;
 
 static void mt6895_machine_reset(MachineState *machine, ResetType type)
 {
@@ -9613,7 +9612,6 @@ static void mt6895_machine_reset(MachineState *machine, ResetType type)
     s->atfctx_val = 0;
     mtk_ufs_lk_stage = false;
     mtk_bl_params_ptr = 0;
-    mtk_gz_skip_active = false;
     if (s->dsi_frame_timer) {
         timer_del(s->dsi_frame_timer);
     }

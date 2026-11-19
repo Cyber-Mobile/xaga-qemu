@@ -35,7 +35,6 @@
  */
 extern uint64_t mtk_bl_params_ptr;
 extern bool mtk_ufs_lk_stage;
-extern bool mtk_gz_skip_active;
 extern uint64_t mtk_init_sighandler_va;
 extern uint64_t mtk_init_syscall_nr;
 extern uint64_t mtk_init_syscall_pc;
@@ -730,26 +729,6 @@ void HELPER(exception_return)(CPUARMState *env, uint64_t new_pc)
         }
     }
     if (new_pc == 0 && arm_current_el(env) == 3) {
-        new_pc = 0x50f00000ULL;
-    }
-    /*
-     * MTK_GZ_SKIP=1: named bypass, off by default.  The DXCC-SEC model now
-     * executes the preloader's AES-128-CTR descriptors, so gz_a/gz_b really
-     * are plaintext in DRAM and this redirect exists only for the aided boot
-     * path while the GenieZone stage is still being brought up.  It sends that
-     * one hand-off to LK instead, through the EL3 -> LK fix-up below, and says
-     * so on stderr when it fires.  Listed in the injection-debt register.
-     */
-    if (new_pc == 0x87f800000ULL && arm_current_el(env) == 3 &&
-        getenv("MTK_GZ_SKIP")) {
-        static int gz_logged;
-
-        if (!gz_logged) {
-            gz_logged = 1;
-            fprintf(stderr, "MT6895-ERET: MTK_GZ_SKIP -- GZ entry %#" PRIx64
-                    " redirected to LK 0x50f00000\n", (uint64_t)new_pc);
-        }
-        mtk_gz_skip_active = true;
         new_pc = 0x50f00000ULL;
     }
     int cur_el = arm_current_el(env);
