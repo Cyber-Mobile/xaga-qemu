@@ -78,6 +78,7 @@ static void mt6895_create_spi(Mt6895MachineState *s, Error **errp);
 #include "hw/core/irq.h"
 #include "exec/cpu-common.h"
 #include "qemu/mtk-env.h"
+#include "crypto/aes.h"
 
 /*
  * Link-safety stub for arm_psci_set_prefer_el1(): the real (strong)
@@ -3690,7 +3691,7 @@ static const MemoryRegionOps mt6895_srclken_rc_ops = {
  * the descriptor's output buffer -- rather than only the verdict -- will see
  * whatever was already in memory.
  */
-static uint64_t mt6895_dxcc_sec_read(void *opaque, hwaddr off, unsigned size)
+static uint64_t mt6895_dxcc_sec_read_impl(void *opaque, hwaddr off, unsigned size)
 {
     Mt6895MachineState *s = opaque;
     {
@@ -3874,8 +3875,219 @@ static void mtk_sha_final(MtkSha256Ctx *c, uint8_t out[32])
     }
 }
 
-static void mt6895_dxcc_sec_write(void *opaque, hwaddr off, uint64_t val,
-                                  unsigned size)
+/*
+ * DXCC-SEC cipher engine: AES-128-CTR.
+ *
+ * Before this block the descriptor ring was consumed without being executed.
+ * The GZ images the preloader loads (gz_a/gz_b) are AES-128-CTR scrambled, so
+ * the preloader hands this engine the key and the initial counter through
+ * setup descriptors and then streams each image through one DIN_AES_DOUT
+ * descriptor.  The six descriptor words are:
+ *
+ *   +0xE80  DIN address low 32
+ *   +0xE84  DIN_DMA_MODE[1:0] | DIN_SIZE[25:2] | NS_BIT[26] |
+ *           DIN_CONST[27] | NOT_LAST[28] | LOCK_QUEUE[29]
+ *   +0xE88  DOUT address low 32
+ *   +0xE8C  DOUT_DMA_MODE[1:0] | DOUT_SIZE[25:2] | NS_BIT[26] |
+ *           DOUT_LAST_IND[27] | HASH_XOR_BIT[29]
+ *   +0xE90  DATA_FLOW_MODE[5:0] | AES_SEL_N_HASH[6] | ACK_NEEDED[9:8] |
+ *           CIPHER_MODE[13:10] | CIPHER_DO[16:15] | KEY_SIZE[23:22] |
+ *           SETUP_OPERATION[27:24] | endian/swap bits[31:28]
+ *   +0xE94  DIN_ADDR_HIGH[15:0] | DOUT_ADDR_HIGH[31:16]
+ *
+ * Field layout from mtkclient's hwcrypto_dxcc.py (DSCRPTR field table), and
+ * confirmed against our own preloader's submissions
+ * (artifacts/r1302/dxcc_aes/RUN_AES.err):
+ *
+ *   setup=LOAD_STATE1(2), flow=S_DIN_to_AES(32), cipher=CTR(2):
+ *       DIN = initial 128-bit counter, 0x020FFEAC, bytes A0B09246..DC93458A
+ *   setup=LOAD_KEY0(4),   flow=S_DIN_to_AES(32), cipher=CTR(2):
+ *       DIN = 16-byte key, 0x020FFEBC, bytes 5C0E349A..A378BD17
+ *   flow=DIN_AES_DOUT(1):
+ *       in-place stream (gz_a: 0x7F800000/0x1CB4A0, gz_b:
+ *       0x7F400000/0x23D90)
+ *
+ * The engine keeps key and counter across descriptors; every LOAD_STATE1
+ * reloads the counter.  CTR is a 128-bit big-endian counter incremented once
+ * per 16-byte block, i.e. exactly mtkclient's
+ * Counter.new(128, initial_value=bytes_to_long(iv)).
+ */
+typedef struct MtkDxccAesState {
+    uint8_t key[32];
+    unsigned key_len;
+    uint8_t ctr[16];
+    unsigned cipher_mode;
+    bool key_valid;
+    bool state_valid;
+} MtkDxccAesState;
+
+static MtkDxccAesState mtk_dxcc_aes_state;
+static int mtk_dxcc_aes_logs;
+
+/* Optional one-shot dump of a decrypted GZ buffer (MTK_GZ_DUMP=<prefix>). */
+static void mtk_dxcc_aes_dump(uint64_t addr, uint64_t len)
+{
+    const char *base = getenv("MTK_GZ_DUMP");
+    char path[1024];
+    uint8_t *buf;
+    FILE *fp;
+
+    if (!base || !base[0] || !len) {
+        return;
+    }
+    snprintf(path, sizeof(path), "%s_%08" PRIx64 ".bin", base, addr);
+    buf = g_malloc(len);
+    if (address_space_read(&address_space_memory, addr,
+                           MEMTXATTRS_UNSPECIFIED, buf, len) == MEMTX_OK) {
+        fp = fopen(path, "wb");
+        if (fp) {
+            fwrite(buf, 1, len, fp);
+            fclose(fp);
+            fprintf(stderr, "MTK-DXCC-AES dump %s addr=%#" PRIx64
+                    " len=%#" PRIx64 "\n", path, addr, len);
+        }
+    }
+    g_free(buf);
+}
+
+static void mtk_dxcc_aes_ctr(uint64_t din, uint64_t dout, uint64_t len)
+{
+    MtkDxccAesState *st = &mtk_dxcc_aes_state;
+    AES_KEY aeskey;
+    uint8_t *buf;
+    uint8_t ks[16];
+    uint64_t off;
+    unsigned i;
+
+    if (!st->key_valid || !st->state_valid) {
+        if (mtk_dxcc_aes_logs < 40) {
+            mtk_dxcc_aes_logs++;
+            fprintf(stderr, "MTK-DXCC-AES skip din=%#" PRIx64 " len=%#" PRIx64
+                    " (key=%d state=%d)\n", din, len, st->key_valid,
+                    st->state_valid);
+        }
+        return;
+    }
+    if (!len || len > 0x4000000ULL) {
+        return;
+    }
+    buf = g_malloc(len);
+    if (address_space_read(&address_space_memory, din,
+                           MEMTXATTRS_UNSPECIFIED, buf, len) != MEMTX_OK) {
+        g_free(buf);
+        return;
+    }
+    AES_set_encrypt_key(st->key, (int)(st->key_len * 8), &aeskey);
+    for (off = 0; off < len; off += 16) {
+        unsigned n = (len - off) < 16 ? (unsigned)(len - off) : 16;
+
+        AES_encrypt(st->ctr, ks, &aeskey);
+        for (i = 0; i < n; i++) {
+            buf[off + i] ^= ks[i];
+        }
+        for (i = 16; i-- > 0; ) {
+            if (++st->ctr[i] != 0) {
+                break;
+            }
+        }
+    }
+    if (dout &&
+        address_space_write(&address_space_memory, dout,
+                            MEMTXATTRS_UNSPECIFIED, buf, len) != MEMTX_OK) {
+        fprintf(stderr, "MTK-DXCC-AES write failed dout=%#" PRIx64 "\n", dout);
+    }
+    if (dout >= 0x7F000000ULL && dout < 0x80000000ULL) {
+        mtk_dxcc_aes_dump(dout, len);
+    }
+    if (MTK_ENV_CACHED("MTK_DXCC_AESLOG")) {
+        unsigned bi;
+
+        fprintf(stderr, "MTK-DXCC-AES ctr din=%#" PRIx64 " dout=%#" PRIx64
+                " len=%#" PRIx64 " key_len=%u head=", din, dout, len,
+                st->key_len);
+        for (bi = 0; bi < 32 && bi < len; bi++) {
+            fprintf(stderr, "%02x", buf[bi]);
+        }
+        fprintf(stderr, "\n");
+    }
+    g_free(buf);
+}
+
+/*
+ * Execute one descriptor.  WORD5 (+0xE94) is written last by the driver's
+ * sasi_sb_adddescsequence(), so a write there marks a complete submission.
+ */
+static void mtk_dxcc_aes_submit(void *opaque)
+{
+    Mt6895MachineState *s = opaque;
+    uint32_t *r = s->dxcc_sec_regs;
+    uint32_t w0 = r[0xe80 / 4];
+    uint32_t w1 = r[0xe84 / 4];
+    uint32_t w2 = r[0xe88 / 4];
+    uint32_t w3 = r[0xe8c / 4];
+    uint32_t w4 = r[0xe90 / 4];
+    uint32_t w5 = r[0xe94 / 4];
+    uint64_t din = w0 | ((uint64_t)(w5 & 0xffffU) << 32);
+    uint64_t dout = w2 | ((uint64_t)((w5 >> 16) & 0xffffU) << 32);
+    uint64_t din_size = (w1 >> 2) & 0xffffffU;
+    uint64_t dout_size = (w3 >> 2) & 0xffffffU;
+    unsigned flow = w4 & 0x3fU;
+    unsigned cipher = (w4 >> 10) & 0xfU;
+    unsigned setup = (w4 >> 24) & 0xfU;
+    MtkDxccAesState *st = &mtk_dxcc_aes_state;
+
+    if (MTK_ENV_CACHED("MTK_DXCC_AESLOG") && mtk_dxcc_aes_logs < 60) {
+        mtk_dxcc_aes_logs++;
+        fprintf(stderr, "MTK-DXCC-AES desc din=%#" PRIx64 " dinsz=%#" PRIx64
+                " dout=%#" PRIx64 " doutsz=%#" PRIx64 " flow=%u cipher=%u"
+                " setup=%u din_const=%u\n", din, din_size, dout, dout_size,
+                flow, cipher, setup, (w1 >> 27) & 1U);
+    }
+
+    if (flow == 32) {           /* S_DIN_to_AES: load key or counter */
+        st->cipher_mode = cipher;
+        if (setup == 2 && din && din_size == 16) {          /* LOAD_STATE1 */
+            if (address_space_read(&address_space_memory, din,
+                                   MEMTXATTRS_UNSPECIFIED, st->ctr,
+                                   sizeof(st->ctr)) == MEMTX_OK) {
+                st->state_valid = true;
+            }
+        } else if (setup == 4 && din &&            /* LOAD_KEY0 */
+                   (din_size == 16 || din_size == 32)) {
+            if (address_space_read(&address_space_memory, din,
+                                   MEMTXATTRS_UNSPECIFIED, st->key,
+                                   (size_t)din_size) == MEMTX_OK) {
+                st->key_len = (unsigned)din_size;
+                st->key_valid = true;
+            }
+        } else if (setup == 4) {
+            /*
+             * No DIN: the engine would use an internal (hardware) key that
+             * software cannot supply.  Do not pretend the previous key is
+             * still selected.
+             */
+            st->key_valid = false;
+        }
+    } else if (flow == 1) {     /* DIN_AES_DOUT: stream data */
+        /*
+         * A data descriptor with no output buffer only updates the cipher's
+         * internal state (the preloader uses those to derive keys); nothing
+         * guest-visible is produced.
+         */
+        if (dout && dout_size && st->cipher_mode == 2) {   /* CTR */
+            mtk_dxcc_aes_ctr(din, dout, din_size ? din_size : dout_size);
+        }
+    }
+    /*
+     * The engine completes synchronously: the transformation above has
+     * already run by the time the guest reads the verdict at +0xBA0
+     * (1 = success).  Nothing may report success before the data moved.
+     */
+    r[MT6895_DXCC_SEC_RESULT / 4] = 1;
+}
+
+static void mt6895_dxcc_sec_write_impl(void *opaque, hwaddr off, uint64_t val,
+                                       unsigned size)
 {
     Mt6895MachineState *s = opaque;
     {
@@ -3985,6 +4197,208 @@ static void mt6895_dxcc_sec_write(void *opaque, hwaddr off, uint64_t val,
             fprintf(stderr, "\n");
         }
     }
+
+    /* WORD5 completes a descriptor: execute it (AES key/IV/data). */
+    if (off == 0xe94) {
+        mtk_dxcc_aes_submit(s);
+    }
+}
+
+static int dec_dumped_a, dec_dumped_b;
+static uint64_t dec_e80, dec_e88;
+static int dec_aes_n, dec_gz_done;
+static int dec_aes_n2;
+
+static void mtk_dec_file_dump(const char *suffix, uint64_t addr, size_t len)
+{
+    const char *base = getenv("MTK_DUMP_SRAM");
+    char path[1024];
+    uint8_t *buf;
+    FILE *fp;
+
+    if (!base || !base[0] || !len) {
+        return;
+    }
+    snprintf(path, sizeof(path), "%s_%s.bin", base, suffix);
+    buf = g_malloc(len);
+    if (address_space_read(&address_space_memory, addr,
+                           MEMTXATTRS_UNSPECIFIED, buf, len) != MEMTX_OK) {
+        fprintf(stderr, "DEC-FILE %s FAILED addr=%016" PRIx64 " len=%zu\n",
+                path, addr, len);
+        g_free(buf);
+        return;
+    }
+    fp = fopen(path, "wb");
+    if (!fp) {
+        fprintf(stderr, "DEC-FILE %s open-failed errno=%d\n", path, errno);
+        g_free(buf);
+        return;
+    }
+    fwrite(buf, 1, len, fp);
+    fclose(fp);
+    fprintf(stderr, "DEC-FILE %s moment=%s addr=%016" PRIx64 " len=%zu\n",
+            path, suffix, addr, len);
+    g_free(buf);
+}
+
+static bool mtk_env_on(const char *name)
+{
+    const char *v = getenv(name);
+
+    /* Unset or "0" is OFF; only an explicit "1" turns the gate ON. */
+    return v && strcmp(v, "1") == 0;
+}
+
+static bool mtk_dec_on(void)
+{
+    static int on = -1;
+
+    if (on < 0) {
+        on = mtk_env_on("MTK_DXCC_DEC") ? 1 : 0;
+    }
+    return on > 0;
+}
+
+static void mtk_dec_memdump(const char *tag, uint64_t addr, unsigned len)
+{
+    uint8_t buf[256];
+    unsigned i;
+
+    if (len > sizeof(buf)) {
+        len = sizeof(buf);
+    }
+    if (address_space_read(&address_space_memory, addr,
+                           MEMTXATTRS_UNSPECIFIED, buf, len) != MEMTX_OK) {
+        fprintf(stderr, "DEC-MEM %s @%016" PRIx64 " read-failed\n", tag, addr);
+        return;
+    }
+    fprintf(stderr, "DEC-MEM %s @%016" PRIx64 ":", tag, addr);
+    for (i = 0; i < len; i++) {
+        fprintf(stderr, " %02x", buf[i]);
+    }
+    fprintf(stderr, "\n");
+}
+
+static void mtk_dec_dump(const char *why)
+{
+    fprintf(stderr, "DEC-DUMP %s\n", why);
+    mtk_dec_memdump("gz-hdr", 0x7F800000ULL, 64);
+    mtk_dec_memdump("key-e780", 0x0206E780ULL, 384);
+    mtk_dec_memdump("key-ffc00", 0x020FFC00ULL, 896);
+    mtk_dec_memdump("ram-fc", 0x20FC000ULL, 128);
+    mtk_dec_memdump("ram-fd", 0x20FD000ULL, 128);
+    mtk_dec_memdump("ram-fe", 0x20FE000ULL, 128);
+    mtk_dec_memdump("ram-ffd", 0x20FFD00ULL, 128);
+    mtk_dec_memdump("ram-ffe", 0x20FFE00ULL, 128);
+    mtk_dec_memdump("ram-fff", 0x20FFF00ULL, 64);
+}
+
+static uint64_t mt6895_dxcc_sec_read(void *opaque, hwaddr off, unsigned size)
+{
+    uint64_t v = mt6895_dxcc_sec_read_impl(opaque, off, size);
+    static int nrd, dstat;
+    CPUState *cs = qemu_get_cpu(0);
+
+    if (mtk_dec_on() && nrd < 600) {
+        nrd++;
+        fprintf(stderr, "DEC-DXCC-R off=%#" PRIx64 " size=%u val=%#" PRIx64
+                " pc=%#" PRIx64 "\n", (uint64_t)off, size, v,
+                cs ? (uint64_t)cpu_env(cs)->pc : 0);
+    }
+    if (mtk_dec_on() && off == 0xa00 && v && !dstat) {
+        dstat = 1;
+        mtk_dec_dump("a00-status");
+    }
+    if (mtk_dec_on() && off == 0xba0 && v == 1 && dec_dumped_a && !dec_dumped_b) {
+        dec_dumped_b = 1;
+        mtk_dec_file_dump("b_sram", 0x02000000ULL, 0x100000);
+        mtk_dec_file_dump("b_gz", 0x7F800000ULL, 0x200000);
+    }
+    return v;
+}
+
+static void mt6895_dxcc_sec_write(void *opaque, hwaddr off, uint64_t val,
+                                  unsigned size)
+{
+    static int nwr, groups, cmd4;
+
+    if (mtk_dec_on() && nwr < 600) {
+        nwr++;
+        fprintf(stderr, "DEC-DXCC-W off=%#" PRIx64 " size=%u val=%#" PRIx64
+                " pc=%#" PRIx64 " g=%d\n", (uint64_t)off, size, val,
+                (uint64_t)(qemu_get_cpu(0) ? cpu_env(qemu_get_cpu(0))->pc : 0),
+                groups);
+    }
+    if (mtk_dec_on() && off == 0xa08 && val == 4 && !cmd4) {
+        cmd4 = 1;
+        mtk_dec_dump("cmd4");
+    }
+    if (mtk_dec_on() && off == 0xe94 && groups < 6) {
+        groups++;
+        mtk_dec_dump("desc-group");
+    }
+    if (mtk_dec_on() && off == 0xe90 && !dec_dumped_a &&
+        (((val & 0x825ULL) == 0x825ULL) || ((val & 0x82bULL) == 0x82bULL))) {
+        dec_dumped_a = 1;
+        mtk_dec_file_dump("a_sram", 0x02000000ULL, 0x100000);
+        mtk_dec_file_dump("a_gz", 0x7F800000ULL, 0x200000);
+    }
+    if (mtk_dec_on() && (off == 0xe80 || off == 0xe88) && nwr < 40) {
+        mtk_dec_memdump(off == 0xe80 ? "e80-buf" : "e88-buf",
+                        val & ~0xFULL, 32);
+    }
+    if (mtk_dec_on()) {
+        if (off == 0xe80) {
+            dec_e80 = val;
+        }
+        if (off == 0xe88) {
+            dec_e88 = val;
+        }
+        if (off == 0xe84) {
+            unsigned cmd = (unsigned)(val & 0xffff);
+
+            if ((cmd == 0x11 || cmd == 0x12 || cmd == 0x41 || cmd == 0x42) &&
+                dec_aes_n < 40) {
+                dec_aes_n++;
+                fprintf(stderr, "DEC-AES cmd=%#x e80=%016" PRIx64
+                        " e88=%016" PRIx64 "\n", cmd, dec_e80, dec_e88);
+                mtk_dec_memdump("aes-e80", dec_e80 & ~0xFULL, 64);
+                mtk_dec_memdump("aes-e88", dec_e88 & ~0xFULL, 64);
+            }
+        }
+    }
+    if (mtk_dec_on() && off == 0xe84 && (val & 0xffff) == 0x42 &&
+        dec_e80 >= 0x7F800000ULL && dec_e80 < 0x7FA00000ULL && !dec_gz_done) {
+        dec_gz_done = 1;
+        mtk_dec_file_dump("gz_in", 0x7F800000ULL, 0x200000);
+        mtk_dec_file_dump("sram_in", 0x02000000ULL, 0x100000);
+    }
+    if (mtk_dec_on() && off == 0xe84) {
+        unsigned cmd2 = (unsigned)(val & 0xffff);
+        bool gzref = (dec_e80 >= 0x7F000000ULL && dec_e80 < 0x80000000ULL) ||
+                     (dec_e88 >= 0x7F000000ULL && dec_e88 < 0x80000000ULL);
+
+        if ((cmd2 == 0x11 || cmd2 == 0x12 || cmd2 == 0x41 || cmd2 == 0x42) &&
+            gzref && dec_aes_n2 < 400) {
+            dec_aes_n2++;
+            fprintf(stderr, "DEC-AES2 cmd=%#x e80=%016" PRIx64
+                    " e88=%016" PRIx64 "\n", cmd2, dec_e80, dec_e88);
+            mtk_dec_memdump("gz-aes-e80", dec_e80 & ~0xFULL, 64);
+            mtk_dec_memdump("gz-aes-e88", dec_e88 & ~0xFULL, 64);
+            if (!dec_gz_done) {
+                dec_gz_done = 1;
+                mtk_dec_file_dump("gzref_in", 0x7F800000ULL, 0x200000);
+                mtk_dec_file_dump("sramref_in", 0x02000000ULL, 0x100000);
+            }
+        }
+    }
+    mt6895_dxcc_sec_write_impl(opaque, off, val, size);
+    if (mtk_dec_on() && dec_gz_done == 1 && off == 0xe84 &&
+        (val & 0xffff) == 0x42) {
+        mtk_dec_file_dump("gz_out", 0x7F800000ULL, 0x200000);
+        mtk_dec_file_dump("sram_out", 0x02000000ULL, 0x100000);
+        dec_gz_done = 2;
+    }
 }
 
 static const MemoryRegionOps mt6895_dxcc_sec_ops = {
@@ -4044,7 +4458,6 @@ static const MemoryRegionOps mt6895_dxcc_sec_ops = {
  * the TRNG the result is unpredictable, which is all the callers rely on.
  * MTK_NO_HACC=1 restores the old RAM behaviour.
  */
-#include "crypto/aes.h"
 
 #define MT6895_HACC2_CON    0x100
 #define MT6895_HACC2_START  0x104
@@ -5259,6 +5672,63 @@ static struct {
     uint64_t atf_left_vbar, atf_left_sctlr, atf_left_tcr, atf_left_pc;
     uint64_t atf_hist_key[64];
     unsigned atf_hist_cnt[64];
+    bool was_in_any, win2_seen, left_all, halt_seen;
+    bool prev_halted;
+    unsigned halt_transitions;
+    uint64_t ticks_total, last_tick_ns, last_dump_ns, last_dump_ticks;
+    unsigned cs_null;
+    unsigned resume_count;
+    uint64_t last_resume_ns, last_resume_pc, last_resume_irq, last_resume_delta;
+    unsigned bl2_halt_count;
+    unsigned dump_count;
+    uint64_t last_progress_ns, last_report_ns;
+    int64_t gt_at_halt[4], gt_at_resume[4];
+    uint64_t win3_pc[64];
+    unsigned win3_count;
+    uint64_t escr, eelr3, evbar3, eesr3, evbar2, eelr2, eesr2, efar2, epstate;
+    uint64_t fmt_pc, fscr, felr3, fvbar3, fesr3, fvbar2, felr2, fesr2, ffar2, fpstate;
+    bool gz_seen, loop_seen;
+    uint64_t gz_first_pc, gz_cur_el, gz_scr, gz_elr3, gz_pstate;
+    uint64_t gz_vbar3, gz_esr3, loop_last_ns;
+    uint64_t loop_x5, loop_x7, loop_x8;
+    uint64_t win4_first_ns, win4_last_ns;
+    unsigned win4_count;
+    uint64_t win4_hist_key[32];
+    unsigned win4_hist_cnt[32];
+    bool smc_seen;
+    unsigned smc_count;
+    uint64_t smc_x0, smc_x1, smc_x2, smc_x3, smc_elr3, smc_esr3, smc_pstate;
+    unsigned mmio70_count;
+    uint64_t mmio70_pa[8], mmio70_val[8];
+    unsigned mmio70_wr[8];
+    unsigned resets;
+    uint64_t any_pc[32];
+    unsigned any_pc_count;
+    unsigned atf_mmio_count;
+    uint64_t atfmm_pa[8], atfmm_val[8];
+    unsigned atfmm_wr[8];
+    bool smcret_seen, out_seen;
+    uint64_t win5_pc[64];
+    unsigned win5_count, win5_el;
+    uint64_t smcret_pc, smcret_x0, smcret_x1, smcret_x2, smcret_x3;
+    uint64_t out_pc, out_elr3, out_esr3, out_pstate;
+    uint64_t bl2_halt_first_ns, bl2_halt_last_ns, bl2_halt_last_pc;
+    uint64_t last_halt_ns, last_halt_pc, last_halt_irq;
+    uint64_t last_halt_esr, last_halt_elr, last_halt_spsr;
+    uint64_t last_halt_vbar, last_halt_sctlr, last_halt_tcr;
+    uint64_t win2_first_ns, win2_last_ns;
+    uint64_t atf2_hist_key[64];
+    unsigned atf2_hist_cnt[64];
+    uint64_t left_all_ns, left_all_last_pc;
+    uint64_t left_all_esr, left_all_elr, left_all_spsr;
+    uint64_t left_all_vbar, left_all_sctlr, left_all_tcr;
+    uint64_t halt_ns, halt_pc, halt_irq;
+    uint64_t halt_esr, halt_elr, halt_spsr;
+    uint64_t halt_vbar, halt_sctlr, halt_tcr;
+    unsigned halt_count;
+    bool have_atf_mmio;
+    uint64_t atf_mmio_pa, atf_mmio_val;
+    unsigned atf_mmio_write;
     bool have_mmio;
     uint64_t mmio_pa, mmio_val;
     unsigned mmio_write;
@@ -5277,6 +5747,26 @@ static bool mtk_bl2pc_pc_in_range(uint64_t pc)
     uint64_t p = pc & 0x0000ffffffffffffULL;
 
     return p >= 0x62f00000ULL && p < 0x64f00000ULL;
+}
+
+static void mtk_bl2pc_memdump(const char *tag, uint64_t addr, unsigned len)
+{
+    uint8_t buf[64];
+    unsigned i;
+
+    if (len > sizeof(buf)) {
+        len = sizeof(buf);
+    }
+    if (address_space_read(&address_space_memory, addr,
+                           MEMTXATTRS_UNSPECIFIED, buf, len) != MEMTX_OK) {
+        fprintf(stderr, "  mem %s @%016" PRIx64 " read-failed\n", tag, addr);
+        return;
+    }
+    fprintf(stderr, "  mem %s @%016" PRIx64 ":", tag, addr);
+    for (i = 0; i < len; i++) {
+        fprintf(stderr, " %02x", buf[i]);
+    }
+    fprintf(stderr, "\n");
 }
 
 static void mtk_bl2pc_print(unsigned n, const char *why)
@@ -5316,7 +5806,24 @@ static void mtk_bl2pc_print(unsigned n, const char *why)
                     (uint64_t)(env->pstate | env->daif),
                     env->cp15.vbar_el[3], env->cp15.sctlr_el[3],
                     env->cp15.tcr_el[3], (uint64_t)env->pc);
+            {
+                CPUState *nc = qemu_get_cpu(0);
+                fprintf(stderr, "  halted_now=%u cur_irq=%#" PRIx64 "\n",
+                        nc ? (unsigned)nc->halted : 0,
+                        nc ? (uint64_t)nc->interrupt_request : 0);
+            }
         }
+    }
+    if (mtk_bl2pc.halt_seen) {
+        fprintf(stderr, "  last-halt#%u at_ns=%" PRId64 " pc=%016" PRIx64
+                " irq=%#" PRIx64 " esr=%#" PRIx64 " elr=%016" PRIx64
+                " spsr=%#" PRIx64 " vbar=%016" PRIx64 " sctlr=%016" PRIx64
+                " tcr=%016" PRIx64 "\n", mtk_bl2pc.halt_transitions,
+                mtk_bl2pc.last_halt_ns, mtk_bl2pc.last_halt_pc,
+                mtk_bl2pc.last_halt_irq, mtk_bl2pc.last_halt_esr,
+                mtk_bl2pc.last_halt_elr, mtk_bl2pc.last_halt_spsr,
+                mtk_bl2pc.last_halt_vbar, mtk_bl2pc.last_halt_sctlr,
+                mtk_bl2pc.last_halt_tcr);
     }
     fprintf(stderr, "  markers pc200=%s(%u) stub=%s"
             " walker_path=%s\n",
@@ -5387,6 +5894,186 @@ static void mtk_bl2pc_print(unsigned n, const char *why)
         }
         fprintf(stderr, "\n");
     }
+    fprintf(stderr, "  timeline2 win2_seen=%u first_ns=%" PRId64
+            " last_ns=%" PRId64 " left_all=%u left_ns=%" PRId64
+            " left_pc=%016" PRIx64 "\n", mtk_bl2pc.win2_seen,
+            mtk_bl2pc.win2_first_ns, mtk_bl2pc.win2_last_ns,
+            mtk_bl2pc.left_all, mtk_bl2pc.left_all_ns,
+            mtk_bl2pc.left_all_last_pc);
+    if (mtk_bl2pc.left_all) {
+        fprintf(stderr, "  left-all esr=%#" PRIx64 " elr=%016" PRIx64
+                " spsr=%#" PRIx64 " vbar=%016" PRIx64 " sctlr=%016" PRIx64
+                " tcr=%016" PRIx64 "\n", mtk_bl2pc.left_all_esr,
+                mtk_bl2pc.left_all_elr, mtk_bl2pc.left_all_spsr,
+                mtk_bl2pc.left_all_vbar, mtk_bl2pc.left_all_sctlr,
+                mtk_bl2pc.left_all_tcr);
+    }
+    if (mtk_bl2pc.halt_seen) {
+        fprintf(stderr, "  halt-seen at_ns=%" PRId64 " pc=%016" PRIx64
+                " irq=%#" PRIx64 " count=%u\n", mtk_bl2pc.halt_ns,
+                mtk_bl2pc.halt_pc, mtk_bl2pc.halt_irq,
+                mtk_bl2pc.halt_count);
+    }
+    if (mtk_bl2pc.have_atf_mmio) {
+        fprintf(stderr, "  last-atf-mmio %c pa=%#" PRIx64 " val=%#" PRIx64
+                "\n", mtk_bl2pc.atf_mmio_write ? 'W' : 'R',
+                mtk_bl2pc.atf_mmio_pa, mtk_bl2pc.atf_mmio_val);
+    }
+    {
+        uint64_t keys2[64];
+        unsigned cnts2[64], pi, pj;
+
+        memcpy(keys2, mtk_bl2pc.atf2_hist_key, sizeof(keys2));
+        memcpy(cnts2, mtk_bl2pc.atf2_hist_cnt, sizeof(cnts2));
+        for (pi = 0; pi < 64; pi++) {
+            for (pj = pi + 1; pj < 64; pj++) {
+                if (cnts2[pj] > cnts2[pi]) {
+                    uint64_t tk = keys2[pi]; unsigned tc = cnts2[pi];
+                    keys2[pi] = keys2[pj]; cnts2[pi] = cnts2[pj];
+                    keys2[pj] = tk; cnts2[pj] = tc;
+                }
+            }
+        }
+        fprintf(stderr, "  atf2-hist top:");
+        for (pi = 0; pi < 8 && cnts2[pi]; pi++) {
+            fprintf(stderr, " %016" PRIx64 "x%u", keys2[pi], cnts2[pi]);
+        }
+        fprintf(stderr, "\n");
+    }
+    {
+        uint64_t nowp = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+
+        fprintf(stderr, "  ticks total=%" PRIu64 " cs_null=%u"
+                " since_dump=%" PRIu64 " ns_since_dump=%" PRId64
+                " last_tick_ns=%" PRId64 "\n", mtk_bl2pc.ticks_total,
+                mtk_bl2pc.cs_null,
+                mtk_bl2pc.ticks_total - mtk_bl2pc.last_dump_ticks,
+                mtk_bl2pc.last_dump_ns ?
+                    (int64_t)(nowp - mtk_bl2pc.last_dump_ns) : 0,
+                (int64_t)mtk_bl2pc.last_tick_ns);
+        mtk_bl2pc.last_dump_ns = nowp;
+        mtk_bl2pc.last_dump_ticks = mtk_bl2pc.ticks_total;
+    }
+    if (mtk_bl2pc.resume_count) {
+        fprintf(stderr, "  last-resume#%u at_ns=%" PRId64 " pc=%016" PRIx64
+                " irq=%#" PRIx64 " delta_ns=%" PRId64 "\n",
+                mtk_bl2pc.resume_count, mtk_bl2pc.last_resume_ns,
+                mtk_bl2pc.last_resume_pc, mtk_bl2pc.last_resume_irq,
+                mtk_bl2pc.last_resume_delta);
+    }
+    if (mtk_bl2pc.gz_seen) {
+        fprintf(stderr, "  gz-enter pc=%016" PRIx64 " cur_el=%" PRIu64
+                " scr=%#" PRIx64 " elr3=%016" PRIx64 " vbar3=%016" PRIx64
+                " pstate=%#" PRIx64 " loop_seen=%u x5=%016" PRIx64
+                " x7=%016" PRIx64 " x8=%016" PRIx64 "\n",
+                mtk_bl2pc.gz_first_pc, mtk_bl2pc.gz_cur_el,
+                mtk_bl2pc.gz_scr, mtk_bl2pc.gz_elr3, mtk_bl2pc.gz_vbar3,
+                mtk_bl2pc.gz_pstate, (unsigned)mtk_bl2pc.loop_seen,
+                mtk_bl2pc.loop_x5, mtk_bl2pc.loop_x7, mtk_bl2pc.loop_x8);
+    }
+    if (mtk_bl2pc.win4_count) {
+        uint64_t k4[32];
+        unsigned c4[32], i4, j4;
+
+        memcpy(k4, mtk_bl2pc.win4_hist_key, sizeof(k4));
+        memcpy(c4, mtk_bl2pc.win4_hist_cnt, sizeof(c4));
+        for (i4 = 0; i4 < 32; i4++) {
+            for (j4 = i4 + 1; j4 < 32; j4++) {
+                if (c4[j4] > c4[i4]) {
+                    uint64_t tk = k4[i4]; unsigned tc = c4[i4];
+                    k4[i4] = k4[j4]; c4[i4] = c4[j4];
+                    k4[j4] = tk; c4[j4] = tc;
+                }
+            }
+        }
+        fprintf(stderr, "  win4 first_ns=%" PRId64 " last_ns=%" PRId64
+                " count=%u top:", mtk_bl2pc.win4_first_ns,
+                mtk_bl2pc.win4_last_ns, mtk_bl2pc.win4_count);
+        for (i4 = 0; i4 < 8 && c4[i4]; i4++) {
+            fprintf(stderr, " %016" PRIx64 "x%u", k4[i4], c4[i4]);
+        }
+        fprintf(stderr, "\n");
+    }
+    if (mtk_bl2pc.smc_seen) {
+        fprintf(stderr, "  smc x0=%#" PRIx64 " x1=%#" PRIx64 " x2=%#"
+                PRIx64 " x3=%#" PRIx64 " elr3=%016" PRIx64
+                " esr3=%#" PRIx64 " pstate=%#" PRIx64 "\n",
+                mtk_bl2pc.smc_x0, mtk_bl2pc.smc_x1, mtk_bl2pc.smc_x2,
+                mtk_bl2pc.smc_x3, mtk_bl2pc.smc_elr3, mtk_bl2pc.smc_esr3,
+                mtk_bl2pc.smc_pstate);
+    }
+    fprintf(stderr, "  resets=%u mmio70=%u\n", mtk_bl2pc.resets,
+            mtk_bl2pc.mmio70_count);
+    if (mtk_bl2pc.atf_mmio_count) {
+        unsigned km;
+
+        fprintf(stderr, "  atf-mmio(%u):", mtk_bl2pc.atf_mmio_count);
+        for (km = 0; km < mtk_bl2pc.atf_mmio_count; km++) {
+            fprintf(stderr, " %c%#" PRIx64 "=%#" PRIx64,
+                    mtk_bl2pc.atfmm_wr[km] ? 'W' : 'R',
+                    mtk_bl2pc.atfmm_pa[km], mtk_bl2pc.atfmm_val[km]);
+        }
+        fprintf(stderr, "\n");
+    }
+    if (mtk_bl2pc.smcret_seen || mtk_bl2pc.out_seen) {
+        fprintf(stderr, "  smc-ret_seen=%u x0=%#" PRIx64 " x1=%#" PRIx64
+                " x2=%#" PRIx64 " x3=%#" PRIx64 " out_seen=%u out_pc=%016"
+                PRIx64 " out_elr3=%016" PRIx64 " out_pstate=%#" PRIx64
+                "\n", (unsigned)mtk_bl2pc.smcret_seen,
+                mtk_bl2pc.smcret_x0, mtk_bl2pc.smcret_x1,
+                mtk_bl2pc.smcret_x2, mtk_bl2pc.smcret_x3,
+                (unsigned)mtk_bl2pc.out_seen, mtk_bl2pc.out_pc,
+                mtk_bl2pc.out_elr3, mtk_bl2pc.out_pstate);
+    }
+    if (mtk_bl2pc.win5_count) {
+        unsigned w5;
+
+        fprintf(stderr, "  win5(%u) el=%u pcs:", mtk_bl2pc.win5_count,
+                mtk_bl2pc.win5_el);
+        for (w5 = 0; w5 < mtk_bl2pc.win5_count && w5 < 32; w5++) {
+            fprintf(stderr, " %016" PRIx64, mtk_bl2pc.win5_pc[w5]);
+        }
+        fprintf(stderr, "\n");
+        mtk_bl2pc_memdump("gz-phys", 0x7F800000ULL, 48);
+        mtk_bl2pc_memdump("gz-alias", 0x87F800000ULL, 48);
+    }
+    if (mtk_bl2pc.win3_count) {
+        unsigned wi;
+
+        fprintf(stderr, "  win3-pcs(%u):", mtk_bl2pc.win3_count);
+        for (wi = 0; wi < mtk_bl2pc.win3_count; wi++) {
+            fprintf(stderr, " %016" PRIx64, mtk_bl2pc.win3_pc[wi]);
+        }
+        fprintf(stderr, "\n");
+        mtk_bl2pc_memdump("gz-base", 0x70000000ULL, 48);
+        mtk_bl2pc_memdump("gz-entry", 0x700000E0ULL, 48);
+    }
+    if (mtk_bl2pc.left_all) {
+        mtk_bl2pc_memdump("left-pc", mtk_bl2pc.left_all_last_pc, 32);
+    }
+    if (mtk_bl2pc.pc200_first_ns) {
+        mtk_bl2pc_memdump("fault-pc", mtk_bl2pc.fmt_pc, 32);
+        fprintf(stderr, "  fault-el scr=%#" PRIx64 " elr3=%016" PRIx64
+                " vbar3=%016" PRIx64 " esr3=%#" PRIx64
+                " vbar2=%016" PRIx64 " elr2=%016" PRIx64
+                " esr2=%#" PRIx64 " far2=%#" PRIx64 " pstate=%#" PRIx64
+                "\n", mtk_bl2pc.fscr, mtk_bl2pc.felr3, mtk_bl2pc.fvbar3,
+                mtk_bl2pc.fesr3, mtk_bl2pc.fvbar2, mtk_bl2pc.felr2,
+                mtk_bl2pc.fesr2, mtk_bl2pc.ffar2, mtk_bl2pc.fpstate);
+        fprintf(stderr, "  left-el scr=%#" PRIx64 " elr3=%016" PRIx64
+                " vbar3=%016" PRIx64 " esr3=%#" PRIx64
+                " vbar2=%016" PRIx64 " elr2=%016" PRIx64
+                " esr2=%#" PRIx64 " far2=%#" PRIx64 " pstate=%#" PRIx64
+                "\n", mtk_bl2pc.escr, mtk_bl2pc.eelr3, mtk_bl2pc.evbar3,
+                mtk_bl2pc.eesr3, mtk_bl2pc.evbar2, mtk_bl2pc.eelr2,
+                mtk_bl2pc.eesr2, mtk_bl2pc.efar2, mtk_bl2pc.epstate);
+    }
+    if (mtk_bl2pc.bl2_halt_count) {
+        fprintf(stderr, "  bl2-halts count=%u first_ns=%" PRId64
+                " last_ns=%" PRId64 " last_pc=%016" PRIx64 "\n",
+                mtk_bl2pc.bl2_halt_count, mtk_bl2pc.bl2_halt_first_ns,
+                mtk_bl2pc.bl2_halt_last_ns, mtk_bl2pc.bl2_halt_last_pc);
+    }
 }
 
 static void mtk_bl2pc_exit_dump(void)
@@ -5400,12 +6087,26 @@ static void mtk_bl2pc_tick(void *opaque)
     CPUARMState *env;
     uint64_t pc, key;
 
+    /*
+     * Re-arm before any early return so a transient cs==NULL (or any other
+     * early exit) can never stop the sampler.  The later timer_mod remains
+     * as a second, harmless re-arm.
+     */
+    {
+        mtk_bl2pc.ticks_total++;
+        mtk_bl2pc.last_tick_ns = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+        mtk_bl2pc.any_pc[mtk_bl2pc.any_pc_count++ % 32] =
+            (uint64_t)((ARM_CPU(cs)->env.pc) & 0x0000ffffffffffffULL);
+        timer_mod(mtk_bl2pc.timer,
+                  qemu_clock_get_ns(QEMU_CLOCK_REALTIME) + 100000);
+    }
     if (!cs) {
+        mtk_bl2pc.cs_null++;
         return;
     }
     env = cpu_env(cs);
     timer_mod(mtk_bl2pc.timer,
-              qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + 100000);
+              qemu_clock_get_ns(QEMU_CLOCK_REALTIME) + 100000);
     pc = env->pc;
     {
         uint64_t lopc = pc & 0x0000ffffffffffffULL;
@@ -5489,6 +6190,353 @@ static void mtk_bl2pc_tick(void *opaque)
             mtk_bl2pc.pc200_first_ns = now_ns ? now_ns : 1;
         }
     }
+    {
+        uint64_t lopc = pc & 0x0000ffffffffffffULL;
+        uint64_t now_ns = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+        bool in1 = lopc >= 0x48200000ULL && lopc < 0x48300000ULL;
+        bool in2 = lopc >= 0x48600000ULL && lopc < 0x48800000ULL;
+
+        if (in2) {
+            unsigned idx = (unsigned)(((lopc >> 4) * 2654435761u) & 63);
+
+            if (!mtk_bl2pc.win2_seen) {
+                mtk_bl2pc.win2_seen = true;
+                mtk_bl2pc.win2_first_ns = now_ns;
+            }
+            mtk_bl2pc.win2_last_ns = now_ns;
+            if (mtk_bl2pc.atf2_hist_cnt[idx] == 0) {
+                mtk_bl2pc.atf2_hist_key[idx] = lopc;
+            }
+            mtk_bl2pc.atf2_hist_cnt[idx]++;
+        }
+        if (in1 || in2) {
+            mtk_bl2pc.was_in_any = true;
+        } else if (mtk_bl2pc.was_in_any && !mtk_bl2pc.left_all) {
+            mtk_bl2pc.left_all = true;
+            mtk_bl2pc.left_all_ns = now_ns;
+            mtk_bl2pc.left_all_last_pc = lopc;
+            mtk_bl2pc.left_all_esr = env->cp15.esr_el[3];
+            mtk_bl2pc.left_all_elr = env->elr_el[3];
+            mtk_bl2pc.left_all_spsr = env->pstate | env->daif;
+            mtk_bl2pc.left_all_vbar = env->cp15.vbar_el[3];
+            mtk_bl2pc.left_all_sctlr = env->cp15.sctlr_el[3];
+            mtk_bl2pc.left_all_tcr = env->cp15.tcr_el[3];
+        }
+        if (cs->halted && !mtk_bl2pc.prev_halted) {
+            unsigned ci;
+
+            mtk_bl2pc.halt_transitions++;
+            mtk_bl2pc.last_halt_ns = now_ns;
+            mtk_bl2pc.last_halt_pc = lopc;
+            mtk_bl2pc.last_halt_irq = cs->interrupt_request;
+            mtk_bl2pc.last_halt_esr = env->cp15.esr_el[3];
+            mtk_bl2pc.last_halt_elr = env->elr_el[3];
+            mtk_bl2pc.last_halt_spsr = env->pstate | env->daif;
+            mtk_bl2pc.last_halt_vbar = env->cp15.vbar_el[3];
+            mtk_bl2pc.last_halt_sctlr = env->cp15.sctlr_el[3];
+            mtk_bl2pc.last_halt_tcr = env->cp15.tcr_el[3];
+            {
+                ARMCPU *acpu = ARM_CPU(cs);
+                unsigned gi;
+
+                for (gi = 0; gi < NUM_GTIMERS && gi < 4; gi++) {
+                    if (acpu->gt_timer[gi]) {
+                        mtk_bl2pc.gt_at_halt[gi] =
+                            timer_expire_time_ns(acpu->gt_timer[gi]) -
+                            (int64_t)now_ns;
+                    } else {
+                        mtk_bl2pc.gt_at_halt[gi] = -1;
+                    }
+                }
+            }
+            if (lopc >= 0x62f00000ULL && lopc < 0x64f00000ULL) {
+                if (!mtk_bl2pc.bl2_halt_count) {
+                    mtk_bl2pc.bl2_halt_first_ns = now_ns;
+                }
+                mtk_bl2pc.bl2_halt_count++;
+                mtk_bl2pc.bl2_halt_last_ns = now_ns;
+                mtk_bl2pc.bl2_halt_last_pc = lopc;
+            }
+            if (!mtk_bl2pc.halt_seen) {
+                mtk_bl2pc.halt_seen = true;
+                mtk_bl2pc.halt_ns = mtk_bl2pc.last_halt_ns;
+                mtk_bl2pc.halt_pc = mtk_bl2pc.last_halt_pc;
+                mtk_bl2pc.halt_irq = mtk_bl2pc.last_halt_irq;
+                mtk_bl2pc.halt_esr = mtk_bl2pc.last_halt_esr;
+                mtk_bl2pc.halt_elr = mtk_bl2pc.last_halt_elr;
+                mtk_bl2pc.halt_spsr = mtk_bl2pc.last_halt_spsr;
+                mtk_bl2pc.halt_vbar = mtk_bl2pc.last_halt_vbar;
+                mtk_bl2pc.halt_sctlr = mtk_bl2pc.last_halt_sctlr;
+                mtk_bl2pc.halt_tcr = mtk_bl2pc.last_halt_tcr;
+            }
+            if (mtk_bl2pc.halt_transitions <= 8) {
+                fprintf(stderr, "  HALT#%u at_ns=%" PRId64
+                        " pc=%016" PRIx64 " cpu_halted=1 irq=%#" PRIx64
+                        " esr=%#" PRIx64 " elr=%016" PRIx64
+                        " spsr=%#" PRIx64 " vbar=%016" PRIx64
+                        " sctlr=%016" PRIx64 " tcr=%016" PRIx64 "\n",
+                        mtk_bl2pc.halt_transitions, now_ns, lopc,
+                        mtk_bl2pc.last_halt_irq, mtk_bl2pc.last_halt_esr,
+                        mtk_bl2pc.last_halt_elr, mtk_bl2pc.last_halt_spsr,
+                        mtk_bl2pc.last_halt_vbar, mtk_bl2pc.last_halt_sctlr,
+                        mtk_bl2pc.last_halt_tcr);
+                fprintf(stderr, "    gt-halt ns_delta[0..3]=%lld,%lld,%lld,%lld\n",
+                        (long long)mtk_bl2pc.gt_at_halt[0],
+                        (long long)mtk_bl2pc.gt_at_halt[1],
+                        (long long)mtk_bl2pc.gt_at_halt[2],
+                        (long long)mtk_bl2pc.gt_at_halt[3]);
+                for (ci = 0; ci < 8; ci++) {
+                    CPUState *oc = qemu_get_cpu(ci);
+
+                    if (!oc) {
+                        break;
+                    }
+                    fprintf(stderr, "    cpu%u halted=%u pc=%016" PRIx64
+                            " irq=%#" PRIx64 "\n", ci,
+                            (unsigned)oc->halted,
+                            (uint64_t)cpu_env(oc)->pc,
+                            (uint64_t)oc->interrupt_request);
+                }
+            }
+            {
+                Mt6895MachineState *ms =
+                    MT6895_MACHINE(OBJECT(qdev_get_machine()));
+                GICv3State *g = (GICv3State *)ms->gic;
+
+                if (g && g->cpu) {
+                    for (ci = 0; ci < g->num_cpu && ci < 8; ci++) {
+                        GICv3CPUState *gc = &g->cpu[ci];
+
+                        fprintf(stderr,
+                                "    gic%u hppi_irq=%d hppi_prio=%u"
+                                " hppi_grp=%d level=%u"
+                                " ienable=%08x ipend=%08x igroup=%08x"
+                                " pend_en=%08x pmr=%#llx igrpen1=%#llx\n",
+                                ci, gc->hppi.irq, (unsigned)gc->hppi.prio,
+                                gc->hppi.grp, gc->level,
+                                (unsigned)gc->gicr_ienabler0,
+                                (unsigned)gc->gicr_ipendr0,
+                                (unsigned)gc->gicr_igroupr0,
+                                (unsigned)(gc->gicr_ipendr0 &
+                                           gc->gicr_ienabler0),
+                                (unsigned long long)gc->icc_pmr_el1,
+                                (unsigned long long)gc->icc_igrpen[1]);
+                    }
+                }
+            }
+        }
+        if (mtk_bl2pc.prev_halted && !cs->halted) {
+            mtk_bl2pc.resume_count++;
+            mtk_bl2pc.last_resume_ns = now_ns;
+            mtk_bl2pc.last_resume_pc = lopc;
+            mtk_bl2pc.last_resume_irq = cs->interrupt_request;
+            mtk_bl2pc.last_resume_delta = (now_ns >= mtk_bl2pc.last_halt_ns)
+                ? now_ns - mtk_bl2pc.last_halt_ns : 0;
+            {
+                ARMCPU *acpu = ARM_CPU(cs);
+                unsigned gi;
+
+                for (gi = 0; gi < NUM_GTIMERS && gi < 4; gi++) {
+                    if (acpu->gt_timer[gi]) {
+                        mtk_bl2pc.gt_at_resume[gi] =
+                            timer_expire_time_ns(acpu->gt_timer[gi]) -
+                            (int64_t)now_ns;
+                    } else {
+                        mtk_bl2pc.gt_at_resume[gi] = -1;
+                    }
+                }
+            }
+            if (mtk_bl2pc.resume_count <= 8) {
+                fprintf(stderr, "  RESUME#%u at_ns=%" PRId64
+                        " pc=%016" PRIx64 " irq=%#" PRIx64
+                        " delta_ns=%" PRId64 " cause=%s\n",
+                        mtk_bl2pc.resume_count, now_ns, lopc,
+                        mtk_bl2pc.last_resume_irq,
+                        mtk_bl2pc.last_resume_delta,
+                        mtk_bl2pc.last_resume_irq ? "irq-pending" :
+                        "no-irq (timer/other)");
+                fprintf(stderr, "    gt-resume ns_delta[0..3]=%lld,%lld,%lld,%lld\n",
+                        (long long)mtk_bl2pc.gt_at_resume[0],
+                        (long long)mtk_bl2pc.gt_at_resume[1],
+                        (long long)mtk_bl2pc.gt_at_resume[2],
+                        (long long)mtk_bl2pc.gt_at_resume[3]);
+            }
+        }
+        mtk_bl2pc.prev_halted = cs->halted;
+    }
+    {
+        uint64_t lopc = pc & 0x0000ffffffffffffULL;
+        uint64_t now_ns = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+        bool in1 = lopc >= 0x48200000ULL && lopc < 0x48300000ULL;
+        bool in2 = lopc >= 0x48600000ULL && lopc < 0x48800000ULL;
+        bool in3 = lopc >= 0x70000000ULL && lopc < 0x71000000ULL;
+
+        if (in3 && mtk_bl2pc.win3_count < 64) {
+            mtk_bl2pc.win3_pc[mtk_bl2pc.win3_count++] = lopc;
+        }
+        if (in3 && !mtk_bl2pc.gz_seen) {
+            mtk_bl2pc.gz_seen = true;
+            mtk_bl2pc.gz_first_pc = lopc;
+            mtk_bl2pc.gz_cur_el = env->pstate & 0xf;
+            mtk_bl2pc.gz_scr = env->cp15.scr_el3;
+            mtk_bl2pc.gz_elr3 = env->elr_el[3];
+            mtk_bl2pc.gz_pstate = env->pstate | env->daif;
+            mtk_bl2pc.gz_vbar3 = env->cp15.vbar_el[3];
+            mtk_bl2pc.gz_esr3 = env->cp15.esr_el[3];
+            fprintf(stderr, "  GZ-ENTER pc=%016" PRIx64 " cur_el=%" PRIu64
+                    " scr=%#" PRIx64 " elr3=%016" PRIx64
+                    " vbar3=%016" PRIx64 " esr3=%#" PRIx64
+                    " pstate=%#" PRIx64 "\n", lopc, mtk_bl2pc.gz_cur_el,
+                    mtk_bl2pc.gz_scr, mtk_bl2pc.gz_elr3, mtk_bl2pc.gz_vbar3,
+                    mtk_bl2pc.gz_esr3, mtk_bl2pc.gz_pstate);
+        }
+        if (lopc >= 0x700000D8ULL && lopc <= 0x700000E4ULL) {
+            if (!mtk_bl2pc.loop_seen) {
+                mtk_bl2pc.loop_seen = true;
+                mtk_bl2pc.loop_last_ns = now_ns;
+                mtk_bl2pc.loop_x5 = env->xregs[5];
+                mtk_bl2pc.loop_x7 = env->xregs[7];
+                mtk_bl2pc.loop_x8 = env->xregs[8];
+                fprintf(stderr, "  COPYLOOP-first pc=%016" PRIx64
+                        " x5=%016" PRIx64 " x7=%016" PRIx64
+                        " x8=%016" PRIx64 "\n", lopc, mtk_bl2pc.loop_x5,
+                        mtk_bl2pc.loop_x7, mtk_bl2pc.loop_x8);
+            } else if (now_ns - mtk_bl2pc.loop_last_ns >= 1000000000LL) {
+                mtk_bl2pc.loop_last_ns = now_ns;
+                mtk_bl2pc.loop_x5 = env->xregs[5];
+                mtk_bl2pc.loop_x7 = env->xregs[7];
+                mtk_bl2pc.loop_x8 = env->xregs[8];
+                fprintf(stderr, "  COPYLOOP-1s at_ns=%" PRId64
+                        " pc=%016" PRIx64 " x5=%016" PRIx64
+                        " x7=%016" PRIx64 " x8=%016" PRIx64 "\n",
+                        now_ns, lopc, mtk_bl2pc.loop_x5, mtk_bl2pc.loop_x7,
+                        mtk_bl2pc.loop_x8);
+            }
+        }
+        if (lopc >= 0x87F800000ULL && lopc < 0x880600000ULL) {
+            if (!mtk_bl2pc.win5_count) {
+                mtk_bl2pc.win5_el = env->pstate & 0xf;
+            }
+            if (mtk_bl2pc.win5_count < 64) {
+                mtk_bl2pc.win5_pc[mtk_bl2pc.win5_count++] = lopc;
+            }
+        }
+        if (lopc >= 0x71000000ULL && lopc < 0x74000000ULL) {
+            unsigned idx = (unsigned)(((lopc >> 4) * 2654435761u) & 31);
+
+            if (!mtk_bl2pc.win4_count) {
+                mtk_bl2pc.win4_first_ns = now_ns;
+            }
+            mtk_bl2pc.win4_count++;
+            mtk_bl2pc.win4_last_ns = now_ns;
+            if (mtk_bl2pc.win4_hist_cnt[idx] == 0) {
+                mtk_bl2pc.win4_hist_key[idx] = lopc;
+            }
+            mtk_bl2pc.win4_hist_cnt[idx]++;
+        }
+        if (mtk_bl2pc.gz_seen && in1 && !mtk_bl2pc.smc_seen) {
+            mtk_bl2pc.smc_seen = true;
+            mtk_bl2pc.smc_count++;
+            mtk_bl2pc.smc_x0 = env->xregs[0];
+            mtk_bl2pc.smc_x1 = env->xregs[1];
+            mtk_bl2pc.smc_x2 = env->xregs[2];
+            mtk_bl2pc.smc_x3 = env->xregs[3];
+            mtk_bl2pc.smc_elr3 = env->elr_el[3];
+            mtk_bl2pc.smc_esr3 = env->cp15.esr_el[3];
+            mtk_bl2pc.smc_pstate = env->pstate | env->daif;
+            fprintf(stderr, "  ATF-REENTRY pc=%016" PRIx64 " x0=%#" PRIx64
+                    " x1=%#" PRIx64 " x2=%#" PRIx64 " x3=%#" PRIx64
+                    " elr3=%016" PRIx64 " esr3=%#" PRIx64
+                    " pstate=%#" PRIx64 "\n", lopc, mtk_bl2pc.smc_x0,
+                    mtk_bl2pc.smc_x1, mtk_bl2pc.smc_x2, mtk_bl2pc.smc_x3,
+                    mtk_bl2pc.smc_elr3, mtk_bl2pc.smc_esr3,
+                    mtk_bl2pc.smc_pstate);
+        }
+        if (mtk_bl2pc.smc_seen && !mtk_bl2pc.smcret_seen &&
+            lopc >= 0x71000000ULL && lopc < 0x74000000ULL) {
+            mtk_bl2pc.smcret_seen = true;
+            mtk_bl2pc.smcret_pc = lopc;
+            mtk_bl2pc.smcret_x0 = env->xregs[0];
+            mtk_bl2pc.smcret_x1 = env->xregs[1];
+            mtk_bl2pc.smcret_x2 = env->xregs[2];
+            mtk_bl2pc.smcret_x3 = env->xregs[3];
+            fprintf(stderr, "  SMC-RET pc=%016" PRIx64 " x0=%#" PRIx64
+                    " x1=%#" PRIx64 " x2=%#" PRIx64 " x3=%#" PRIx64
+                    "\n", lopc, mtk_bl2pc.smcret_x0, mtk_bl2pc.smcret_x1,
+                    mtk_bl2pc.smcret_x2, mtk_bl2pc.smcret_x3);
+        }
+        {
+            bool known = in1 || in2 || in3 ||
+                (lopc >= 0x62f00000ULL && lopc < 0x64f00000ULL) ||
+                (lopc >= 0x48000000ULL && lopc < 0x49000000ULL) ||
+                (lopc >= 0x71000000ULL && lopc < 0x74000000ULL);
+
+            if (mtk_bl2pc.gz_seen && mtk_bl2pc.smc_seen && !known &&
+                !mtk_bl2pc.out_seen && lopc != 0x200) {
+                mtk_bl2pc.out_seen = true;
+                mtk_bl2pc.out_pc = lopc;
+                mtk_bl2pc.out_elr3 = env->elr_el[3];
+                mtk_bl2pc.out_esr3 = env->cp15.esr_el[3];
+                mtk_bl2pc.out_pstate = env->pstate | env->daif;
+                fprintf(stderr, "  OUT-OF-WINDOW pc=%016" PRIx64
+                        " elr3=%016" PRIx64 " esr3=%#" PRIx64
+                        " pstate=%#" PRIx64 "\n", lopc,
+                        mtk_bl2pc.out_elr3, mtk_bl2pc.out_esr3,
+                        mtk_bl2pc.out_pstate);
+            }
+        }
+        if (in1 || in2 || in3) {
+            mtk_bl2pc.was_in_any = true;
+        } else if (mtk_bl2pc.was_in_any && !mtk_bl2pc.left_all) {
+            mtk_bl2pc.left_all = true;
+            mtk_bl2pc.left_all_ns = now_ns;
+            mtk_bl2pc.left_all_last_pc = lopc;
+            mtk_bl2pc.left_all_esr = env->cp15.esr_el[3];
+            mtk_bl2pc.left_all_elr = env->elr_el[3];
+            mtk_bl2pc.left_all_spsr = env->pstate | env->daif;
+            mtk_bl2pc.left_all_vbar = env->cp15.vbar_el[3];
+            mtk_bl2pc.left_all_sctlr = env->cp15.sctlr_el[3];
+            mtk_bl2pc.left_all_tcr = env->cp15.tcr_el[3];
+            mtk_bl2pc.escr = env->cp15.scr_el3;
+            mtk_bl2pc.eelr3 = env->elr_el[3];
+            mtk_bl2pc.evbar3 = env->cp15.vbar_el[3];
+            mtk_bl2pc.eesr3 = env->cp15.esr_el[3];
+            mtk_bl2pc.evbar2 = env->cp15.vbar_el[2];
+            mtk_bl2pc.eelr2 = env->elr_el[2];
+            mtk_bl2pc.eesr2 = env->cp15.esr_el[2];
+            mtk_bl2pc.efar2 = env->cp15.far_el[2];
+            mtk_bl2pc.epstate = env->pstate | env->daif;
+            fprintf(stderr, "  LEFT-ALL pc=%016" PRIx64 " scr=%#" PRIx64
+                    " elr3=%016" PRIx64 " vbar3=%016" PRIx64
+                    " esr3=%#" PRIx64 " vbar2=%016" PRIx64
+                    " elr2=%016" PRIx64 " esr2=%#" PRIx64
+                    " far2=%#" PRIx64 " pstate=%#" PRIx64 "\n", lopc,
+                    mtk_bl2pc.escr, mtk_bl2pc.eelr3, mtk_bl2pc.evbar3,
+                    mtk_bl2pc.eesr3, mtk_bl2pc.evbar2, mtk_bl2pc.eelr2,
+                    mtk_bl2pc.eesr2, mtk_bl2pc.efar2, mtk_bl2pc.epstate);
+        }
+        if (lopc == 0x200ULL && !mtk_bl2pc.pc200_first_ns) {
+            mtk_bl2pc.pc200_first_ns = now_ns ? now_ns : 1;
+            mtk_bl2pc.fmt_pc = 0x200;
+            mtk_bl2pc.fscr = env->cp15.scr_el3;
+            mtk_bl2pc.felr3 = env->elr_el[3];
+            mtk_bl2pc.fvbar3 = env->cp15.vbar_el[3];
+            mtk_bl2pc.fesr3 = env->cp15.esr_el[3];
+            mtk_bl2pc.fvbar2 = env->cp15.vbar_el[2];
+            mtk_bl2pc.felr2 = env->elr_el[2];
+            mtk_bl2pc.fesr2 = env->cp15.esr_el[2];
+            mtk_bl2pc.ffar2 = env->cp15.far_el[2];
+            mtk_bl2pc.fpstate = env->pstate | env->daif;
+            fprintf(stderr, "  PC200 scr=%#" PRIx64 " elr3=%016" PRIx64
+                    " vbar3=%016" PRIx64 " esr3=%#" PRIx64
+                    " vbar2=%016" PRIx64 " elr2=%016" PRIx64
+                    " esr2=%#" PRIx64 " far2=%#" PRIx64 " pstate=%#"
+                    PRIx64 "\n", mtk_bl2pc.fscr, mtk_bl2pc.felr3,
+                    mtk_bl2pc.fvbar3, mtk_bl2pc.fesr3, mtk_bl2pc.fvbar2,
+                    mtk_bl2pc.felr2, mtk_bl2pc.fesr2, mtk_bl2pc.ffar2,
+                    mtk_bl2pc.fpstate);
+        }
+    }
     mtk_bl2pc.any[mtk_bl2pc.any_head] = (MtkBl2PcSample){ pc, env->xregs[30],
                                                         env->xregs[31],
                                                         env->daif };
@@ -5511,28 +6559,44 @@ static void mtk_bl2pc_tick(void *opaque)
      * dump before the harness kills QEMU -- the atexit dump would not run on
      * a forced kill.  Labelled separately from the stall dump.
      */
-    if (mtk_bl2pc.head == mtk_bl2pc.last_head) {
-        mtk_bl2pc.idle_ticks++;
-    } else {
-        mtk_bl2pc.last_head = mtk_bl2pc.head;
-        mtk_bl2pc.idle_ticks = 0;
-    }
-    if (mtk_bl2pc.idle_ticks == 2000 && !mtk_bl2pc.dumped_noprogress &&
-        mtk_bl2pc.count) {
-        mtk_bl2pc.dumped_noprogress = true;
-        mtk_bl2pc_print(32, "no-progress");
-        fprintf(stderr, "  current pc=%016" PRIx64 " lr=%016" PRIx64
-                " sp=%016" PRIx64 " daif=%#" PRIx64 "\n", pc,
-                env->xregs[30], env->xregs[31], env->daif);
-        if (mtk_bl2pc.any_count) {
-            unsigned k, start = (mtk_bl2pc.any_head + MTK_BL2PC_ANY -
-                                 mtk_bl2pc.any_count) % 16;
-            for (k = 0; k < mtk_bl2pc.any_count; k++) {
-                MtkBl2PcSample *a =
-                    &mtk_bl2pc.any[(start + k) % MTK_BL2PC_ANY];
-                fprintf(stderr, "  after[%u] pc=%016" PRIx64 " lr=%016"
-                        PRIx64 " sp=%016" PRIx64 " daif=%#" PRIx64 "\n",
-                        k, a->pc, a->lr, a->sp, a->daif);
+    {
+        int64_t now_r = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+
+        if (mtk_bl2pc.head == mtk_bl2pc.last_head) {
+            mtk_bl2pc.idle_ticks++;
+        } else {
+            mtk_bl2pc.last_head = mtk_bl2pc.head;
+            mtk_bl2pc.idle_ticks = 0;
+            mtk_bl2pc.last_progress_ns = (uint64_t)now_r;
+        }
+        /*
+         * Time-based reporting: every 2 s of virtual time, at most 4 dumps;
+         * labelled no-progress only when no sample arrived for 2 s.  The
+         * atexit dump remains an unconditional fallback.
+         */
+        if (mtk_bl2pc.count && mtk_bl2pc.dump_count < 4 && now_r > 0 &&
+            now_r - (int64_t)mtk_bl2pc.last_report_ns >= 2000000000LL) {
+            mtk_bl2pc.dump_count++;
+            mtk_bl2pc.last_report_ns = (uint64_t)now_r;
+            mtk_bl2pc_print(32, (mtk_bl2pc.last_progress_ns &&
+                                now_r - (int64_t)mtk_bl2pc.last_progress_ns >=
+                                2000000000LL) ? "no-progress" : "periodic");
+            fprintf(stderr, "  current pc=%016" PRIx64 " lr=%016" PRIx64
+                    " sp=%016" PRIx64 " daif=%#" PRIx64 "\n", pc,
+                    env->xregs[30], env->xregs[31], env->daif);
+            if (mtk_bl2pc.any_count) {
+                unsigned k, st = (mtk_bl2pc.any_head + MTK_BL2PC_ANY -
+                                  mtk_bl2pc.any_count) % MTK_BL2PC_ANY;
+
+                for (k = 0; k < mtk_bl2pc.any_count; k++) {
+                    MtkBl2PcSample *a =
+                        &mtk_bl2pc.any[(st + k) % MTK_BL2PC_ANY];
+
+                    fprintf(stderr, "  after[%u] pc=%016" PRIx64
+                            " lr=%016" PRIx64 " sp=%016" PRIx64
+                            " daif=%#" PRIx64 "\n", k, a->pc, a->lr,
+                            a->sp, a->daif);
+                }
             }
         }
     }
@@ -5566,15 +6630,92 @@ static void mtk_bl2pc_mmio(hwaddr pa, uint64_t val, bool is_write)
     mtk_bl2pc.mmio_write = is_write;
 }
 
+static void mtk_bl2pc_atf_mmio(hwaddr pa, uint64_t val, bool is_write)
+{
+    CPUState *cs;
+    uint64_t lopc;
+
+    if (!mtk_bl2pc.enabled) {
+        return;
+    }
+    cs = qemu_get_cpu(0);
+    if (!cs) {
+        return;
+    }
+    lopc = cpu_env(cs)->pc & 0x0000ffffffffffffULL;
+    if ((lopc >= 0x48200000ULL && lopc < 0x48300000ULL) ||
+        (lopc >= 0x48600000ULL && lopc < 0x48800000ULL) ||
+        (lopc >= 0x70000000ULL && lopc < 0x74000000ULL) ||
+        (lopc >= 0x7F800000ULL && lopc < 0x800600000ULL) ||
+        (lopc >= 0x87F800000ULL && lopc < 0x880600000ULL)) {
+        mtk_bl2pc.have_atf_mmio = true;
+        mtk_bl2pc.atf_mmio_pa = pa;
+        mtk_bl2pc.atf_mmio_val = val;
+        mtk_bl2pc.atf_mmio_write = is_write;
+        if (((lopc >= 0x48200000ULL && lopc < 0x48300000ULL) ||
+             (lopc >= 0x48600000ULL && lopc < 0x48800000ULL)) &&
+            mtk_bl2pc.atf_mmio_count < 8) {
+            unsigned k = mtk_bl2pc.atf_mmio_count++;
+
+            mtk_bl2pc.atfmm_pa[k] = pa;
+            mtk_bl2pc.atfmm_val[k] = val;
+            mtk_bl2pc.atfmm_wr[k] = is_write;
+            fprintf(stderr, "  ATF-MMIO pc=%016" PRIx64 " %c pa=%#"
+                    PRIx64 " val=%#" PRIx64 "\n", lopc,
+                    is_write ? 'W' : 'R', pa, val);
+        }
+        if (lopc >= 0x70000000ULL && lopc < 0x74000000ULL &&
+            mtk_bl2pc.mmio70_count < 8) {
+            unsigned k = mtk_bl2pc.mmio70_count++;
+
+            mtk_bl2pc.mmio70_pa[k] = pa;
+            mtk_bl2pc.mmio70_val[k] = val;
+            mtk_bl2pc.mmio70_wr[k] = is_write;
+            fprintf(stderr, "  MMIO70 pc=%016" PRIx64 " %c pa=%#" PRIx64
+                    " val=%#" PRIx64 "\n", lopc, is_write ? 'W' : 'R',
+                    pa, val);
+        }
+    }
+}
+
+static void mtk_bl2pc_reset(void *opaque)
+{
+    (void)opaque;
+    mtk_bl2pc.resets++;
+    if (mtk_bl2pc.resets <= 4) {
+        uint64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+        CPUState *cs = qemu_get_cpu(0);
+        CPUARMState *env = cs ? cpu_env(cs) : NULL;
+        unsigned k, st = (mtk_bl2pc.any_pc_count > 32) ?
+            (mtk_bl2pc.any_pc_count & 31) : 0;
+
+        fprintf(stderr, "  RESET#%u at_ns=%" PRId64 " pc=%016" PRIx64
+                " elr3=%016" PRIx64 " esr3=%#" PRIx64 " scr=%#" PRIx64
+                " pstate=%#" PRIx64 "\n", mtk_bl2pc.resets, now,
+                env ? (uint64_t)env->pc : 0,
+                env ? env->elr_el[3] : 0,
+                env ? env->cp15.esr_el[3] : 0,
+                env ? env->cp15.scr_el3 : 0,
+                env ? (env->pstate | env->daif) : 0);
+        fprintf(stderr, "    RESET-last-pcs:");
+        for (k = 0; k < 32 && k < mtk_bl2pc.any_pc_count; k++) {
+            fprintf(stderr, " %016" PRIx64,
+                    mtk_bl2pc.any_pc[(st + k) & 31]);
+        }
+        fprintf(stderr, "\n");
+    }
+}
+
 static void mtk_bl2pc_init(void)
 {
     if (mtk_bl2pc.enabled || !MTK_ENV_CACHED("MTK_BL2PC")) {
         return;
     }
     mtk_bl2pc.enabled = true;
-    mtk_bl2pc.timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, mtk_bl2pc_tick, NULL);
+    qemu_register_reset(mtk_bl2pc_reset, NULL);
+    mtk_bl2pc.timer = timer_new_ns(QEMU_CLOCK_REALTIME, mtk_bl2pc_tick, NULL);
     timer_mod(mtk_bl2pc.timer,
-              qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + 100000);
+              qemu_clock_get_ns(QEMU_CLOCK_REALTIME) + 100000);
     atexit(mtk_bl2pc_exit_dump);
     fprintf(stderr, "mt6895: MTK_BL2PC sampler enabled "
             "(BL2_EXT 0x62f00000..0x64efffff)\n");
@@ -5586,6 +6727,7 @@ static uint64_t mt6895_peri_fill_read(void *opaque, hwaddr off, unsigned size)
     (void)size;
     mt6895_usbdevtrace('R', 0x10000000ULL + off, size, 0);
     mtk_bl2pc_mmio(0x10000000ULL + off, 0, false);
+    mtk_bl2pc_atf_mmio(0x10000000ULL + off, 0, false);
     if (MTK_ENV_CACHED("MTK_SPIN2")) {
         static hwaddr last;
         static unsigned long cnt;
@@ -5656,6 +6798,7 @@ static void mt6895_peri_fill_write(void *opaque, hwaddr off, uint64_t val,
     (void)opaque; (void)size;
     mt6895_usbdevtrace('W', 0x10000000ULL + off, size, val);
     mtk_bl2pc_mmio(0x10000000ULL + off, val, true);
+    mtk_bl2pc_atf_mmio(0x10000000ULL + off, val, true);
     if (MTK_ENV_CACHED("MTK_PERI_WTRACE")) {
         static int budget;
 
@@ -9600,7 +10743,7 @@ ufs_done:
          * DISPLAY_CMDQ_DEFECT.md.  Unset means the machine creates no touch
          * devices and behaves exactly like the committed base.
          */
-        if (MTK_ENV_CACHED("MTK_TOUCH")) {
+        if (mtk_env_on("MTK_TOUCH")) {
             mt6895_create_spi(s, errp);
         }
     }
@@ -14102,6 +15245,16 @@ static void mt6895_init(MachineState *machine)
     memory_region_add_subregion(sysmem,
                                 MT6895_DRAM_ALIAS_BASE + MT6895_DRAM_BASE,
                                 &s->ddr_alias);
+    /* Real-hardware secure PA alias: 0x800000000 + PA views the same DRAM. */
+    {
+        static MemoryRegion dram_alias_mr;
+        memory_region_init_alias(&dram_alias_mr, OBJECT(s),
+                                 "mt6895.dram-secure-alias", s->ddr, 0,
+                                 MACHINE(s)->ram_size);
+        memory_region_add_subregion(sysmem,
+            0x800000000 + MT6895_DRAM_BASE, &dram_alias_mr);
+    }
+
 
     /*
      * GenieZone EMI domain remap: DRAM as the VMID1 domain addresses it, at
