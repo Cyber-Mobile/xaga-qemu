@@ -13429,12 +13429,26 @@ static void mt6895_create_syscons(Mt6895MachineState *s, Error **errp)
         }
     }
     /*
-     * MTK_NO_GTAPLANT=1: leave ATF's tag area as plain RAM.  Once BL32/TEE
-     * actually runs, ATF's secmem_init (0x4821e338) copies the real TZ_TAGS
-     * from tee-secmem+0x200 into 0x4825ad1c after the BSS clear, and the
-     * planted "SS\x12" tag (0x48280000) overlaps BL31's own xlat tables.
+     * ATF's platform tag area (GTA) at 0x4825ad1c is left as plain RAM by
+     * default now that BL32/TEE really runs: ATF's secmem_init (0x4821e338)
+     * copies the real TZ_TAGS from tee-secmem+0x200 into that address after
+     * its BSS clear, so the tags ATF sees are the firmware's own.
+     *
+     * The old synthetic "SS\x12" tag (MTK_GTAPLANT=1 restores it) is wrong in
+     * this configuration and is what hung the zero-injection boot: the tag
+     * advertises a translation-table area at 0x48280000, which overlaps BL31's
+     * own L3 tables, and its read hook re-plants the tag whenever the magic is
+     * gone, overwriting the real TZ_TAGS.  With the tag in place, LK's CMDQ SMC
+     * 0xc2000418 -> GZ-forwarded 0xc2004418 -> ATF cmdq_bl_handler (0x48207758)
+     * -> mtk_iommu_init_secure_pt_mem (0x4821443c) memsets 0x48280000 for
+     * 0x10000 bytes, data-aborts at 0x48280800 (translation fault, EL3), and
+     * the nested instruction-abort loop at 0x4822b800 means LK never gets its
+     * SMC return.  See DEBUG_NOTES round 1,285/1,286 and NEXT_STEPS 26/27.
+     *
+     * MTK_NO_GTAPLANT=1 is still accepted for older harnesses and now matches
+     * the default.
      */
-    if (!MTK_ENV_CACHED("MTK_NO_GTAPLANT")) {
+    if (MTK_ENV_CACHED("MTK_GTAPLANT") && !MTK_ENV_CACHED("MTK_NO_GTAPLANT")) {
         static MemoryRegion gta_mr;
 
         memory_region_init_io(&gta_mr, OBJECT(s), &mt6895_atf_gta_ops, s,
