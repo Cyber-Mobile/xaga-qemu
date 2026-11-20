@@ -61,6 +61,8 @@ struct MtkSysconState {
     bool efuse_unlocked;
     /* Board strap selecting LPDDR5X (genuine 6 GiB configuration). */
     bool lpdd5x_strap;
+    /* Board pulls the fastmeta pad (GPIO5) high. */
+    bool fastmeta_strap;
 };
 
 static bool mtk_infracfg_b4_ctl;
@@ -598,6 +600,37 @@ static uint64_t mtk_syscon_read(void *opaque, hwaddr offset, unsigned size)
             }
         }
     }
+    /*
+     * DIAGNOSTIC (MTK_PINCTRL_FORCE="0x<off>=0x<val>"): OR a value into one
+     * pinctrl register on read.  The preloader's fastmeta probe reports a pad
+     * input level that is constant 0, and the earlier write-probe campaign
+     * could not attribute it to a register; this knob bisects the offset
+     * without touching anything else.  Default: off.
+     */
+    {
+        MtkSysconState *sf = MTK_SYSCON(opaque);
+
+        if (MTK_ENV_CACHED("MTK_PINCTRL_FORCE") && sf->name &&
+            strstr(sf->name, "pinctrl")) {
+            static hwaddr foff;
+            static uint32_t fval;
+            static bool finit;
+
+            if (!finit) {
+                const char *e = getenv("MTK_PINCTRL_FORCE");
+                unsigned long long o = 0, v = 0;
+
+                finit = true;
+                if (e && sscanf(e, "0x%llx=0x%llx", &o, &v) == 2) {
+                    foff = (hwaddr)o;
+                    fval = (uint32_t)v;
+                }
+            }
+            if (fval && offset == foff && offset + 4 <= sf->size) {
+                return sf->regs[offset / 4] | fval;
+            }
+        }
+    }
     {
         MtkSysconState *sd = MTK_SYSCON(opaque);
         static const char *lname;
@@ -637,6 +670,27 @@ static uint64_t mtk_syscon_read(void *opaque, hwaddr offset, unsigned size)
          */
         if (s0->lpdd5x_strap && offset == 0x200 && offset + 4 <= s0->size) {
             return s0->regs[offset / 4] | 1u;
+        }
+        /*
+         * The xaga board also pulls the fastmeta pad (GPIO5) high: it is an
+         * input with its pull-up enabled and nothing on the board driving it,
+         * so it reads 1.  +0x200 is the pad input register (one bit per pin);
+         * a write probe proved bit 5 is the fastmeta pad -- forcing it turns
+         * the preloader's report into "value 1" and removes "Enable fastmeta".
+         *
+         * This matters far beyond the message: when the level reads low the
+         * preloader enables meta mode, and in meta mode the LK on this device
+         * never exports /firmware/android/vbmeta.{digest,size,hash_alg}.  The
+         * kernel then exposes no vbmeta digest, libfs_avb fails with
+         * "[libfs_avb] Invalid hash size", AvbHandle::Open() returns null,
+         * /system cannot be set up and first-stage init aborts with
+         * "Failed to mount required partitions early".
+         *
+         * MTK_NO_FASTMETA_STRAP=1 keeps the historical all-zero behaviour.
+         */
+        if (s0->fastmeta_strap && offset == 0x200 && offset + 4 <= s0->size &&
+            !MTK_ENV_CACHED("MTK_NO_FASTMETA_STRAP")) {
+            return s0->regs[offset / 4] | (1u << 5);
         }
 
         /*
@@ -1226,6 +1280,8 @@ static const Property mtk_syscon_props[] = {
      */
     DEFINE_PROP_STRING("name", MtkSysconState, name),
     DEFINE_PROP_BOOL("lpdd5x-strap", MtkSysconState, lpdd5x_strap, false),
+    /* Board pulls the fastmeta pad (GPIO5) high; see the read handler. */
+    DEFINE_PROP_BOOL("fastmeta-strap", MtkSysconState, fastmeta_strap, true),
 };
 
 static void mtk_syscon_class_init(ObjectClass *klass, const void *data)
