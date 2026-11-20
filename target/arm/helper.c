@@ -9723,6 +9723,24 @@ static bool mtk_atf_sha256_active;
  * it from (0xFFFF000048401000, size 0x1000). */
 #define MTK_ATF_CRYPTO_MB   0x48401000ULL
 
+/*
+ * MTK_INIT_CRASH_TRACE: diagnostic tracer for Android first-stage init
+ * fatal reboot / crash analysis.
+ */
+uint64_t mtk_init_sighandler_va;
+
+/*
+ * The first-stage init failure is silent: no log line reaches either the UART
+ * or the printk ring.  Record the last EL0 syscall number and PC so the
+ * exception-return helper can print the syscall's return value (and errno),
+ * which is the only remaining view of which mount/ioctl failed.
+ */
+uint64_t mtk_init_syscall_nr = ~0ULL;
+uint64_t mtk_init_syscall_pc;
+uint64_t mtk_init_syscall_a0;
+uint64_t mtk_init_syscall_a1;
+uint64_t mtk_init_syscall_a2;
+
 
 static void arm_cpu_do_interrupt_aarch64(CPUState *cs)
 {
@@ -9960,6 +9978,153 @@ static void arm_cpu_do_interrupt_aarch64(CPUState *cs)
                     (uint64_t)env->cp15.sctlr_el[1],
                     (uint64_t)env->cp15.vbar_el[1],
                     (uint64_t)env->xregs[30]);
+        }
+    }
+    /*
+     * MTK_INIT_CRASH_TRACE=1: trace Android first-stage init sigaction registration
+     * and reboot system call from EL0.
+     */
+    {
+        static int mtk_init_trace = -1;
+
+        if (mtk_init_trace < 0) {
+            mtk_init_trace = getenv("MTK_INIT_CRASH_TRACE") != NULL;
+        }
+        if (mtk_init_trace && arm_current_el(env) == 0 &&
+            (env->exception.syndrome >> 26) == 0x15) {
+            uint64_t nr = env->xregs[8];
+
+            if (nr == 134) {
+                /* __NR_rt_sigaction */
+                uint32_t sig = (uint32_t)env->xregs[0];
+                uint64_t act = env->xregs[1];
+
+                if ((sig == 4 || sig == 5 || sig == 6 || sig == 7 ||
+                     sig == 8 || sig == 11 || sig == 16 || sig == 31) && act != 0) {
+                    uint64_t handler_va = 0;
+
+                    if (cpu_memory_rw_debug(cs, act, (uint8_t *)&handler_va, 8, false) == 0) {
+                        fprintf(stderr, "MTK-INIT-SIGACT sig=%u handler=%#" PRIx64 " pc=%#" PRIx64 "\n",
+                                sig, handler_va, (uint64_t)env->pc);
+                        if ((handler_va & 0xfff) == 0xba0) {
+                            mtk_init_sighandler_va = handler_va;
+                            fprintf(stderr, "MTK-INIT-SIGACT locked sighandler_va=%#" PRIx64
+                                    " (pie_base=%#" PRIx64 ")\n",
+                                    handler_va, handler_va - 0x100ba0ULL);
+                        }
+                    }
+                }
+            } else if (nr == 142) {
+                /* __NR_reboot */
+                uint64_t x0 = env->xregs[0];
+                uint64_t x1 = env->xregs[1];
+                uint64_t x2 = env->xregs[2];
+                uint64_t x3 = env->xregs[3];
+                uint64_t pc = env->pc;
+                uint64_t lr = env->xregs[30];
+                uint64_t sp = env->xregs[31];
+                uint64_t fp = env->xregs[29];
+                char cmd_str[33] = {0};
+
+                if (x3 != 0) {
+                    cpu_memory_rw_debug(cs, x3, (uint8_t *)cmd_str, 32, false);
+                    cmd_str[32] = '\0';
+                }
+                fprintf(stderr, "MTK-INIT-REBOOT x0=%#" PRIx64 " x1=%#" PRIx64
+                        " x2=%#" PRIx64 " x3=%#" PRIx64 " ('%s') pc=%#" PRIx64
+                        " lr=%#" PRIx64 " sp=%#" PRIx64 " fp=%#" PRIx64 "\n",
+                        x0, x1, x2, x3, cmd_str, pc, lr, sp, fp);
+
+                /* Walk up to 16 frame-pointer frames */
+                uint64_t cur_fp = fp;
+                for (int f = 0; f < 16 && cur_fp >= 0x1000ULL; f++) {
+                    uint64_t frame[2] = {0, 0};
+                    if (cpu_memory_rw_debug(cs, cur_fp, (uint8_t *)frame, 16, false) != 0) {
+                        break;
+                    }
+                    fprintf(stderr, "  MTK-INIT-REBOOT-BT #%02d fp=%#" PRIx64 " lr=%#" PRIx64 "\n",
+                            f, frame[0], frame[1]);
+                    if (frame[0] <= cur_fp || frame[0] - cur_fp > 0x100000ULL) {
+                        break;
+                    }
+                    cur_fp = frame[0];
+                }
+            } else {
+                /*
+                 * Syscall-level trace.  The interesting calls are the ones
+                 * that can fail silently in first stage: mount(2), the
+                 * device-mapper ioctls, and every write(2)/writev(2) (so a
+                 * LOG() line that never reaches the UART is still visible).
+                 */
+                static int nlogged;
+
+                mtk_init_syscall_nr = nr;
+                mtk_init_syscall_pc = (uint64_t)env->pc;
+                mtk_init_syscall_a0 = env->xregs[0];
+                mtk_init_syscall_a1 = env->xregs[1];
+                mtk_init_syscall_a2 = env->xregs[2];
+                /*
+                 * Only the tail of first-stage init is interesting; gating on
+                 * the virtual clock keeps the trace readable instead of
+                 * drowning it in the 163 module loads.
+                 */
+                if (qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL) >= 224000 &&
+                    nlogged < 20000) {
+                    if (nr == 40) {          /* mount */
+                        char s_src[160] = {0}, s_tgt[160] = {0}, s_fs[48] = {0};
+
+                        if (env->xregs[0]) {
+                            cpu_memory_rw_debug(cs, env->xregs[0], (uint8_t *)s_src, 159, false);
+                        }
+                        if (env->xregs[1]) {
+                            cpu_memory_rw_debug(cs, env->xregs[1], (uint8_t *)s_tgt, 159, false);
+                        }
+                        if (env->xregs[2]) {
+                            cpu_memory_rw_debug(cs, env->xregs[2], (uint8_t *)s_fs, 47, false);
+                        }
+                        nlogged++;
+                        fprintf(stderr, "MTK-SYS mount src='%s' tgt='%s' fs='%s'"
+                                " flags=%#" PRIx64 " data=%#" PRIx64 " pc=%#" PRIx64 "\n",
+                                s_src, s_tgt, s_fs, env->xregs[3], env->xregs[4],
+                                (uint64_t)env->pc);
+                    } else if (nr == 29) {   /* ioctl */
+                        nlogged++;
+                        fprintf(stderr, "MTK-SYS ioctl fd=%" PRId64 " req=%#" PRIx64
+                                " arg=%#" PRIx64 " pc=%#" PRIx64 "\n",
+                                (int64_t)env->xregs[0], env->xregs[1], env->xregs[2],
+                                (uint64_t)env->pc);
+                    } else if (nr == 64) {   /* write */
+                        char buf[201] = {0};
+                        uint64_t len = env->xregs[2];
+
+                        if (env->xregs[1] && len) {
+                            cpu_memory_rw_debug(cs, env->xregs[1], (uint8_t *)buf,
+                                                len > 200 ? 200 : len, false);
+                        }
+                        nlogged++;
+                        fprintf(stderr, "MTK-SYS write fd=%" PRId64 " len=%" PRIu64
+                                " pc=%#" PRIx64 " data='%s'\n",
+                                (int64_t)env->xregs[0], len, (uint64_t)env->pc, buf);
+                    } else if (nr == 66) {   /* writev */
+                        nlogged++;
+                        fprintf(stderr, "MTK-SYS writev fd=%" PRId64 " iov=%#" PRIx64
+                                " cnt=%" PRIu64 " pc=%#" PRIx64 "\n",
+                                (int64_t)env->xregs[0], env->xregs[1], env->xregs[2],
+                                (uint64_t)env->pc);
+                    } else if (nr == 56) {   /* openat */
+                        char p[160] = {0};
+
+                        if (env->xregs[1]) {
+                            cpu_memory_rw_debug(cs, env->xregs[1], (uint8_t *)p, 159, false);
+                        }
+                        nlogged++;
+                        fprintf(stderr, "MTK-SYS openat dirfd=%" PRId64 " path='%s'"
+                                " flags=%#" PRIx64 " pc=%#" PRIx64 "\n",
+                                (int64_t)env->xregs[0], p, env->xregs[2],
+                                (uint64_t)env->pc);
+                    }
+                }
+            }
         }
     }
     vaddr addr = env->cp15.vbar_el[new_el];

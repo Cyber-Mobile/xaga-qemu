@@ -36,6 +36,11 @@
 extern uint64_t mtk_bl_params_ptr;
 extern bool mtk_ufs_lk_stage;
 extern bool mtk_gz_skip_active;
+extern uint64_t mtk_init_sighandler_va;
+extern uint64_t mtk_init_syscall_nr;
+extern uint64_t mtk_init_syscall_pc;
+extern uint64_t mtk_init_syscall_a1;
+extern uint64_t mtk_init_syscall_a2;
 #include "qemu/crc32c.h"
 #include "exec/cpu-common.h"
 #include "accel/tcg/cpu-ldst.h"
@@ -633,6 +638,74 @@ void HELPER(exception_return)(CPUARMState *env, uint64_t new_pc)
     ARMCPU *cpu = env_archcpu(env);
 
     /*
+     * MTK_INIT_CRASH_TRACE=1: detect return to init's fatal reboot signal handler
+     * (InstallRebootSignalHandlers::$_0::__invoke).
+     */
+    {
+        static int mtk_init_trace = -1;
+
+        if (mtk_init_trace < 0) {
+            mtk_init_trace = getenv("MTK_INIT_CRASH_TRACE") != NULL;
+        }
+        if (mtk_init_trace && mtk_init_sighandler_va != 0 &&
+            new_pc == mtk_init_sighandler_va) {
+            CPUState *cs = CPU(cpu);
+            uint64_t sig = env->xregs[0];
+            uint64_t siginfo_va = env->xregs[1];
+            uint64_t uctx_va = env->xregs[2];
+
+            fprintf(stderr, "MTK-INIT-CRASH sig=%" PRIu64 " siginfo=%#" PRIx64 " uctx=%#" PRIx64 "\n",
+                    sig, siginfo_va, uctx_va);
+
+            /* Read siginfo_t: si_signo(+0), si_errno(+4), si_code(+8), si_addr(+0x10) */
+            int32_t si_signo = 0, si_errno = 0, si_code = 0;
+            uint64_t si_addr = 0;
+            cpu_memory_rw_debug(cs, siginfo_va + 0, (uint8_t *)&si_signo, 4, false);
+            cpu_memory_rw_debug(cs, siginfo_va + 4, (uint8_t *)&si_errno, 4, false);
+            cpu_memory_rw_debug(cs, siginfo_va + 8, (uint8_t *)&si_code, 4, false);
+            cpu_memory_rw_debug(cs, siginfo_va + 0x10, (uint8_t *)&si_addr, 8, false);
+
+            fprintf(stderr, "  MTK-INIT-SIGINFO signo=%d errno=%d code=%d addr=%#" PRIx64 "\n",
+                    si_signo, si_errno, si_code, si_addr);
+
+            /* Read ucontext_t.uc_mcontext: fault_address(+0xb0), regs[0..30](+0xb8), sp(+0x1b0), pc(+0x1b8), pstate(+0x1c0) */
+            uint64_t fault_addr = 0;
+            uint64_t regs[31] = {0};
+            uint64_t crash_sp = 0;
+            uint64_t crash_pc = 0;
+            uint64_t pstate = 0;
+
+            cpu_memory_rw_debug(cs, uctx_va + 0xb0, (uint8_t *)&fault_addr, 8, false);
+            cpu_memory_rw_debug(cs, uctx_va + 0xb8, (uint8_t *)regs, sizeof(regs), false);
+            cpu_memory_rw_debug(cs, uctx_va + 0x1b0, (uint8_t *)&crash_sp, 8, false);
+            cpu_memory_rw_debug(cs, uctx_va + 0x1b8, (uint8_t *)&crash_pc, 8, false);
+            cpu_memory_rw_debug(cs, uctx_va + 0x1c0, (uint8_t *)&pstate, 8, false);
+
+            fprintf(stderr, "  MTK-INIT-MCONTEXT fault_addr=%#" PRIx64 " pc=%#" PRIx64
+                    " lr=%#" PRIx64 " sp=%#" PRIx64 " pstate=%#" PRIx64 "\n",
+                    fault_addr, crash_pc, regs[30], crash_sp, pstate);
+            fprintf(stderr, "  MTK-INIT-REGS x0=%#" PRIx64 " x1=%#" PRIx64
+                    " x2=%#" PRIx64 " x3=%#" PRIx64 "\n",
+                    regs[0], regs[1], regs[2], regs[3]);
+
+            /* Walk up to 12 frame-pointer frames from regs[29] (FP) */
+            uint64_t cur_fp = regs[29];
+            for (int f = 0; f < 12 && cur_fp >= 0x1000ULL; f++) {
+                uint64_t frame[2] = {0, 0};
+                if (cpu_memory_rw_debug(cs, cur_fp, (uint8_t *)frame, 16, false) != 0) {
+                    break;
+                }
+                fprintf(stderr, "  MTK-INIT-CRASH-BT #%02d fp=%#" PRIx64 " lr=%#" PRIx64 "\n",
+                        f, frame[0], frame[1]);
+                if (frame[0] <= cur_fp || frame[0] - cur_fp > 0x100000ULL) {
+                    break;
+                }
+                cur_fp = frame[0];
+            }
+        }
+    }
+
+    /*
      * MT6895 machine model: BL31 is entered from a warm reset without the
      * bl_params image list BL2 would normally pass (ATF logs "atfarg is
      * NULL!"), so at hand-off time it has no BL33 entry point and ends up
@@ -837,6 +910,61 @@ void HELPER(exception_return)(CPUARMState *env, uint64_t new_pc)
     }
 
     new_el = el_from_spsr(spsr);
+    /*
+     * MTK_INIT_CRASH_TRACE=1: log the return value of the last EL0 syscall.
+     * First-stage init fails silently, so the syscall return / errno is the
+     * only remaining evidence of which mount or device-mapper ioctl failed.
+     */
+    {
+        static int mtk_sys_trace = -1;
+        static int nret;
+
+        if (mtk_sys_trace < 0) {
+            mtk_sys_trace = getenv("MTK_INIT_CRASH_TRACE") != NULL;
+        }
+        if (mtk_sys_trace && new_el == 0 && mtk_init_syscall_nr != ~0ULL &&
+            qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL) >= 224000 && nret < 20000) {
+            nret++;
+            fprintf(stderr, "MTK-SYS ret nr=%" PRIu64 " ret=%#" PRIx64 " (%" PRId64 ")"
+                    " pc=%#" PRIx64 " t=%" PRId64 "\n",
+                    mtk_init_syscall_nr, env->xregs[0],
+                    (int64_t)env->xregs[0], mtk_init_syscall_pc,
+                    qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL));
+            /*
+             * Any large read (the bootloader-supplied /proc/bootconfig and
+             * /proc/cmdline are read this way) is dumped verbatim: that is
+             * where androidboot.vbmeta.digest comes from, and its absence is
+             * what makes libfs_avb reject the whole AVB chain.
+             */
+            if (mtk_init_syscall_nr == 63 && (int64_t)env->xregs[0] > 200 &&
+                mtk_init_syscall_a1) {
+                char rbuf[2049];
+                uint64_t n = (uint64_t)env->xregs[0];
+                char *w = rbuf;
+
+                if (n > 2048) {
+                    n = 2048;
+                }
+                if (cpu_memory_rw_debug(CPU(cpu), mtk_init_syscall_a1,
+                                        (uint8_t *)rbuf, n, false) == 0) {
+                    rbuf[n] = 0;
+                    /* NUL-pad tolerant: scan by length, not by terminator. */
+                    for (uint64_t k = 0; k < n; k++) {
+                        char c = rbuf[k];
+
+                        if (c == 0x0a) {
+                            rbuf[k] = '|';
+                        } else if (c < 0x20 || c > 0x7e) {
+                            rbuf[k] = ' ';
+                        }
+                    }
+                    fprintf(stderr, "MTK-SYS readdump len=%" PRIu64 " data='%s'\n",
+                            n, w);
+                }
+            }
+        }
+        mtk_init_syscall_nr = ~0ULL;
+    }
     if (new_pc == 0x50f00000ULL) {
         fprintf(stderr, "MT6895-ERET: handoff spsr=%#x -> new_el=%d cur_el=%d"
                 " scr_el3=%#" PRIx64 "\n",
