@@ -3727,6 +3727,18 @@ typedef struct MtkDxccAesState {
 static MtkDxccAesState mtk_dxcc_aes_state;
 static int mtk_dxcc_aes_logs;
 
+/*
+ * DXCC hash engine: the real hardware keeps one SHA-256 chaining state
+ * across descriptor submissions (LOAD_STATE1 loads it, S_DIN_to_HASH feeds
+ * it, DIN_HASH finalizes it), so the model has to keep the context too.
+ */
+typedef struct MtkDxccHashState {
+    MtkSha256Ctx ctx;
+    bool active;
+} MtkDxccHashState;
+
+static MtkDxccHashState mtk_dxcc_hash_state;
+
 /* Optional one-shot dump of a decrypted GZ buffer (MTK_GZ_DUMP=<prefix>). */
 static void mtk_dxcc_aes_dump(uint64_t addr, uint64_t len)
 {
@@ -3895,12 +3907,53 @@ static void mt6895_dxcc_sec_write_impl(void *opaque, hwaddr off, uint64_t val,
     Mt6895MachineState *s = opaque;
     {
         static int n;
+        static int cap = -1;
 
-        if (n < 300) {
+        /*
+         * The historical hard cap of 300 lines was consumed by the BL2_EXT
+         * phase alone, hiding every LK/BL31-phase descriptor submission.  The
+         * limit is now env-configurable (MTK_DXCC_WR_MAX); the default keeps
+         * the old behaviour.
+         */
+        if (cap < 0) {
+            const char *m = getenv("MTK_DXCC_WR_MAX");
+
+            cap = m ? atoi(m) : 300;
+        }
+        if (n < cap) {
             n++;
             fprintf(stderr, "MTK-DXCC-WR off=%#" PRIx64 " val=%#" PRIx64
                     " pc=%#" PRIx64 "\n", (uint64_t)off, val,
                     current_cpu ? (uint64_t)ARM_CPU(current_cpu)->env.regs[15] : 0);
+        }
+    }
+    if (off == 0xe90 && MTK_ENV_CACHED("MTK_DXCC_SUBMIT")) {
+        /*
+         * DIAGNOSTIC (MTK_DXCC_SUBMIT): one decoded line per descriptor
+         * submission, whatever the data-flow mode, so the exact sequence the
+         * firmware drives the engine with can be read straight from the run
+         * log (src/len/dst/opcode/flow/setup).
+         */
+        static int nsub;
+        uint32_t din_lo = s->dxcc_sec_regs[0xe80 / 4];
+        uint32_t din_cfg = s->dxcc_sec_regs[0xe84 / 4];
+        uint32_t dout_lo = s->dxcc_sec_regs[0xe88 / 4];
+        uint32_t dout_cfg = s->dxcc_sec_regs[0xe8c / 4];
+        uint32_t hi = s->dxcc_sec_regs[0xe94 / 4];
+        uint64_t din = ((uint64_t)(hi & 0xffffu) << 32) | din_lo;
+        uint64_t dout = ((uint64_t)(hi >> 16) << 32) | dout_lo;
+        uint64_t din_sz = (din_cfg >> 2) & 0x00ffffffu;
+        uint64_t dout_sz = (dout_cfg >> 2) & 0x00ffffffu;
+
+        if (nsub < 4000) {
+            nsub++;
+            fprintf(stderr, "MTK-DXCC-SUBMIT op=%#" PRIx64 " flow=%u %s"
+                    " setup=%u din=%#" PRIx64 " din_sz=%" PRIu64
+                    " dout=%#" PRIx64 " dout_sz=%" PRIu64 "\n",
+                    val, (unsigned)(val & 0x3fu),
+                    (val & 0x40u) ? "AES" : "HASH",
+                    (unsigned)((val >> 24) & 0xfu),
+                    din, din_sz, dout, dout_sz);
         }
     }
 
@@ -3922,54 +3975,153 @@ static void mt6895_dxcc_sec_write_impl(void *opaque, hwaddr off, uint64_t val,
      * thing that can produce a correct digest; a no-op engine makes every
      * secure-config hash comparison fail and the boot stops before LK.
      */
-    if (off == 0xe90 && (val == 0x908082bULL || val == 0x80c082bULL)) {
-        uint64_t src = s->dxcc_sec_regs[0xe88 / 4];
-        uint64_t len = s->dxcc_sec_regs[0xe8c / 4];
-        uint64_t dst = s->dxcc_sec_regs[0xe80 / 4];
-        uint8_t *in = src ? mt6895_guest_ptr(s, src, len ? len : 1) : NULL;
-        uint8_t digest[32];
-        MtkSha256Ctx ctx;
+    if (off == 0xe90) {
+        /*
+         * Execute the hash descriptors the engine is handed.  The real DXCC
+         * hash engine keeps one SHA-256 chaining state across descriptors:
+         * LOAD_STATE1 (flow=37 setup=1) loads the chaining state, S_DIN_to_HASH
+         * (flow=7) streams update data, and the DIN_HASH descriptor with an
+         * empty DIN (flow=43 setup=8) finalizes into DOUT.  Both the BL2_EXT
+         * image (EL3) and BL31's SiP SHA service drive it this way -- the
+         * reference LK computes the vbmeta digest for libfs_avb through
+         * exactly such an update/final sequence (r1314 RUN_SUBMIT.err).
+         * The old executor only recognised the two one-shot opcodes and, for
+         * an empty DIN, hashed the DOUT buffer itself, so every streaming
+         * digest was deterministic garbage; self-comparisons still matched
+         * (wrong vs. the same wrong) until libfs_avb checked one against a
+         * real software SHA-256.
+         */
+        unsigned flow = (unsigned)(val & 0x3f);
+        unsigned setup = (unsigned)((val >> 24) & 0xf);
+        uint32_t din_lo = s->dxcc_sec_regs[0xe80 / 4];
+        uint32_t din_cfg = s->dxcc_sec_regs[0xe84 / 4];
+        uint32_t dout_lo = s->dxcc_sec_regs[0xe88 / 4];
+        uint32_t dout_cfg = s->dxcc_sec_regs[0xe8c / 4];
+        uint32_t adhi = s->dxcc_sec_regs[0xe94 / 4];
+        uint64_t din = ((uint64_t)(adhi & 0xffffu) << 32) | din_lo;
+        uint64_t dout = ((uint64_t)(adhi >> 16) << 32) | dout_lo;
+        uint64_t din_sz = (din_cfg >> 2) & 0x00ffffffu;
+        uint64_t dout_sz = (dout_cfg >> 2) & 0x00ffffffu;
+        MtkDxccHashState *hs = &mtk_dxcc_hash_state;
 
-        if (in && len && len <= 0x100000) {
-            mtk_sha_init(&ctx);
-            mtk_sha_update(&ctx, in, (size_t)len);
-            mtk_sha_final(&ctx, digest);
-            if (dst) {
-                uint8_t *out = mt6895_guest_ptr(s, dst, sizeof(digest));
+        if (flow == 37 && setup == 1) {
+            /* LOAD_STATE1: load the SHA-256 chaining state (32 bytes) or
+             * start from the standard IV when no state is supplied. */
+            mtk_sha_init(&hs->ctx);
+            hs->active = true;
+            if (din && din_sz == 32 && din <= 0x100000000ULL) {
+                uint8_t iv[32];
 
-                if (out) {
-                    memcpy(out, digest, sizeof(digest));
+                if (address_space_read(&address_space_memory, din,
+                                       MEMTXATTRS_UNSPECIFIED, iv,
+                                       sizeof(iv)) == MEMTX_OK) {
+                    unsigned i;
+
+                    /*
+                     * The firmware serialises the chaining state
+                     * byte-reversed (observed: the standard SHA-256 IV
+                     * appears fully reversed), so word i lives at
+                     * bytes [4*(7-i), +4) little-endian.
+                     */
+                    for (i = 0; i < 8; i++) {
+                        const uint8_t *p = iv + 4 * (7 - i);
+
+                        hs->ctx.h[i] = (uint32_t)p[0] |
+                                       ((uint32_t)p[1] << 8) |
+                                       ((uint32_t)p[2] << 16) |
+                                       ((uint32_t)p[3] << 24);
+                    }
                 }
-            }
-            /*
-             * The crypto mailbox is the second place the driver looks for the
-             * result: the LK copy of the SHA-256 front-end reads the digest
-             * indirectly through a global pointer that resolves to the
-             * dedicated crypto mailbox buffer.  Publishing it there costs
-             * nothing and covers that path.
-             */
-            {
-                uint8_t *mb = mt6895_guest_ptr(s, 0x48401000ULL,
-                                               sizeof(digest));
-
-                if (mb) {
-                    memcpy(mb, digest, sizeof(digest));
-                }
-            }
-            if (MTK_ENV_CACHED("MTK_DXHASH")) {
-                static int nrun;
-
-                if (nrun < 8) {
+                if (MTK_ENV_CACHED("MTK_SHARUN")) {
+                    static int nstate;
                     unsigned bi;
 
-                    nrun++;
-                    fprintf(stderr, "MTK-SHARUN op=%" PRIx64 " src=%#" PRIx64
-                            " len=%" PRIu64 " dst=%#" PRIx64 " digest=",
-                            val, src, len, dst);
-                    for (bi = 0; bi < 32; bi++) {
-                        fprintf(stderr, "%02x", digest[bi]);
+                    if (nstate < 4) {
+                        nstate++;
+                        fprintf(stderr, "MTK-SHARUN LOAD_STATE din=%#" PRIx64
+                                " iv=", din);
+                        for (bi = 0; bi < 32; bi++) {
+                            fprintf(stderr, "%02x", iv[bi]);
+                        }
+                        fprintf(stderr, "\n");
                     }
-                    fprintf(stderr, "\n");
+                }
+            }
+        } else if (flow == 7) {
+            /* S_DIN_to_HASH: stream data into the chaining state. */
+            if (din && din_sz && din_sz <= 0x4000000ULL) {
+                uint8_t *in = g_malloc(din_sz);
+
+                if (address_space_read(&address_space_memory, din,
+                                       MEMTXATTRS_UNSPECIFIED, in,
+                                       din_sz) == MEMTX_OK) {
+                    mtk_sha_update(&hs->ctx, in, (size_t)din_sz);
+                    hs->active = true;
+                }
+                g_free(in);
+            }
+        } else if (flow == 43 && setup == 8) {
+            /* DIN_HASH: one-shot over DIN when supplied, otherwise finalize
+             * the accumulated streaming state into DOUT. */
+            uint8_t digest[32];
+            bool have = false;
+
+            if (din && din_sz && din_sz <= 0x100000ULL) {
+                uint8_t *in = g_malloc(din_sz);
+
+                if (address_space_read(&address_space_memory, din,
+                                       MEMTXATTRS_UNSPECIFIED, in,
+                                       din_sz) == MEMTX_OK) {
+                    MtkSha256Ctx one;
+
+                    mtk_sha_init(&one);
+                    mtk_sha_update(&one, in, (size_t)din_sz);
+                    mtk_sha_final(&one, digest);
+                    have = true;
+                }
+                g_free(in);
+            } else if (hs->active) {
+                mtk_sha_final(&hs->ctx, digest);
+                hs->active = false;
+                have = true;
+            }
+            if (have) {
+                /*
+                 * DOUT receives the digest (DXCC field table), and the
+                 * crypto mailbox at 0x48401000 is the second place the LK
+                 * crypto_hw SHA front-end reads the result from through its
+                 * global pointer.
+                 */
+                if (dout && dout_sz) {
+                    uint64_t n = dout_sz < 32 ? dout_sz : 32;
+                    uint8_t *out = mt6895_guest_ptr(s, dout, n);
+
+                    if (out) {
+                        memcpy(out, digest, (size_t)n);
+                    }
+                }
+                {
+                    uint8_t *mb = mt6895_guest_ptr(s, 0x48401000ULL,
+                                                   sizeof(digest));
+
+                    if (mb) {
+                        memcpy(mb, digest, sizeof(digest));
+                    }
+                }
+                if (MTK_ENV_CACHED("MTK_SHARUN")) {
+                    static int nrun;
+                    unsigned bi;
+
+                    if (nrun < 8) {
+                        nrun++;
+                        fprintf(stderr, "MTK-SHARUN FINAL din=%#" PRIx64
+                                " din_sz=%" PRIu64 " dout=%#" PRIx64
+                                " digest=", din, din_sz, dout);
+                        for (bi = 0; bi < 32; bi++) {
+                            fprintf(stderr, "%02x", digest[bi]);
+                        }
+                        fprintf(stderr, "\n");
+                    }
                 }
             }
         }
