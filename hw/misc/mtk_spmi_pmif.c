@@ -256,7 +256,21 @@ static const PmicPowerOnReg mt6363_power_on[] = {
     { 0x000f, 0x00 }, { 0x0010, 0x00 },   /* POFFSTS2_3[0xF] = 0x0 */
     { 0x0011, 0xff }, { 0x0012, 0xff },   /* POFFSTS4_5[0x11] = 0xFFFF */
     { 0x0013, 0x0f },                     /* POFFSTS6[0x13] = 0xF */
-    { 0x001e, 0x06 },                     /* LEGACY: not printed by device */
+    /*
+     * MT6363 TOPSTATUS (0x1e).  Bits 1/3/4 are the active-low debounced
+     * power/home/home2 key levels: is_pmic_key_pressed() returns
+     * "pressed" when the bit is 0.  On the board no key is held at boot,
+     * so all three inputs are pulled high and read 1.
+     *
+     * The old value 0x06 had bit 3 (HOMEKEY_DEB) clear, so LK's
+     * detect_key(BOOT_MENU_KEY)->is_pmic_key_pressed(HOME_KEY) reported
+     * the home key as pressed and boot_mode_check() selected
+     * RECOVERY_BOOT ("lk boot mode = 2") on every normal power-on.
+     * Setting bit 3 gives 0x0e and lets the device boot Android.
+     *
+     * MTK_NO_HOMEKEY_STRAP=1 keeps the historical 0x06 value for A/B.
+     */
+    { 0x001e, 0x0e },                     /* TOPSTATUS: PWR/HOME/HOME2 de-bounced = released */
     { 0x020b, 0xff }, { 0x020c, 0xff },   /* PG_SDN_STS0_1[0x20B] = 0xFFFF */
     { 0x020d, 0xff }, { 0x020e, 0xff },   /* PG_SDN_STS2_3[0x20D] = 0xFFFF */
     { 0x020f, 0x80 },                     /* PG_SDN_STS4[0x20F] = 0x80 */
@@ -455,6 +469,9 @@ static void mtk_spmi_pmif_seed_parts(MtkSpmiPmifState *s)
         case PMIC_PART_MT6363:
             mtk_spmi_pmif_seed(s, sid, mt6363_power_on,
                                ARRAY_SIZE(mt6363_power_on));
+            if (MTK_ENV_CACHED("MTK_NO_HOMEKEY_STRAP")) {
+                s->pmic[sid][0x1e] = 0x06;   /* legacy: HOMEKEY_DEB low */
+            }
             break;
         case PMIC_PART_MT6368:
             mtk_spmi_pmif_seed(s, sid, mt6368_power_on,
