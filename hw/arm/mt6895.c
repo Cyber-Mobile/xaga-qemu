@@ -1252,12 +1252,17 @@ static void mt6895_atf_uartobj_write(void *opaque, hwaddr off, uint64_t val,
  *
  * Model the three registers for real and bridge step 2 into QEMU's power
  * control: when a request bit rises, start the matching vCPU with
+ * Model the CPC power controller registers for real and bridge step 2 into
+ * QEMU's power control: when a request bit rises, start the matching vCPU with
  * arm_set_cpu_on() at the entry point ATF wrote in step 1, and report the CPU
- * as powered for step 3.  The bridge is OFF by default (old all-ones
- * behaviour, no secondary ever starts) and has to be enabled explicitly with
- * MTK_CPCON=1; MTK_CPCLOG=1 prints the bridge decisions.
+ * as powered for step 3. The bridge is default-ON; MTK_LEGACY_CPCOFF=1 preserves
+ * the old all-ones legacy behavior for A/B testing; MTK_CPCLOG=1 prints the bridge
+ * decisions.
  */
+#define MT6895_CPC_CTRL_ADDR    0x0c53a814ULL
 #define MT6895_CPC_STATUS_ADDR  0x0c53a840ULL
+#define MT6895_CPC_ACK_ADDR     0x0c53a8a8ULL
+#define MT6895_CPC_BIGCORE_ADDR 0x0c53ad8cULL
 #define MT6895_CPC_REQ_ADDR     0x0c53c8e4ULL
 #define MT6895_CPC_ENTRY_ADDR   0x0c53c900ULL
 #define MT6895_CPC_ENTRY_COUNT  8
@@ -1266,6 +1271,9 @@ static void mt6895_atf_uartobj_write(void *opaque, hwaddr off, uint64_t val,
 static uint64_t mt6895_cpc_entries[MT6895_CPC_ENTRY_COUNT];
 static uint32_t mt6895_cpc_req_word;
 static uint32_t mt6895_cpc_powered = 1;   /* CPU0 runs from reset */
+static uint32_t mt6895_cpc_ack = 1;       /* CPU0 boot ack */
+static uint32_t mt6895_cpc_ctrl;
+static uint32_t mt6895_cpc_bigcore;
 static uint32_t mt6895_cpc_pending;       /* cores with a queued power-up */
 static QEMUTimer *mt6895_cpc_power_timer;
 
@@ -1274,6 +1282,9 @@ static void mt6895_cpc_state_reset(void)
     memset(mt6895_cpc_entries, 0, sizeof(mt6895_cpc_entries));
     mt6895_cpc_req_word = 0;
     mt6895_cpc_powered = 1;
+    mt6895_cpc_ack = 1;
+    mt6895_cpc_ctrl = 0;
+    mt6895_cpc_bigcore = 0;
     mt6895_cpc_pending = 0;
     if (mt6895_cpc_power_timer) {
         timer_del(mt6895_cpc_power_timer);
@@ -1303,7 +1314,7 @@ static uint64_t mt6895_cpc_status_read(void *opaque, hwaddr off, unsigned size)
     uint64_t v;
 
     (void)opaque; (void)off;
-    if (!MTK_ENV_CACHED("MTK_CPCON")) {
+    if (MTK_ENV_CACHED("MTK_LEGACY_CPCOFF")) {
         return (size >= 8) ? ~0ULL : ((1ULL << (size * 8)) - 1);
     }
     v = mt6895_cpc_powered;
@@ -1320,6 +1331,65 @@ static void mt6895_cpc_status_write(void *opaque, hwaddr off, uint64_t val,
     if (MTK_ENV_CACHED("MTK_CPCTRACE")) {
         mt6895_cpc_trace("wr-status", MT6895_CPC_STATUS_ADDR + off, val, size);
     }
+}
+
+static uint64_t mt6895_cpc_ack_read(void *opaque, hwaddr off, unsigned size)
+{
+    (void)opaque; (void)off;
+    if (MTK_ENV_CACHED("MTK_CPCTRACE")) {
+        mt6895_cpc_trace("rd-ack", MT6895_CPC_ACK_ADDR + off, mt6895_cpc_ack, size);
+    }
+    return mt6895_cpc_ack;
+}
+
+static void mt6895_cpc_ack_write(void *opaque, hwaddr off, uint64_t val,
+                                 unsigned size)
+{
+    (void)opaque; (void)off; (void)size;
+    if (MTK_ENV_CACHED("MTK_CPCTRACE")) {
+        mt6895_cpc_trace("wr-ack", MT6895_CPC_ACK_ADDR + off, val, size);
+    }
+    mt6895_cpc_ack |= (uint32_t)val;
+    mt6895_cpc_powered |= (uint32_t)val;
+}
+
+static uint64_t mt6895_cpc_ctrl_read(void *opaque, hwaddr off, unsigned size)
+{
+    (void)opaque; (void)off;
+    if (MTK_ENV_CACHED("MTK_CPCTRACE")) {
+        mt6895_cpc_trace("rd-ctrl", MT6895_CPC_CTRL_ADDR + off, mt6895_cpc_ctrl, size);
+    }
+    return mt6895_cpc_ctrl;
+}
+
+static void mt6895_cpc_ctrl_write(void *opaque, hwaddr off, uint64_t val,
+                                  unsigned size)
+{
+    (void)opaque; (void)off; (void)size;
+    if (MTK_ENV_CACHED("MTK_CPCTRACE")) {
+        mt6895_cpc_trace("wr-ctrl", MT6895_CPC_CTRL_ADDR + off, val, size);
+    }
+    mt6895_cpc_ctrl = (uint32_t)val;
+}
+
+static uint64_t mt6895_cpc_bigcore_read(void *opaque, hwaddr off, unsigned size)
+{
+    (void)opaque; (void)off;
+    if (MTK_ENV_CACHED("MTK_CPCTRACE")) {
+        mt6895_cpc_trace("rd-bigcore", MT6895_CPC_BIGCORE_ADDR + off,
+                         mt6895_cpc_bigcore, size);
+    }
+    return mt6895_cpc_bigcore;
+}
+
+static void mt6895_cpc_bigcore_write(void *opaque, hwaddr off, uint64_t val,
+                                     unsigned size)
+{
+    (void)opaque; (void)off; (void)size;
+    if (MTK_ENV_CACHED("MTK_CPCTRACE")) {
+        mt6895_cpc_trace("wr-bigcore", MT6895_CPC_BIGCORE_ADDR + off, val, size);
+    }
+    mt6895_cpc_bigcore = (uint32_t)val;
 }
 
 static uint64_t mt6895_cpc_req_read(void *opaque, hwaddr off, unsigned size)
@@ -1410,7 +1480,7 @@ static void mt6895_cpc_req_write(void *opaque, hwaddr off, uint64_t val,
     }
     raised = (uint32_t)val & ~mt6895_cpc_req_word;
     mt6895_cpc_req_word = val;
-    if (!MTK_ENV_CACHED("MTK_CPCON")) {
+    if (MTK_ENV_CACHED("MTK_LEGACY_CPCOFF")) {
         return;
     }
     for (n = 0; n < MT6895_CPC_ENTRY_COUNT; n++) {
@@ -1476,47 +1546,6 @@ static void mt6895_cpc_entry_write(void *opaque, hwaddr off, uint64_t val,
         mt6895_cpc_entries[n] = (mt6895_cpc_entries[n] & ~0xffffffffULL) |
                                 (uint32_t)val;
     }
-}
-
-/*
- * ATF per-CPU data pointer (0x48244190).
- *
- * LK's final SMC makes BL31 write into its per-CPU record:
- *   0x48213af8  adrp x8,#0x48244000
- *   0x48213b00  ldr x21,[x8,#0x190]     ; 0x48244190 -> NULL here
- *   0x48213b3c  str x8,[x9,#0x10]       ; x9 = x21+... -> data abort at 0x10
- * BL31 normally fills this in during cold boot; this machine enters warm, so
- * it stays NULL and the SMC that hands over to Linux dies. Point it at a
- * scratch record inside BL31's mapped gap.
- */
-static uint64_t mt6895_atf_percpu_read(void *opaque, hwaddr off, unsigned size)
-{
-    static int n;
-
-    (void)opaque;
-    if (n < 3) {
-        n++;
-        fprintf(stderr, "MTK-PERCPU read off=%#x size=%u\n",
-                (unsigned)off, size);
-    }
-    /*
-     * Must live inside BL31's mapped BSS (0x4824b000..0x4825e000): the gap
-     * between the end of the image (0x48246190) and BSS start is NOT mapped,
-     * which is why a scratch record there aborted with vaddr=0x4824a484.
-     * Use the top of BSS, above BL31's own allocations.
-     */
-    /*
-     * The record's 64-bit fields sit at +0x74+0x10+8*n, so the base must be
-     * 4 mod 8: at 0x4825d800 the store landed on 0x4825d884 and took an
-     * alignment fault (syndrome 0x96000061, DFSC=0x21).
-     */
-    return 0x4825d804ULL;
-}
-
-static void mt6895_atf_percpu_write(void *opaque, hwaddr off, uint64_t val,
-                                    unsigned size)
-{
-    (void)opaque; (void)off; (void)val; (void)size;
 }
 
 /*
@@ -1648,14 +1677,6 @@ static const MemoryRegionOps mt6895_bt_ops = {
     .impl = { .min_access_size = 1, .max_access_size = 8 },
 };
 
-static const MemoryRegionOps mt6895_atf_percpu_ops = {
-    .read = mt6895_atf_percpu_read,
-    .write = mt6895_atf_percpu_write,
-    .endianness = DEVICE_NATIVE_ENDIAN,
-    .valid = { .min_access_size = 1, .max_access_size = 8 },
-    .impl = { .min_access_size = 1, .max_access_size = 8 },
-};
-
 /*
  * DIAGNOSTIC (MTK_BAGWATCH): transparent, read-through observation of the
  * regions that decide the LK boot-argument path.  Accesses are forwarded to
@@ -1753,7 +1774,31 @@ static const MemoryRegionOps mt6895_cpc_status_ops = {
     .read = mt6895_cpc_status_read,
     .write = mt6895_cpc_status_write,
     .endianness = DEVICE_NATIVE_ENDIAN,
-    .valid = { .min_access_size = 4, .max_access_size = 4 },
+    .valid = { .min_access_size = 1, .max_access_size = 8 },
+    .impl = { .min_access_size = 4, .max_access_size = 4 },
+};
+
+static const MemoryRegionOps mt6895_cpc_ack_ops = {
+    .read = mt6895_cpc_ack_read,
+    .write = mt6895_cpc_ack_write,
+    .endianness = DEVICE_NATIVE_ENDIAN,
+    .valid = { .min_access_size = 1, .max_access_size = 8 },
+    .impl = { .min_access_size = 4, .max_access_size = 4 },
+};
+
+static const MemoryRegionOps mt6895_cpc_ctrl_ops = {
+    .read = mt6895_cpc_ctrl_read,
+    .write = mt6895_cpc_ctrl_write,
+    .endianness = DEVICE_NATIVE_ENDIAN,
+    .valid = { .min_access_size = 1, .max_access_size = 8 },
+    .impl = { .min_access_size = 4, .max_access_size = 4 },
+};
+
+static const MemoryRegionOps mt6895_cpc_bigcore_ops = {
+    .read = mt6895_cpc_bigcore_read,
+    .write = mt6895_cpc_bigcore_write,
+    .endianness = DEVICE_NATIVE_ENDIAN,
+    .valid = { .min_access_size = 1, .max_access_size = 8 },
     .impl = { .min_access_size = 4, .max_access_size = 4 },
 };
 
@@ -1761,7 +1806,7 @@ static const MemoryRegionOps mt6895_cpc_req_ops = {
     .read = mt6895_cpc_req_read,
     .write = mt6895_cpc_req_write,
     .endianness = DEVICE_NATIVE_ENDIAN,
-    .valid = { .min_access_size = 4, .max_access_size = 4 },
+    .valid = { .min_access_size = 1, .max_access_size = 8 },
     .impl = { .min_access_size = 4, .max_access_size = 4 },
 };
 
@@ -1769,7 +1814,7 @@ static const MemoryRegionOps mt6895_cpc_entry_ops = {
     .read = mt6895_cpc_entry_read,
     .write = mt6895_cpc_entry_write,
     .endianness = DEVICE_NATIVE_ENDIAN,
-    .valid = { .min_access_size = 4, .max_access_size = 4 },
+    .valid = { .min_access_size = 1, .max_access_size = 8 },
     .impl = { .min_access_size = 4, .max_access_size = 4 },
 };
 
@@ -9838,47 +9883,16 @@ static const CPUArchIdList *mt6895_possible_cpu_arch_ids(MachineState *ms)
 }
 
 /*
- * PSCI routing for multi-vCPU guests.
- *
- * The faithful hardware path for CPU_ON is guest SMC -> ATF's `psci_on` ->
- * CPC power-on -> core released at BL31's warm-boot entry.  This model
- * implements the CPC bridge, but the secondary's ATF warm boot does not
- * complete: only the cold-boot core ever initialises the per-CPU ATF data
- * blocks, and every core started at 0x48200100 faults inside EL3 during its
- * per-CPU init (see artifacts/r1302/lineage/notes_mttcg.md, CPC/ATF section).
- *
- * With more than one vCPU, answer the guest's PSCI calls in QEMU instead
- * (SMC conduit stays, so ATF keeps serving every MTK SiP SMC) and start the
- * secondaries at EL1 -- this machine's non-secure world only ever runs at EL1.
- * The target vCPU's EL3 state that ATF's warm boot would have set up is
- * planted lazily on its first SiP SMC (see mtk_secondary_atf_init()).
- *
- * This is an interim measure, not the modelled behaviour: it exists so the
- * multi-core configuration can be used at all while BL31's per-CPU cold-boot
- * initialisation is missing.  Multi-vCPU guests therefore do not exercise
- * ATF's own CPU_ON path yet; the single-vCPU configuration, which is the
- * default, keeps the historical ATF-owned PSCI path unchanged.
- *
- * MTK_NO_HOST_PSCI=1 forces the ATF-owned path for A/B runs.
+ * PSCI routing:
+ * Native ATF PSCI via SMC conduit is the default for all configurations.
+ * Secondary CPUs boot cleanly through BL31's warm-boot vector at 0x48200100
+ * when requested via the CPC power controller bridge.
+ * MTK_PSCI_HOST=1 is preserved purely for legacy A/B comparison.
  */
 static bool mt6895_host_psci_mode(MachineState *ms)
 {
-    static bool announced;
-
+    (void)ms;
     if (MTK_ENV_CACHED("MTK_PSCI_HOST")) {
-        return true;
-    }
-    if (MTK_ENV_CACHED("MTK_NO_HOST_PSCI")) {
-        return false;
-    }
-    if (ms->smp.cpus > 1) {
-        if (!announced) {
-            announced = true;
-            warn_report("mt6895: %d vCPUs requested; PSCI is answered by QEMU "
-                        "because BL31 per-CPU cold-boot initialisation is not "
-                        "modelled yet (MTK_NO_HOST_PSCI=1 forces the ATF path)",
-                        ms->smp.cpus);
-        }
         return true;
     }
     return false;
@@ -10101,6 +10115,7 @@ static void mt6895_gic_bootstrap(Mt6895MachineState *s)
 
             address_space_stl_le(as, rd + 0x0014, 0x0, attrs, NULL);
             address_space_stl_le(as, rd + 0x10080, 0xffffffff, attrs, NULL);
+            address_space_stl_le(as, rd + 0x10d00, 0x00000000, attrs, NULL);
             address_space_stl_le(as, rd + 0x10100, 0xffffffff, attrs, NULL);
             address_space_stl_le(as, rd + 0x10400, 0xa0a0a0a0, attrs, NULL);
         }
@@ -15960,36 +15975,58 @@ static const uint8_t stub_cmd_def[0x80] = {
                                     &s->atf_uartobj_mr);
         /*
          * CPC/SMP power controller: the per-CPU power-state register (read by
-         * ATF's mt_smp wait), the per-CPU power-on request register and the
-         * per-CPU secondary entry points (written by ATF's CPU_ON path).
+         * ATF's mt_smp wait), the per-CPU power-on request register, the
+         * per-CPU secondary entry points (written by ATF's CPU_ON path),
+         * control/ack/bigcore registers (handshaked by ATF warm boot).
          * Priority 3 beats both the generic dcm-cpccfg-reg window
          * (0x0c53a800) and dcm-mp-cpusys-top (0x0c538000) that cover these
-         * addresses.  See mt6895_cpc_req_write() for the arm_set_cpu_on()
-         * bridge.
+         * addresses. See mt6895_cpc_req_write() for the arm_set_cpu_on()
+         * bridge. Default-ON; MTK_LEGACY_CPCOFF=1 preserves legacy behavior.
          */
-        if (MTK_ENV_CACHED("MTK_CPCON")) {
+        if (!MTK_ENV_CACHED("MTK_LEGACY_CPCOFF")) {
+            static MemoryRegion cpc_ack_mr;
+            static MemoryRegion cpc_ctrl_mr;
+            static MemoryRegion cpc_bigcore_mr;
+            static MemoryRegion cpc_req_mr;
+            static MemoryRegion cpc_entry_mr;
+
             memory_region_init_io(&s->cpc_mr, OBJECT(s),
                                   &mt6895_cpc_status_ops, NULL,
                                   "mt6895.cpc-status", 4);
             memory_region_add_subregion_overlap(sysmem, MT6895_CPC_STATUS_ADDR,
                                                 &s->cpc_mr, 3);
-            {
-                static MemoryRegion cpc_req_mr;
-                static MemoryRegion cpc_entry_mr;
 
-                memory_region_init_io(&cpc_req_mr, OBJECT(s),
-                                      &mt6895_cpc_req_ops, NULL,
-                                      "mt6895.cpc-req", 4);
-                memory_region_add_subregion_overlap(sysmem, MT6895_CPC_REQ_ADDR,
-                                                    &cpc_req_mr, 3);
-                memory_region_init_io(&cpc_entry_mr, OBJECT(s),
-                                      &mt6895_cpc_entry_ops, NULL,
-                                      "mt6895.cpc-entry",
-                                      MT6895_CPC_ENTRY_COUNT * 8);
-                memory_region_add_subregion_overlap(sysmem,
-                                                    MT6895_CPC_ENTRY_ADDR,
-                                                    &cpc_entry_mr, 3);
-            }
+            memory_region_init_io(&cpc_ack_mr, OBJECT(s),
+                                  &mt6895_cpc_ack_ops, NULL,
+                                  "mt6895.cpc-ack", 4);
+            memory_region_add_subregion_overlap(sysmem, MT6895_CPC_ACK_ADDR,
+                                                &cpc_ack_mr, 3);
+
+            memory_region_init_io(&cpc_ctrl_mr, OBJECT(s),
+                                  &mt6895_cpc_ctrl_ops, NULL,
+                                  "mt6895.cpc-ctrl", 4);
+            memory_region_add_subregion_overlap(sysmem, MT6895_CPC_CTRL_ADDR,
+                                                &cpc_ctrl_mr, 3);
+
+            memory_region_init_io(&cpc_bigcore_mr, OBJECT(s),
+                                  &mt6895_cpc_bigcore_ops, NULL,
+                                  "mt6895.cpc-bigcore", 4);
+            memory_region_add_subregion_overlap(sysmem, MT6895_CPC_BIGCORE_ADDR,
+                                                &cpc_bigcore_mr, 3);
+
+            memory_region_init_io(&cpc_req_mr, OBJECT(s),
+                                  &mt6895_cpc_req_ops, NULL,
+                                  "mt6895.cpc-req", 4);
+            memory_region_add_subregion_overlap(sysmem, MT6895_CPC_REQ_ADDR,
+                                                &cpc_req_mr, 3);
+
+            memory_region_init_io(&cpc_entry_mr, OBJECT(s),
+                                  &mt6895_cpc_entry_ops, NULL,
+                                  "mt6895.cpc-entry",
+                                  MT6895_CPC_ENTRY_COUNT * 8);
+            memory_region_add_subregion_overlap(sysmem,
+                                                MT6895_CPC_ENTRY_ADDR,
+                                                &cpc_entry_mr, 3);
         } else {
             /*
              * Default: keep the pre-bridge footprint byte-for-byte -- only
@@ -16004,11 +16041,6 @@ static const uint8_t stub_cmd_def[0x80] = {
             memory_region_add_subregion_overlap(sysmem, MT6895_CPC_STATUS_ADDR,
                                                 &s->cpc_mr, 1);
         }
-        memory_region_init_io(&s->atf_percpu_mr, OBJECT(s),
-                              &mt6895_atf_percpu_ops, NULL,
-                              "mt6895.atf-percpu", 8);
-        memory_region_add_subregion_overlap(sysmem, 0x48244190ULL,
-                                            &s->atf_percpu_mr, 1);
         memory_region_init_io(&s->bt_mr, OBJECT(s), &mt6895_bt_ops, s,
                               "mt6895.bt-watch", 0x2000);
         if (MTK_ENV_CACHED("MTK_BAGWATCH")) {

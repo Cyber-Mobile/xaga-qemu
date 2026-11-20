@@ -980,7 +980,6 @@ struct Mt6895MachineState {
     MemoryRegion atf_arg_mr;
     MemoryRegion atf_log_mr;
     MemoryRegion cpc_mr;
-    MemoryRegion atf_percpu_mr;
     MemoryRegion bt_mr;
     MemoryRegion lkdtb_mr;
     MemoryRegion lkcount_mr;
