@@ -442,6 +442,14 @@ struct MtkSpmiPmifState {
     uint8_t otp_addr[SPMI_MAX_SID];      /* 0x42d latch: MT6363 / MT6368 OTP */
     uint8_t mt6319_efuse_idx[SPMI_MAX_SID]; /* 0x38c latch: MT6319 efuse */
 
+    /*
+     * MT6368 (SID5) internal EFUSE controller: 0x39e key unlock, 0x38b
+     * address latch, 0x395 trigger, 0x39b busy, 0x399 16-bit data.  Protocol
+     * from LUA_1 helper 0x0203b744 (notes_pmic_tail_recon.md §3.3).
+     */
+    bool mt6368_efuse_unlocked[SPMI_MAX_SID];
+    uint8_t mt6368_efuse_addr[SPMI_MAX_SID];
+
     /* SPMI RCS interrupt output (level, to the EINT controller). */
     qemu_irq rcs_irq;
     bool trace;
@@ -773,6 +781,24 @@ static uint16_t mtk_spmi_pmif_otp_word(MtkSpmiPmifState *s, unsigned sid)
 }
 
 /*
+ * MT6368 internal EFUSE words, addressed through the controller registers
+ * (0x38b latch / 0x395 trigger / 0x399 data).  Word 0x7a bits[4:0] select the
+ * second-PMIC variant on the real device: (word & 0x1f) == 1 marks the
+ * mt6368DW build -- LUA_1 helper 0x0203bb9a gates both the RSV4 bit 29 in
+ * dvfsrc_opp_level_mapping (0x30500020 vs 0x10500020) and the 15-entry
+ * mt6368DW init table on exactly that comparison
+ * (notes_pmic_tail_recon.md §1-§3).  Only that field is documented by the
+ * device artefacts; every other word reads 0.
+ */
+static uint16_t mtk_spmi_mt6368_efuse_word(unsigned word)
+{
+    if (word == 0x7a) {
+        return 0x0001;
+    }
+    return 0;
+}
+
+/*
  * MT6319 efuse data at 0x39b, selected by the 0x38c word-index latch.
  *
  * The real unit's log prints eight decoded words per die (S6:
@@ -933,6 +959,32 @@ static void mtk_spmi_pmif_xfer(MtkSpmiPmifState *s, unsigned chan, uint32_t cmd)
             if (r == 0x42d) {
                 /* MT6363/MT6368 OTP word-address latch (data read at 0x42b). */
                 s->otp_addr[sid] = v;
+            }
+            if (s->slave_part[sid] == PMIC_PART_MT6368) {
+                /*
+                 * MT6368 internal EFUSE controller (LUA_1 0x0203b744):
+                 * unlock 0x39e with the 16-bit key 0x9c97, latch the word's
+                 * byte address (word_index << 1) & 0xff in 0x38b, then write
+                 * 0x395 to trigger; the driver waits for 0x39b != 1 and reads
+                 * the 16-bit word at 0x399 little-endian.
+                 */
+                if (addr == 0x39e && len >= 2) {
+                    s->mt6368_efuse_unlocked[sid] =
+                        (data & 0xffffu) == 0x9c97u;
+                }
+                if (addr == 0x38b) {
+                    s->mt6368_efuse_addr[sid] = v;
+                }
+                if (addr == 0x395) {
+                    uint16_t w = mtk_spmi_mt6368_efuse_word(
+                        s->mt6368_efuse_addr[sid] >> 1);
+
+                    if (s->mt6368_efuse_unlocked[sid]) {
+                        s->pmic[sid][0x399] = (uint8_t)(w & 0xff);
+                        s->pmic[sid][0x39a] = (uint8_t)(w >> 8);
+                    }
+                    s->pmic[sid][0x39b] = 0;    /* BUSY clear: ready */
+                }
             }
             mtk_spmi_ring_add(sid, r, v, 0);
         }
