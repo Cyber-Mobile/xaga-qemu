@@ -892,8 +892,20 @@ static UfsReqResult mtk_ufs_process_scsi_cmd(UfsLu *lu, UfsRequest *req)
 
     if (MTK_ENV_CACHED("MTK_UFS_CDB")) {
         static int ncdb;
+        static int ncdb_max = -1;
 
-        if (ncdb < 80) {
+        /*
+         * DIAGNOSTIC: the entry limit is configurable through MTK_UFS_CDB_MAX
+         * because the boot stages alone consume the historical hard-coded 80
+         * entries, leaving nothing for the kernel/init reads that we actually
+         * want to see.  The default is unchanged.
+         */
+        if (ncdb_max < 0) {
+            const char *m = getenv("MTK_UFS_CDB_MAX");
+
+            ncdb_max = m ? atoi(m) : 80;
+        }
+        if (ncdb < ncdb_max) {
             uint64_t lba = 0;
             uint32_t nblk = 0;
             uint8_t op = req->req_upiu.sc.cdb[0];
