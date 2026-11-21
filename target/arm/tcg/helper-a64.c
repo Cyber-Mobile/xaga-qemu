@@ -714,15 +714,22 @@ void HELPER(exception_return)(CPUARMState *env, uint64_t new_pc)
      * catches the return itself, which is what actually executes.
      */
     if (arm_current_el(env) >= 2) {
-        static int logged;
+        /*
+         * Per-CPU bounded log: GZ's vCPU-run ERETs on the boot core alone
+         * used to eat the shared 40-line cap before the CPU_ON secondaries
+         * ever appeared (r1315).
+         */
+        static int logged[16];
+        unsigned mtk_cpu = (unsigned)cpu->mp_affinity >> 8;
         int el = arm_current_el(env);
 
-        if (logged < 40) {
-            logged++;
-            fprintf(stderr, "MT6895-ERET#%d el%d pc=%#" PRIx64 " spsr=%#x"
+        if (mtk_cpu < 16 &&
+            logged[mtk_cpu] < 14) {
+            logged[mtk_cpu]++;
+            fprintf(stderr, "MT6895-ERET c%u#%d el%d pc=%#" PRIx64 " spsr=%#x"
                     " x0=%#" PRIx64 " x1=%#" PRIx64 " x2=%#" PRIx64
                     " x3=%#" PRIx64 "\n",
-                    logged, el, (uint64_t)new_pc,
+                    mtk_cpu, logged[mtk_cpu], el, (uint64_t)new_pc,
                     (unsigned)env->banked_spsr[aarch64_banked_spsr_index(el)],
                     env->xregs[0], env->xregs[1], env->xregs[2],
                     env->xregs[3]);

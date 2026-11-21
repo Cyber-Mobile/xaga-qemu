@@ -9617,7 +9617,7 @@ static void arm_cpu_do_interrupt_aarch64(CPUState *cs)
         {
             static int nsmc;
 
-            if (nsmc < 200) {
+            if (nsmc < 600) {
                 nsmc++;
                 fprintf(stderr, "MTK-SMC x0=%#" PRIx64 " x1=%#" PRIx64
                         " x2=%#" PRIx64 " x3=%#" PRIx64 " pc=%#" PRIx64
@@ -10163,6 +10163,54 @@ void arm_cpu_do_interrupt(CPUState *cs)
                     (unsigned long long)last_pc,
                     env->exception.vaddress,
                     env->exception.syndrome);
+        }
+    }
+    if (cs->exception_index == EXCP_PREFETCH_ABORT && is_a64(env)) {
+        /*
+         * r1315: the PSCI CPU_ON secondaries go silent after the BL31 warm
+         * boot ERETs to the entry GZ forwarded (an IPA the secondary must
+         * resolve through stage 2).  A silent prefetch abort is exactly
+         * that death, and nothing else in the trace shows it.
+         */
+        static int mtk_pfabt64_n;
+
+        if (mtk_pfabt64_n < 16) {
+            mtk_pfabt64_n++;
+            fprintf(stderr,
+                    "MTK-PFABT64 cpu=%u el=%d pc=%#llx vaddr=%#" PRIx64
+                    " synd=%#" PRIx64 " sctlr=%#" PRIx64 " vttbr=%#" PRIx64
+                    " vtcr=%#" PRIx64 " scr=%#" PRIx64 "\n",
+                    cs->cpu_index, arm_current_el(env),
+                    (unsigned long long)last_pc,
+                    env->exception.vaddress,
+                    env->exception.syndrome,
+                    (unsigned long long)env->cp15.sctlr_el[arm_current_el(env)],
+                    (unsigned long long)env->cp15.vttbr_el2,
+                    (unsigned long long)env->cp15.vtcr_el2,
+                    (unsigned long long)env->cp15.scr_el3);
+        }
+    }
+    if (cs->exception_index == EXCP_HVC && is_a64(env) &&
+        arm_current_el(env) >= 1) {
+        /*
+         * r1315: the kernel's PSCI calls arrive at GZ (EL2) as HVCs from
+         * EL1; GZ then forwards CPU_ON to BL31 with x2 replaced by its own
+         * stub.  Log the incoming call so the kernel's holding-pen value is
+         * on record and can be searched for in the GZ dump.
+         */
+        static int mtk_hvc_n;
+
+        if (mtk_hvc_n < 24) {
+            mtk_hvc_n++;
+            fprintf(stderr,
+                    "MTK-HVC cpu=%u from_el=%d pc=%#llx x0=%#" PRIx64
+                    " x1=%#" PRIx64 " x2=%#" PRIx64 " x3=%#" PRIx64
+                    " vttbr=%#" PRIx64 "\n",
+                    cs->cpu_index, arm_current_el(env),
+                    (unsigned long long)last_pc,
+                    env->xregs[0], env->xregs[1], env->xregs[2],
+                    env->xregs[3],
+                    (unsigned long long)env->cp15.vttbr_el2);
         }
     }
 

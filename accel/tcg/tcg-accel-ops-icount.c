@@ -26,6 +26,7 @@
 #include "qemu/osdep.h"
 #include "system/replay.h"
 #include "exec/icount.h"
+#include "exec/cpu-interrupt.h"
 #include "qemu/main-loop.h"
 #include "qemu/guest-random.h"
 #include "hw/core/cpu.h"
@@ -152,9 +153,17 @@ void icount_handle_interrupt(CPUState *cpu, int mask)
     int old_mask = cpu->interrupt_request;
 
     tcg_handle_interrupt(cpu, mask);
+    /*
+     * CPU_INTERRUPT_DEBUG is exempt: it is raised mid-TB by the watchpoint
+     * re-entry (check_watchpoints) to replay the pending store, and that
+     * re-entry runs wherever the watchpoint happened to land -- not
+     * necessarily at an I/O boundary.  The replay re-executes the same
+     * instruction, so icount accounting is unaffected.  Everything else
+     * must still respect the I/O-boundary invariant.
+     */
     if (qemu_cpu_is_self(cpu) &&
         !cpu->neg.can_do_io
-        && (mask & ~old_mask) != 0) {
+        && (mask & ~(old_mask | CPU_INTERRUPT_DEBUG)) != 0) {
         cpu_abort(cpu, "Raised interrupt while not in I/O function");
     }
 }

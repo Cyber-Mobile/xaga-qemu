@@ -1185,7 +1185,7 @@ static uint64_t mt6895_atf_uart_read(void *opaque, hwaddr off, unsigned size)
     (void)opaque;
     (void)size;
     (void)off;
-    return 0x4824a100ULL;      /* pointer slot: ATF's UART object */
+    return 0x48300000ULL;      /* pointer slot: ATF's UART object */
 }
 
 static uint64_t mt6895_atf_uartobj_read(void *opaque, hwaddr off, unsigned size)
@@ -1476,7 +1476,9 @@ static void mt6895_cpc_power_on_tick(void *opaque)
         if (MTK_ENV_CACHED("MTK_ATFWATCH")) {
             /*
              * Observation-only: dump the target core's per-CPU block as
-             * BL31's CPU_ON handler left it, before the warm entry runs.
+             * BL31's CPU_ON handler left it, before the warm entry runs,
+             * plus the MCDI slot-array heads the warm entry's chain walk
+             * consumes (r1315: cpu7 faults on a garbage head).
              */
             uint8_t blk[0x40];
             hwaddr ba = 0x4824b000ULL + (hwaddr)n * 0x80;
@@ -1491,6 +1493,50 @@ static void mt6895_cpc_power_on_tick(void *opaque)
                         (unsigned int)memcpy_ld32(&blk[0x18]),
                         (unsigned int)memcpy_ld32(&blk[0x1c]), blk[0x20],
                         (unsigned long long)memcpy_ld(&blk[0x08]));
+            }
+            {
+                uint8_t slots[0x80];
+                unsigned k;
+
+                if (address_space_read(&address_space_memory, 0x48250FD0ULL,
+                                       MEMTXATTRS_UNSPECIFIED, slots,
+                                       sizeof(slots)) == MEMTX_OK) {
+                    fprintf(stderr, "MTK-SLOTS pre-warm cpu%u mp:", n);
+                    for (k = 0; k < 8; k++) {
+                        fprintf(stderr, " %08x",
+                                (unsigned int)memcpy_ld32(&slots[k * 16]));
+                    }
+                    fprintf(stderr, " nxt:");
+                    for (k = 0; k < 8; k++) {
+                        fprintf(stderr, " %08x",
+                                (unsigned int)memcpy_ld32(&slots[k * 16 + 8]));
+                    }
+                    fprintf(stderr, "\n");
+                }
+            }
+            {
+                /*
+                 * The context the CPU_ON handler left for this core: block+8
+                 * points at a 0x1f0-byte per-core save area and the warm boot
+                 * ERETs to whatever entry it recorded.  r1315: secondaries
+                 * vanish after that ERET, so record what they ERET to.
+                 */
+                uint64_t ctx_pa = memcpy_ld(&blk[0x08]);
+                uint8_t ctx[0x20];
+
+                if (ctx_pa >= 0x40000000ULL && ctx_pa < 0x1C0000000ULL &&
+                    address_space_read(&address_space_memory, ctx_pa,
+                                       MEMTXATTRS_UNSPECIFIED, ctx,
+                                       sizeof(ctx)) == MEMTX_OK) {
+                    fprintf(stderr,
+                            "MTK-CTX cpu%u ctx=%#llx: %016llx %016llx "
+                            "%016llx %016llx\n",
+                            n, (unsigned long long)ctx_pa,
+                            (unsigned long long)memcpy_ld(&ctx[0x00]),
+                            (unsigned long long)memcpy_ld(&ctx[0x08]),
+                            (unsigned long long)memcpy_ld(&ctx[0x10]),
+                            (unsigned long long)memcpy_ld(&ctx[0x18]));
+                }
             }
         }
         ret = arm_set_cpu_on((uint64_t)n << 8, entry, 0, 3, true);
@@ -10057,13 +10103,20 @@ static void mt6895_create_cpus(Mt6895MachineState *s, Error **errp)
          * ATF entry run) does not walk into unmapped space. */
         ARM_CPU(cpuobj)->env.cp15.tpidr_el[3] = 0x4824b000ULL + (uint64_t)n * 0x80;
         /*
-         * Let QEMU answer the guest's PSCI calls (SMC conduit) whenever the
-         * multi-vCPU bring-up needs it; see mt6895_host_psci_mode().
+         * PSCI conduit.  On the real phone there is no QEMU-side PSCI: the
+         * kernel's PSCI calls are HVCs that trap into GenieZone (EL2), which
+         * runs its own PSCI handler and forwards CPU_ON to BL31 with its
+         * per-vCPU stub entry (r1315: GZ issued the only 7 CPU_ON SMCs that
+         * reached EL3).  Leave QEMU's built-in PSCI out of the default boot
+         * (it intercepted the kernel's HVCs and answered ALREADY_ON because
+         * GZ had already powered the cores via CPC, so every secondary
+         * "failed to come online").  MTK_PSCI_HOST=1 restores the legacy
+         * machine-as-PSCI-provider mode for isolated experiments.
          */
         object_property_set_uint(cpuobj, "psci-conduit",
                                  mt6895_host_psci_mode(ms)
                                      ? QEMU_PSCI_CONDUIT_SMC
-                                     : QEMU_PSCI_CONDUIT_HVC,
+                                     : QEMU_PSCI_CONDUIT_DISABLED,
                                  &error_fatal);
 
     /*
@@ -10087,15 +10140,25 @@ static void mt6895_create_cpus(Mt6895MachineState *s, Error **errp)
         mt6895_add_impdef_regs(ARM_CPU(cpuobj));
 
         qdev_realize(DEVICE(cpuobj), NULL, errp);
-        if (MTK_ENV_CACHED("MTK_ATFWATCH") && n == 7) {
+        if (MTK_ENV_CACHED("MTK_ATFWATCH")) {
             /*
-             * Observation-only: watch writes into cpu7's per-CPU block to
-             * capture the +0x18 write sequence (r1315: cpu7 takes the
-             * non-skip path in 0x4821c690 while cpu1-6 skip).
+             * Observation-only: watch writes into cpu7's per-CPU block and
+             * into cpu7's warm-boot stack region (0x4824a1c0 is its EL3
+             * entry SP; the frame the warmboot entrypoint builds there was
+             * corrupted between the chain-fill loop and the unlock loop --
+             * r1315).  The stack watch is armed on every CPU so a stray
+             * cross-core writer is caught too; the per-CPU block watch only
+             * sees cpu7's own stores.
              */
-            if (cpu_watchpoint_insert(CPU(cpuobj), 0x4824b380ULL, 0x80,
+            if (n == 7 &&
+                cpu_watchpoint_insert(CPU(cpuobj), 0x4824b380ULL, 0x80,
                                       BP_MEM_WRITE, NULL) == 0) {
                 fprintf(stderr, "mt6895: ATF watch armed on cpu7 block\n");
+            }
+            if (cpu_watchpoint_insert(CPU(cpuobj), 0x4824a000ULL, 0x200,
+                                      BP_MEM_WRITE, NULL) == 0) {
+                fprintf(stderr, "mt6895: ATF watch armed on stack region cpu%u\n",
+                        n);
             }
         }
         object_unref(cpuobj);
@@ -16124,12 +16187,15 @@ static const uint8_t stub_cmd_def[0x80] = {
                               &mt6895_atf_uartobj_ops, NULL,
                               "mt6895.atf-uartobj", 0x100);
         /*
-         * Keep the fake UART object OUT of ATF's BSS: the translation tables
-         * and the mmap array live there, and parking it at 0x4825d000 made
-         * xlat report a bogus region (VA/PA 0x19020000) and panic. 0x48300000
-         * is inside BL31's reserved window but beyond its BSS.
+         * Keep the fake UART object OUT of ATF's BSS and OUT of the EL3
+         * stack area: parking it at 0x4825d000 made xlat report a bogus
+         * region (VA/PA 0x19020000) and panic, and 0x4824a100 sat inside
+         * cpu7's EL3 stack window (0x482469c0 + 7*0x800 = 0x4824a1c0 entry
+         * SP; the stack reaches 0x4824a100), so the warmboot entrypoint's
+         * chain fill/unlock read the fake handler's 0x4825d000 filler and
+         * faulted (r1315). 0x48300000 is just past BL31's reserved window.
          */
-        memory_region_add_subregion(sysmem, 0x4824a100ULL,
+        memory_region_add_subregion(sysmem, 0x48300000ULL,
                                     &s->atf_uartobj_mr);
         /*
          * CPC/SMP power controller: the per-CPU power-state register (read by
