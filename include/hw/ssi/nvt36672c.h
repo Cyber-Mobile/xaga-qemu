@@ -71,6 +71,7 @@ struct Nvt36672cState {
     uint32_t report_base;   /* page the driver reads its report from */
     uint32_t touch_x, touch_y;
     bool touch_down;
+    bool rel_seeded;     /* REL position seeded from console centre */
     bool report_read_pending;
     bool trace;
 };

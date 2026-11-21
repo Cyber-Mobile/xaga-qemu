@@ -10939,15 +10939,17 @@ ufs_done:
         sysbus_connect_irq(SYS_BUS_DEVICE(s->spmi), 0,
                            qdev_get_gpio_in(eint, 0));
         /*
-         * Touch stack: SPI controllers + Novatek NT36672C client.  Opt-in via
-         * MTK_TOUCH=1; default OFF because binding the NVT driver currently
-         * exposes a pre-existing display/CMDQ model defect (GCE-D "aee not
-         * ready" -> cmdq_task_handle_error -> smi_dbg_hang_detect -> emidbg
-         * flood, no recovery).  See artifacts/r1302/phase2/touch_landing/
-         * DISPLAY_CMDQ_DEFECT.md.  Unset means the machine creates no touch
-         * devices and behaves exactly like the committed base.
+         * Touch stack: SPI controllers + Novatek NT36672C client.  Default ON
+         * since r1315: the display/CMDQ defect that originally gated it
+         * (GCE-D "aee not ready" -> cmdq_task_handle_error ->
+         * smi_dbg_hang_detect -> emidbg flood) is resolved
+         * (artifacts/r1302/phase2/touch_landing/DISPLAY_CMDQ_DEFECT.md,
+         * RESOLVED) and the whole chain passed acceptance (QMP ABS inject ->
+         * touch report -> EINT ack -> INTID 291 active, evidence ACC5).
+         * MTK_NO_TOUCH=1 removes the devices to compare against the
+         * committed base.
          */
-        if (mtk_env_on("MTK_TOUCH")) {
+        if (!mtk_env_on("MTK_NO_TOUCH")) {
             mt6895_create_spi(s, errp);
         }
     }

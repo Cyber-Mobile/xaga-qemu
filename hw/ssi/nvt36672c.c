@@ -302,6 +302,38 @@ static void nvt_input_event(DeviceState *dev, QemuConsole *src,
         }
     }
     switch (evt->type) {
+    case INPUT_EVENT_KIND_REL:
+    {
+        /*
+         * REL sources are VNC clients that never negotiated absolute mode:
+         * their events arrive as pointer deltas and used to be dropped by the
+         * handler mask, leaving the report stuck at (0,0).  Accumulate the
+         * deltas as console-pixel moves of the emulated finger so an
+         * interactive drag works end-to-end; ABS injectors keep the exact
+         * 0..0x7fff scaling path above.
+         */
+        int64_t max_x = (int64_t)s->abs_x_max * s->super_res - 1;
+        int64_t max_y = (int64_t)s->abs_y_max * s->super_res - 1;
+
+        if (!s->rel_seeded) {
+            s->touch_x = (uint32_t)s->abs_x_max * s->super_res / 2;
+            s->touch_y = (uint32_t)s->abs_y_max * s->super_res / 2;
+            s->rel_seeded = true;
+        }
+        if (evt->rel.axis == INPUT_AXIS_X) {
+            int64_t v = (int64_t)s->touch_x + evt->rel.value;
+
+            s->touch_x = (uint32_t)(v < 0 ? 0 : (v > max_x ? max_x : v));
+        } else if (evt->rel.axis == INPUT_AXIS_Y) {
+            int64_t v = (int64_t)s->touch_y + evt->rel.value;
+
+            s->touch_y = (uint32_t)(v < 0 ? 0 : (v > max_y ? max_y : v));
+        }
+        if (s->touch_down) {
+            nvt_touch_report(s, 2);
+        }
+        break;
+    }
     case INPUT_EVENT_KIND_ABS:
         if (evt->abs.axis == INPUT_AXIS_X) {
             s->touch_x = (uint32_t)((uint64_t)evt->abs.value *
@@ -333,7 +365,8 @@ static void nvt_input_event(DeviceState *dev, QemuConsole *src,
 
 static const QemuInputHandler nvt_input_handler = {
     .name = "nvt36672c-touch",
-    .mask = INPUT_EVENT_MASK_BTN | INPUT_EVENT_MASK_ABS,
+    .mask = INPUT_EVENT_MASK_BTN | INPUT_EVENT_MASK_ABS |
+            INPUT_EVENT_MASK_REL,
     .event = nvt_input_event,
 };
 
