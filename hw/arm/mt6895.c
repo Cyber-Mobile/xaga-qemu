@@ -10087,22 +10087,15 @@ static void mt6895_create_cpus(Mt6895MachineState *s, Error **errp)
         mt6895_add_impdef_regs(ARM_CPU(cpuobj));
 
         qdev_realize(DEVICE(cpuobj), NULL, errp);
-        if (MTK_ENV_CACHED("MTK_ATFWATCH")) {
+        if (MTK_ENV_CACHED("MTK_ATFWATCH") && n == 7) {
             /*
-             * Observation-only bring-up aid: two guest-memory write
-             * watchpoints on every CPU cover BL31's per-CPU blocks, the
-             * synthetic UART/SPM area and the SPM node slots + registration
-             * tables, armed from machine init so BL31's whole cold-boot
-             * registration sequence is visible with the writing PC
-             * (r1315 analysis).  debug.c prints and resumes.
+             * Observation-only: watch writes into cpu7's per-CPU block to
+             * capture the +0x18 write sequence (r1315: cpu7 takes the
+             * non-skip path in 0x4821c690 while cpu1-6 skip).
              */
-            if (cpu_watchpoint_insert(CPU(cpuobj), 0x4824a000ULL, 0x2000,
+            if (cpu_watchpoint_insert(CPU(cpuobj), 0x4824b380ULL, 0x80,
                                       BP_MEM_WRITE, NULL) == 0) {
-                fprintf(stderr, "mt6895: ATF watch A armed on cpu%d\n", n);
-            }
-            if (cpu_watchpoint_insert(CPU(cpuobj), 0x48250000ULL, 0xc000,
-                                      BP_MEM_WRITE, NULL) == 0) {
-                fprintf(stderr, "mt6895: ATF watch B armed on cpu%d\n", n);
+                fprintf(stderr, "mt6895: ATF watch armed on cpu7 block\n");
             }
         }
         object_unref(cpuobj);
