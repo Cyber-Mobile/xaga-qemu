@@ -466,6 +466,28 @@ void arm_debug_excp_handler(CPUState *cs)
     CPUWatchpoint *wp_hit = cs->watchpoint_hit;
 
     if (wp_hit) {
+        if ((wp_hit->flags & BP_MEM_WRITE) &&
+            getenv("MTK_ATFWATCH") != NULL) {
+            /*
+             * MT6895 bring-up aid: the machine inserted a guest-memory
+             * write watchpoint over BL31's per-CPU/slot region; report the
+             * write and resume instead of raising a guest exception.
+             */
+            static int mtk_watch_n;
+
+            if (mtk_watch_n < 200) {
+                mtk_watch_n++;
+                fprintf(stderr,
+                        "MTK-ATFWATCH cpu=%u pc=%#llx addr=%#" PRIx64
+                        " len=%#" PRIx64 "\n",
+                        cs->cpu_index,
+                        (unsigned long long)(is_a64(env) ? env->pc
+                                                         : env->regs[15]),
+                        wp_hit->hitaddr, wp_hit->len);
+            }
+            cs->watchpoint_hit = NULL;
+            return;
+        }
         if (wp_hit->flags & BP_CPU) {
             bool wnr = (wp_hit->flags & BP_WATCHPOINT_HIT_WRITE) != 0;
 

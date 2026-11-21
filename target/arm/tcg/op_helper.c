@@ -60,14 +60,33 @@ void raise_exception(CPUARMState *env, uint32_t excp,
             n++;
             fprintf(stderr,
                     "MT6895-DBG cpu=%u dabt#%d pc=%#x syndrome=%#llx "
-                    "r0=%#x r1=%#x r2=%#x r3=%#x r4=%#x r14=%#x sp=%#x\n",
+                    "r0=%#x r1=%#x r2=%#x r3=%#x r4=%#x r14=%#x sp=%#x "
+                    "x8=%#llx x21=%#llx x22=%#llx\n",
                     env_cpu(env)->cpu_index, n,
                     (unsigned)(env->aarch64 ? env->pc : env->regs[15]),
                     (unsigned long long)syndrome,
                     (unsigned)env->regs[0], (unsigned)env->regs[1],
                     (unsigned)env->regs[2], (unsigned)env->regs[3],
                     (unsigned)env->regs[4], (unsigned)env->regs[14],
-                    (unsigned)env->regs[13]);
+                    (unsigned)env->regs[13],
+                    (unsigned long long)env->xregs[8],
+                    (unsigned long long)env->xregs[21],
+                    (unsigned long long)env->xregs[22]);
+            if (env->aarch64 && env->xregs[24]) {
+                uint64_t lst[3];
+
+                if (cpu_memory_rw_debug(env_cpu(env), env->xregs[24],
+                                        (uint8_t *)lst, sizeof(lst),
+                                        false) == 0) {
+                    fprintf(stderr,
+                            "MT6895-DBG list@%#llx = %016llx %016llx "
+                            "%016llx\n",
+                            (unsigned long long)env->xregs[24],
+                            (unsigned long long)lst[0],
+                            (unsigned long long)lst[1],
+                            (unsigned long long)lst[2]);
+                }
+            }
         }
     }
     if (excp == EXCP_UDEF) {

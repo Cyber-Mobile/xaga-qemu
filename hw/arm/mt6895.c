@@ -39,6 +39,7 @@
 #include "system/blockdev.h"
 #include "hw/arm/machines-qom.h"
 #include "hw/arm/mt6895.h"
+#include "exec/watchpoint.h"
 #include "target/arm/cpu.h"
 #include "target/arm/cpregs.h"
 #include "hw/char/mtk_uart.h"
@@ -110,6 +111,7 @@ extern uint64_t mtk_pc_hist[];
 extern unsigned mtk_pc_hist_idx;
 #include "qobject/qlist.h"
 #include "system/system.h"
+#include "exec/watchpoint.h"
 #include "target/arm/cpu.h"
 #include "target/arm/cpregs.h"
 
@@ -1430,11 +1432,40 @@ static void mt6895_cpc_mark_powered(CPUState *cs, run_on_cpu_data data)
     mt6895_cpc_powered |= 1u << n;
 }
 
+/*
+ * Observation-only bring-up aid (MTK_ATFWATCH=1): arm a guest-memory write
+ * watchpoint over BL31's per-CPU blocks / SPM node slots / 表A region on every
+ * CPU, one-shot at the first CPC power-on tick so only the CPU_ON warm-boot
+ * window is traced.  debug.c reports each write with the writing PC and
+ * resumes; no guest state is touched.
+ */
+static bool mt6895_atfwatch_armed;
+
+static void mt6895_atfwatch_arm(void)
+{
+    CPUState *cs;
+
+    if (mt6895_atfwatch_armed) {
+        return;
+    }
+    mt6895_atfwatch_armed = true;
+    CPU_FOREACH(cs) {
+        if (cpu_watchpoint_insert(cs, 0x482500fd0ULL, 0xa0,
+                                  BP_MEM_WRITE, NULL) == 0) {
+            fprintf(stderr, "mt6895: ATF watch armed on cpu%u\n",
+                    cs->cpu_index);
+        }
+    }
+}
+
 static void mt6895_cpc_power_on_tick(void *opaque)
 {
     unsigned n;
 
     (void)opaque;
+    if (MTK_ENV_CACHED("MTK_ATFWATCH")) {
+        mt6895_atfwatch_arm();
+    }
     for (n = 0; n < MT6895_CPC_ENTRY_COUNT; n++) {
         uint64_t entry = mt6895_cpc_entries[n];
         CPUState *target;
@@ -10862,6 +10893,10 @@ ufs_done:
      * ufs0_shutdown domain from it.
      */
     s->scpsys = qdev_new(TYPE_MTK_SCPSYS);
+    fprintf(stderr, "INITMARK INITMARK scpsys-new\n");
+    /* MSYS2/Windows buffers stderr when redirected to a file: unbuffer it so
+     * INITMARK diagnostics survive a timeout kill (r1315 lesson). */
+    setvbuf(stderr, NULL, _IONBF, 0);
     qdev_prop_set_uint32(s->scpsys, "size", MT6895_SCPSYS_SIZE);
     if (!sysbus_realize(SYS_BUS_DEVICE(s->scpsys), errp)) {
         return;
@@ -10874,6 +10909,7 @@ ufs_done:
      * drivers that hang off a PMIC regulator can probe.
      */
     s->spmi = qdev_new(TYPE_MTK_SPMI_PMIF);
+    fprintf(stderr, "INITMARK INITMARK spmi-new\n");
     /*
      * The board's PMIC population, as wired in the xaga device tree /
      * preloader SPMI check table: MT6363 main PMIC at slave 4, MT6368 second
@@ -10920,6 +10956,7 @@ ufs_done:
             0x1c01e000ULL,      /* eint-c */
         };
         DeviceState *eint = qdev_new("mtk-eint");
+    fprintf(stderr, "INITMARK INITMARK eint-new\n");
         /* Board wiring: the touch IRQ line maps to this EINT pin. */
         /* Touch INT: EINT instance 1, index 31 (discovered from the guest own request_irq programming). */
         qdev_prop_set_uint32(eint, "touch-instance", 1);
@@ -10960,6 +10997,7 @@ ufs_done:
      * needs modelling.
      */
     dinfo = drive_get(IF_SD, 0, 0);
+    fprintf(stderr, "INITMARK INITMARK sd-section\n");
     if (!dinfo) {
         return;
     }
@@ -11423,25 +11461,36 @@ static void mt6895_create_spi(Mt6895MachineState *s, Error **errp)
     if (!mt6895_eint_dev) {
         return;
     }
+    fprintf(stderr, "INITMARK INITMARK create-spi-enter\n");
     for (i = 0; i < ARRAY_SIZE(ctl); i++) {
+        fprintf(stderr, "INITMARK spi-i%d-new\n", i);
         DeviceState *dev = qdev_new(TYPE_MTK_SPI);
         SysBusDevice *sbd = SYS_BUS_DEVICE(dev);
 
         qdev_prop_set_uint32(dev, "clock-hz", 13000000);
+        fprintf(stderr, "INITMARK spi-i%d-realize\n", i);
         sysbus_realize_and_unref(sbd, &error_fatal);
+        fprintf(stderr, "INITMARK spi-i%d-irq\n", i);
         sysbus_connect_irq(sbd, 0, qdev_get_gpio_in(s->gic, ctl[i].spi));
+        fprintf(stderr, "INITMARK spi-i%d-map\n", i);
         memory_region_add_subregion_overlap(get_system_memory(), ctl[i].addr,
                                             sysbus_mmio_get_region(sbd, 0), 1);
+        fprintf(stderr, "INITMARK spi-i%d-done\n", i);
         if (i == nvt_spi) {
+    fprintf(stderr, "INITMARK INITMARK create-spi-nvt\n");
             SSIBus *bus = (SSIBus *)qdev_get_child_bus(dev, "spi");
             DeviceState *nvt = qdev_new(TYPE_NVT36672C);
 
+            fprintf(stderr, "INITMARK nvt-realize-pre\n");
             if (!ssi_realize_and_unref(nvt, bus, errp)) {
                 return;
             }
+            fprintf(stderr, "INITMARK nvt-realize-post\n");
+            fprintf(stderr, "INITMARK nvt-gpio-pre\n");
             qdev_connect_gpio_out(nvt, 0,
                                   qdev_get_gpio_in(mt6895_eint_dev, 1));
             sysbus_connect_irq(sbd, 1, qdev_get_gpio_in(nvt, 0));
+            fprintf(stderr, "INITMARK nvt-gpio-post\n");
         }
     }
 }

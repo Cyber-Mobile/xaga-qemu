@@ -14,4 +14,7 @@ system_ss.add(when: 'CONFIG_IBEX', if_true: files('ibex_spi_host.c'))
 system_ss.add(when: 'CONFIG_BCM2835_SPI', if_true: files('bcm2835_spi.c'))
 system_ss.add(when: 'CONFIG_PNV_SPI', if_true: files('pnv_spi.c'))
 # MTK touch stack wiring (touch_wiring.py)
-system_ss.add(when: 'CONFIG_MT6895', if_true: files('mtk_spi.c', 'nvt36672c.c'))
+# The touch controllers belong to the MT6895 machine build: machine symbols
+# (CONFIG_MT6895) only evaluate in the per-target arm_common_ss set, not in
+# the global system_ss (remote build-win evidence, r1315).
+arm_common_ss.add(when: 'CONFIG_MT6895', if_true: files('mtk_spi.c', 'nvt36672c.c'))
