@@ -10145,6 +10145,26 @@ void arm_cpu_do_interrupt(CPUState *cs)
                     (uint32_t)env->uncached_cpsr);
         }
     }
+    if (cs->exception_index == EXCP_DATA_ABORT && is_a64(env)) {
+        /*
+         * Same bring-up aid for AArch64 faults: the EL3 data aborts from
+         * BL31's per-core warm boot carry the bad address in
+         * env->exception.vaddress, which the bounded dabt trace does not
+         * print, and the faulting address is what identifies which per-CPU
+         * slot the firmware chain tripped over.
+         */
+        static int mtk_abort64_n;
+
+        if (mtk_abort64_n < 8) {
+            mtk_abort64_n++;
+            fprintf(stderr, "MTK-ABORT64 cpu=%u el=%d pc=%#llx vaddr=%#" PRIx64
+                    " synd=%#" PRIx64 "\n",
+                    cs->cpu_index, arm_current_el(env),
+                    (unsigned long long)last_pc,
+                    env->exception.vaddress,
+                    env->exception.syndrome);
+        }
+    }
 
     assert(!arm_feature(env, ARM_FEATURE_M));
 

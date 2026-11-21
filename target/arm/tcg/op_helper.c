@@ -59,9 +59,10 @@ void raise_exception(CPUARMState *env, uint32_t excp,
         if (n < 24) {
             n++;
             fprintf(stderr,
-                    "MT6895-DBG dabt#%d pc=%#x syndrome=%#llx "
+                    "MT6895-DBG cpu=%u dabt#%d pc=%#x syndrome=%#llx "
                     "r0=%#x r1=%#x r2=%#x r3=%#x r4=%#x r14=%#x sp=%#x\n",
-                    n, (unsigned)env->regs[15],
+                    env_cpu(env)->cpu_index, n,
+                    (unsigned)(env->aarch64 ? env->pc : env->regs[15]),
                     (unsigned long long)syndrome,
                     (unsigned)env->regs[0], (unsigned)env->regs[1],
                     (unsigned)env->regs[2], (unsigned)env->regs[3],
@@ -74,11 +75,13 @@ void raise_exception(CPUARMState *env, uint32_t excp,
         if (u < 8) {
             u++;
             fprintf(stderr,
-                    "MT6895-DBG udef#%d pc=%#x cpsr=%#x r0=%#x r1=%#x r2=%#x "
+                    "MT6895-DBG cpu=%u udef#%d pc=%#x cpsr=%#x r0=%#x r1=%#x r2=%#x "
                     "r3=%#x r4=%#x r14=%#x sp=%#x el=%d thumb=%d "
                     "aarch64=%d pstate=%#x vbar3=%#llx vbar1=%#llx "
                     "syndrome=%#llx\n",
-                    u, (unsigned)env->regs[15], (unsigned)cpsr_read(env),
+                    env_cpu(env)->cpu_index, u,
+                    (unsigned)(env->aarch64 ? env->pc : env->regs[15]),
+                    (unsigned)cpsr_read(env),
                     (unsigned)env->regs[0], (unsigned)env->regs[1],
                     (unsigned)env->regs[2], (unsigned)env->regs[3],
                     (unsigned)env->regs[4], (unsigned)env->regs[14],

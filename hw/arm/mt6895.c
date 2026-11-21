@@ -40,6 +40,7 @@
 #include "hw/arm/machines-qom.h"
 #include "hw/arm/mt6895.h"
 #include "target/arm/cpu.h"
+#include "target/arm/cpregs.h"
 #include "hw/char/mtk_uart.h"
 #include "hw/misc/mtk_scpsys.h"
 #include "hw/misc/mtk_tinysys_mbox.h"
@@ -110,6 +111,7 @@ extern unsigned mtk_pc_hist_idx;
 #include "qobject/qlist.h"
 #include "system/system.h"
 #include "target/arm/cpu.h"
+#include "target/arm/cpregs.h"
 
 /* ---- Boot LUN image format -------------------------------------------------
  *
@@ -9677,6 +9679,14 @@ static void mt6895_machine_reset(MachineState *machine, ResetType type)
     if (mt6895_warm_reset_requested) {
         fprintf(stderr, "mt6895: WDT software reset -- devices reset, PMIC/DRAM preserved\n");
     }
+    /*
+     * The GZ EMI/infra-IO remap registers live inside the hypervisor's own
+     * register block and reset with it: carrying boot#1's remap selection
+     * into boot#2 gave the second preloader pass an environment the firmware
+     * never set up (r1315 ISO2/ISO1 boot#2 preloader data abort).
+     */
+    memset(s->gz_remap_regs, 0, sizeof(s->gz_remap_regs));
+    memory_region_set_enabled(&s->gz_ddr_remap, false);
     mt6895_cpc_state_reset();
     {
         bool was_warm = mt6895_warm_reset_requested;
@@ -9898,6 +9908,76 @@ static bool mt6895_host_psci_mode(MachineState *ms)
     return false;
 }
 
+/*
+ * MTK's Cortex-A55/A78 integration implements registers in the
+ * implementation-defined C15 space that the stock QEMU CPU models lack.
+ * BL31's per-core bring-up writes S3_0_C15_C3_6 right after arming its
+ * per-CPU state (tee_a.img 0x4820448c); without the register the MSR is
+ * undefined, ATF panics before finishing the warm boot, and the RGU turns
+ * that into a machine reset (r1315 ISO1/ISO2/R3 evidence).  Model it as
+ * plain per-CPU RW storage: the firmware uses it as configuration state.
+ */
+static uint64_t mtk_impdef_c15_c3_6[MT6895_NUM_CPUS];
+static uint64_t mtk_impdef_c15_c2_0[MT6895_NUM_CPUS];
+
+static uint64_t mt6895_impdef_c15_c3_6_read(CPUARMState *env,
+                                            const ARMCPRegInfo *ri)
+{
+    return mtk_impdef_c15_c3_6[env_cpu(env)->cpu_index];
+}
+
+static void mt6895_impdef_c15_c3_6_write(CPUARMState *env,
+                                         const ARMCPRegInfo *ri, uint64_t v)
+{
+    mtk_impdef_c15_c3_6[env_cpu(env)->cpu_index] = v;
+}
+
+static uint64_t mt6895_impdef_c15_c2_0_read(CPUARMState *env,
+                                            const ARMCPRegInfo *ri)
+{
+    return mtk_impdef_c15_c2_0[env_cpu(env)->cpu_index];
+}
+
+static void mt6895_impdef_c15_c2_0_write(CPUARMState *env,
+                                         const ARMCPRegInfo *ri, uint64_t v)
+{
+    mtk_impdef_c15_c2_0[env_cpu(env)->cpu_index] = v;
+}
+
+static void mt6895_add_impdef_regs(ARMCPU *cpu)
+{
+    /*
+     * s3_0_c15_c3_6: written by BL31's per-core bring-up on every core
+     * (tee_a.img 0x4820448c).  s3_6_c15_c2_0: A78-only (guarded by the MIDR
+     * part-number compare at tee_a.img 0x482166e0), read-modify-written with
+     * bit 54 set during the warm entry.  Both live in the MTK integration's
+     * implementation-defined C15 space that the stock QEMU Cortex models
+     * lack; the MSR/MRS is undefined without them and ATF panics mid
+     * warm-boot, which the RGU turns into a machine reset.
+     */
+    static const ARMCPRegInfo mtk_impdef_c15_c3_6 = {
+        .name = "mtk_impdef_c15_c3_6",
+        .crn = 15, .crm = 3, .opc0 = 3, .opc1 = 0, .opc2 = 6,
+        .access = PL3_RW,
+        .state = ARM_CP_STATE_AA64,
+        .type = ARM_CP_NO_RAW,
+        .readfn = mt6895_impdef_c15_c3_6_read,
+        .writefn = mt6895_impdef_c15_c3_6_write,
+    };
+    static const ARMCPRegInfo mtk_impdef_c15_c2_0 = {
+        .name = "mtk_impdef_c15_c2_0",
+        .crn = 15, .crm = 2, .opc0 = 3, .opc1 = 6, .opc2 = 0,
+        .access = PL3_RW,
+        .state = ARM_CP_STATE_AA64,
+        .type = ARM_CP_NO_RAW,
+        .readfn = mt6895_impdef_c15_c2_0_read,
+        .writefn = mt6895_impdef_c15_c2_0_write,
+    };
+
+    define_one_arm_cp_reg(cpu, &mtk_impdef_c15_c3_6);
+    define_one_arm_cp_reg(cpu, &mtk_impdef_c15_c2_0);
+}
+
 static void mt6895_create_cpus(Mt6895MachineState *s, Error **errp)
 {
     MachineState *ms = MACHINE(s);
@@ -9958,6 +10038,7 @@ static void mt6895_create_cpus(Mt6895MachineState *s, Error **errp)
             object_property_set_bool(cpuobj, "start-powered-off", true,
                                      &error_fatal);
         }
+        mt6895_add_impdef_regs(ARM_CPU(cpuobj));
 
         qdev_realize(DEVICE(cpuobj), NULL, errp);
         object_unref(cpuobj);
