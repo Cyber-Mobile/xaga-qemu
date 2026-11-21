@@ -1433,29 +1433,27 @@ static void mt6895_cpc_mark_powered(CPUState *cs, run_on_cpu_data data)
 }
 
 /*
- * Observation-only bring-up aid (MTK_ATFWATCH=1): arm a guest-memory write
- * watchpoint over BL31's per-CPU blocks / SPM node slots / 表A region on every
- * CPU, one-shot at the first CPC power-on tick so only the CPU_ON warm-boot
- * window is traced.  debug.c reports each write with the writing PC and
- * resumes; no guest state is touched.
+ * Observation-only bring-up aid (MTK_ATFWATCH=1): two guest-memory write
+ * watchpoints on every CPU cover BL31's per-CPU blocks (0x4824a000+), the
+ * synthetic UART area, the SPM node slots and the registration tables, armed
+ * from machine init so BL31's whole cold-boot registration sequence is
+ * visible with the writing PC.  debug.c reports each write and resumes; no
+ * guest state is touched.
  */
-static bool mt6895_atfwatch_armed;
-
-static void mt6895_atfwatch_arm(void)
+static uint64_t memcpy_ld(const uint8_t *p)
 {
-    CPUState *cs;
+    uint64_t v;
 
-    if (mt6895_atfwatch_armed) {
-        return;
-    }
-    mt6895_atfwatch_armed = true;
-    CPU_FOREACH(cs) {
-        if (cpu_watchpoint_insert(cs, 0x482500fd0ULL, 0xa0,
-                                  BP_MEM_WRITE, NULL) == 0) {
-            fprintf(stderr, "mt6895: ATF watch armed on cpu%u\n",
-                    cs->cpu_index);
-        }
-    }
+    memcpy(&v, p, sizeof(v));
+    return v;
+}
+
+static uint32_t memcpy_ld32(const uint8_t *p)
+{
+    uint32_t v;
+
+    memcpy(&v, p, sizeof(v));
+    return v;
 }
 
 static void mt6895_cpc_power_on_tick(void *opaque)
@@ -1463,9 +1461,6 @@ static void mt6895_cpc_power_on_tick(void *opaque)
     unsigned n;
 
     (void)opaque;
-    if (MTK_ENV_CACHED("MTK_ATFWATCH")) {
-        mt6895_atfwatch_arm();
-    }
     for (n = 0; n < MT6895_CPC_ENTRY_COUNT; n++) {
         uint64_t entry = mt6895_cpc_entries[n];
         CPUState *target;
@@ -1477,6 +1472,26 @@ static void mt6895_cpc_power_on_tick(void *opaque)
         mt6895_cpc_pending &= ~(1u << n);
         if (entry == 0) {
             continue;
+        }
+        if (MTK_ENV_CACHED("MTK_ATFWATCH")) {
+            /*
+             * Observation-only: dump the target core's per-CPU block as
+             * BL31's CPU_ON handler left it, before the warm entry runs.
+             */
+            uint8_t blk[0x40];
+            hwaddr ba = 0x4824b000ULL + (hwaddr)n * 0x80;
+
+            if (address_space_read(&address_space_memory, ba,
+                                   MEMTXATTRS_UNSPECIFIED, blk,
+                                   sizeof(blk)) == MEMTX_OK) {
+                fprintf(stderr,
+                        "MTK-CPUBLK cpu%u pre-warm: +10=%016llx +18=%08x "
+                        "+1c=%08x +20=%02x +8=%016llx\n",
+                        n, (unsigned long long)memcpy_ld(&blk[0x10]),
+                        (unsigned int)memcpy_ld32(&blk[0x18]),
+                        (unsigned int)memcpy_ld32(&blk[0x1c]), blk[0x20],
+                        (unsigned long long)memcpy_ld(&blk[0x08]));
+            }
         }
         ret = arm_set_cpu_on((uint64_t)n << 8, entry, 0, 3, true);
         if (MTK_ENV_CACHED("MTK_CPCLOG")) {
@@ -10072,6 +10087,24 @@ static void mt6895_create_cpus(Mt6895MachineState *s, Error **errp)
         mt6895_add_impdef_regs(ARM_CPU(cpuobj));
 
         qdev_realize(DEVICE(cpuobj), NULL, errp);
+        if (MTK_ENV_CACHED("MTK_ATFWATCH")) {
+            /*
+             * Observation-only bring-up aid: two guest-memory write
+             * watchpoints on every CPU cover BL31's per-CPU blocks, the
+             * synthetic UART/SPM area and the SPM node slots + registration
+             * tables, armed from machine init so BL31's whole cold-boot
+             * registration sequence is visible with the writing PC
+             * (r1315 analysis).  debug.c prints and resumes.
+             */
+            if (cpu_watchpoint_insert(CPU(cpuobj), 0x4824a000ULL, 0x2000,
+                                      BP_MEM_WRITE, NULL) == 0) {
+                fprintf(stderr, "mt6895: ATF watch A armed on cpu%d\n", n);
+            }
+            if (cpu_watchpoint_insert(CPU(cpuobj), 0x48250000ULL, 0xc000,
+                                      BP_MEM_WRITE, NULL) == 0) {
+                fprintf(stderr, "mt6895: ATF watch B armed on cpu%d\n", n);
+            }
+        }
         object_unref(cpuobj);
     }
 }

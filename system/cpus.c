@@ -343,6 +343,15 @@ bool cpu_can_run(CPUState *cpu)
 
 void cpu_handle_guest_debug(CPUState *cpu)
 {
+    if (getenv("MTK_ATFWATCH") != NULL) {
+        /*
+         * MT6895 ATFWATCH diagnostic: the watchpoint hit was already
+         * reported by arm_debug_excp_handler and the store committed via
+         * the CPU_INTERRUPT_DEBUG re-entry.  There is no gdb session to
+         * stop into, so keep the vCPU scheduled instead of stopping it.
+         */
+        return;
+    }
     if (replay_running_debug()) {
         if (!cpu_single_stepping(cpu)) {
             /*

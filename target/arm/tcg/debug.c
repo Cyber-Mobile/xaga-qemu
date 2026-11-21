@@ -475,7 +475,7 @@ void arm_debug_excp_handler(CPUState *cs)
              */
             static int mtk_watch_n;
 
-            if (mtk_watch_n < 200) {
+            if (mtk_watch_n < 20000) {
                 mtk_watch_n++;
                 fprintf(stderr,
                         "MTK-ATFWATCH cpu=%u pc=%#llx addr=%#" PRIx64
@@ -485,8 +485,9 @@ void arm_debug_excp_handler(CPUState *cs)
                                                          : env->regs[15]),
                         wp_hit->hitaddr, wp_hit->len);
             }
-            cs->watchpoint_hit = NULL;
-            return;
+            /* Fall through: the store commits via the CPU_INTERRUPT_DEBUG
+             * re-entry, and the RR loop's guest_debug handling is gated by
+             * the same env in cpus.c. */
         }
         if (wp_hit->flags & BP_CPU) {
             bool wnr = (wp_hit->flags & BP_WATCHPOINT_HIT_WRITE) != 0;
