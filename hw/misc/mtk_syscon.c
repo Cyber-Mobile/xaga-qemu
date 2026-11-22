@@ -681,41 +681,29 @@ static uint64_t mtk_syscon_read(void *opaque, hwaddr offset, unsigned size)
         MtkSysconState *s0 = MTK_SYSCON(opaque);
 
         /*
-         * Pinctrl board strap selecting the DRAM generation.
+         * Pinctrl board straps read from the pad input register (+0x200):
+         *   - bit 0 (lpdd5x_strap): selects LPDDR5X (dram_type 0xC) in 6 GiB
+         *     configs instead of falling back to LPDDR5 (0xB).
+         *   - bit 5 (fastmeta_strap): GPIO5 pull-up prevents meta-mode
+         *     override (which suppresses vbmeta.* FDT exports in LK).
+         *     MTK_NO_FASTMETA_STRAP=1 keeps the historical all-zero bit 5.
          *
-         * The preloader's dram-type detector (0x020283f0) bit-bangs the
-         * pinctrl word at +0x200 (bit 0) and +0x260 (bit 14).  On the xaga
-         * board the first reads high and the second low, which is how the
-         * firmware selects LPDDR5X (dram_type 0xC) instead of falling back to
-         * LPDDR5 (0xB).  Both are board input levels, like the pad input lines
-         * described below, not guest state.
-         *
-         * The machine enables this only in the genuine 6 GiB configuration;
-         * every other -m keeps the historical plain-storage behaviour.
+         * Both bits live in the same +0x200 word and must combine rather than
+         * letting lpdd5x_strap return early and shadow fastmeta_strap.
          */
-        if (s0->lpdd5x_strap && offset == 0x200 && offset + 4 <= s0->size) {
-            return s0->regs[offset / 4] | 1u;
-        }
-        /*
-         * The xaga board also pulls the fastmeta pad (GPIO5) high: it is an
-         * input with its pull-up enabled and nothing on the board driving it,
-         * so it reads 1.  +0x200 is the pad input register (one bit per pin);
-         * a write probe proved bit 5 is the fastmeta pad -- forcing it turns
-         * the preloader's report into "value 1" and removes "Enable fastmeta".
-         *
-         * This matters far beyond the message: when the level reads low the
-         * preloader enables meta mode, and in meta mode the LK on this device
-         * never exports /firmware/android/vbmeta.{digest,size,hash_alg}.  The
-         * kernel then exposes no vbmeta digest, libfs_avb fails with
-         * "[libfs_avb] Invalid hash size", AvbHandle::Open() returns null,
-         * /system cannot be set up and first-stage init aborts with
-         * "Failed to mount required partitions early".
-         *
-         * MTK_NO_FASTMETA_STRAP=1 keeps the historical all-zero behaviour.
-         */
-        if (s0->fastmeta_strap && offset == 0x200 && offset + 4 <= s0->size &&
-            !MTK_ENV_CACHED("MTK_NO_FASTMETA_STRAP")) {
-            return s0->regs[offset / 4] | (1u << 5);
+        if (offset == 0x200 && offset + 4 <= s0->size) {
+            uint32_t v = s0->regs[offset / 4];
+
+            if (s0->lpdd5x_strap) {
+                v |= 1u;
+            }
+            if (s0->fastmeta_strap &&
+                !MTK_ENV_CACHED("MTK_NO_FASTMETA_STRAP")) {
+                v |= 1u << 5;
+            }
+            if (v != s0->regs[offset / 4]) {
+                return v;
+            }
         }
 
         /*

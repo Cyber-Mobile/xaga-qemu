@@ -1177,65 +1177,6 @@ static const MemoryRegionOps mt6895_atf_gta_ops = {
 };
 
 /*
- * Points ATF's console driver at a usable UART object (see the registration
- * site in the machine init for why this global has to be supplied).
- */
-static uint64_t mt6895_atf_uart_read(void *opaque, hwaddr off, unsigned size)
-{
-    (void)opaque;
-    (void)size;
-    (void)off;
-    return 0x48300000ULL;      /* pointer slot: ATF's UART object */
-}
-
-static uint64_t mt6895_atf_uartobj_read(void *opaque, hwaddr off, unsigned size)
-{
-    (void)opaque;
-    (void)size;
-    if (off == 0x14) {
-        /*
-         * TX-ready bit. The console writer loops on
-         * "ldr w2,[uart,#0x14]; and w2,#0x20; cbz -> loop" (0x48204d1c) and
-         * the object initialiser never sets this field, so without it ATF
-         * spins forever on the first character.
-         */
-        return 0x20;
-    }
-    return 0x4825d000ULL;
-}
-
-static void mt6895_atf_uart_write(void *opaque, hwaddr off, uint64_t val,
-                                  unsigned size)
-{
-    (void)opaque; (void)off; (void)val; (void)size;
-}
-
-static void mt6895_atf_uartobj_write(void *opaque, hwaddr off, uint64_t val,
-                                     unsigned size)
-{
-    (void)opaque; (void)size;
-    if (off == 0) {
-        /*
-         * The character itself: surface ATF's console on stderr, one line at
-         * a time, so the firmware's own log is readable.
-         */
-        static char line[256];
-        static size_t len;
-
-        if (val == '\n' || len == sizeof(line) - 1) {
-            line[len] = '\0';
-            fprintf(stderr, "ATF-CONSOLE: %s (pc=%#" PRIx64 ")\n", line,
-                    current_cpu ? (uint64_t)ARM_CPU(current_cpu)->env.regs[15] : 0);
-            len = 0;
-        } else if (val != '\r') {
-            line[len++] = (char)val;
-        }
-    }
-}
-
-
-
-/*
  * MTK CPC/SMP power controller bridge (dcm-mp-cpusys-top block, 0x0C538000).
  *
  * ATF's CPU_ON path (plat/mediatek/drivers/cpu_pm/cpcv3_2/mt_smp.c) does, per
@@ -1910,21 +1851,6 @@ static const MemoryRegionOps mt6895_cpc_entry_ops = {
     .endianness = DEVICE_NATIVE_ENDIAN,
     .valid = { .min_access_size = 1, .max_access_size = 8 },
     .impl = { .min_access_size = 4, .max_access_size = 4 },
-};
-
-
-static const MemoryRegionOps mt6895_atf_uart_ops = {
-    .read = mt6895_atf_uart_read,
-    .write = mt6895_atf_uart_write,
-    .endianness = DEVICE_NATIVE_ENDIAN,
-    .valid = { .min_access_size = 1, .max_access_size = 4 },
-};
-
-static const MemoryRegionOps mt6895_atf_uartobj_ops = {
-    .read = mt6895_atf_uartobj_read,
-    .write = mt6895_atf_uartobj_write,
-    .endianness = DEVICE_NATIVE_ENDIAN,
-    .valid = { .min_access_size = 1, .max_access_size = 4 },
 };
 
 /* The payload image's own vtable bytes at 0x02078DE8. */
@@ -8439,7 +8365,10 @@ static int mt6895_rgu_key_val(void)
     if (v < 0) {
         const char *e = getenv("MTK_RGU_KEY");
 
-        v = e ? (int)strtol(e, NULL, 0) : -1;
+        if (!e || !*e) {
+            e = getenv("MTK_BOOT_MODE");
+        }
+        v = (e && *e) ? (int)strtol(e, NULL, 0) : -1;
     }
     /*
      * MTK_RGU_KEY_ONCE=1: only the first boot of this QEMU process sees the
@@ -9836,6 +9765,19 @@ static void mt6895_machine_reset(MachineState *machine, ResetType type)
              */
             mtk_spmi_pmif_set_pmic_reg(s->spmi, 4, 0x0d, 0xff);
             mtk_spmi_pmif_set_pmic_reg(s->spmi, 4, 0x139, 1);
+        }
+        {
+            const char *bm = getenv("MTK_BOOT_MODE");
+
+            if (bm && atoi(bm) == 2) {
+                /*
+                 * Hold MT6363 TOPSTATUS (0x1e) bit 3 (HOMEKEY_DEB, active-low)
+                 * low when recovery boot mode is requested so LK
+                 * detect_key(6) selects RECOVERY_BOOT (g_boot_mode = 2).
+                 * Default normal boot leaves TOPSTATUS at 0x0e (released).
+                 */
+                mtk_spmi_pmif_set_pmic_reg(s->spmi, 4, 0x1e, 0x06);
+            }
         }
     }
     }
@@ -16186,34 +16128,9 @@ static const uint8_t stub_cmd_def[0x80] = {
             memory_region_add_subregion(sysmem, planted[i].base, &s->planted[i]);
         }
         /*
-         * ATF's UART object pointer.
-         *
-         * mtk_console_init loads it from 0x4825ac84 and passes it to the
-         * console-node constructor, whose first check is "cbz x0 -> return 0"
-         * (0x48204d98). That global is BSS and is normally filled in by ATF's
-         * UART driver during cold boot, which this machine never runs -- so
-         * it stays 0, the constructor fails, and mtk_console panics at
-         * mtk_console.c:71. Hand it a scratch buffer inside ATF's own BSS so
-         * the constructor can initialise a real object and the console comes
-         * up.
+         * 0x4825ac84 stays in genuine DRAM so BL31 init_debug_port stores
+         * UART0 (0x11001000) and writes directly to TYPE_MTK_UART.
          */
-        memory_region_init_io(&s->atf_uart_mr, OBJECT(s), &mt6895_atf_uart_ops,
-                              NULL, "mt6895.atf-uart", 4);
-        memory_region_add_subregion(sysmem, 0x4825ac84ULL, &s->atf_uart_mr);
-        memory_region_init_io(&s->atf_uartobj_mr, OBJECT(s),
-                              &mt6895_atf_uartobj_ops, NULL,
-                              "mt6895.atf-uartobj", 0x100);
-        /*
-         * Keep the fake UART object OUT of ATF's BSS and OUT of the EL3
-         * stack area: parking it at 0x4825d000 made xlat report a bogus
-         * region (VA/PA 0x19020000) and panic, and 0x4824a100 sat inside
-         * cpu7's EL3 stack window (0x482469c0 + 7*0x800 = 0x4824a1c0 entry
-         * SP; the stack reaches 0x4824a100), so the warmboot entrypoint's
-         * chain fill/unlock read the fake handler's 0x4825d000 filler and
-         * faulted (r1315). 0x48300000 is just past BL31's reserved window.
-         */
-        memory_region_add_subregion(sysmem, 0x48300000ULL,
-                                    &s->atf_uartobj_mr);
         /*
          * CPC/SMP power controller: the per-CPU power-state register (read by
          * ATF's mt_smp wait), the per-CPU power-on request register, the
@@ -16334,6 +16251,25 @@ static const uint8_t stub_cmd_def[0x80] = {
         }
         memory_region_add_subregion_overlap(sysmem, 0x48600000ULL,
                                             &s->bt_mr, 1);
+        if (getenv("MTK_BOOT_MODE") || getenv("MTK_BTLOG")) {
+            static MemoryRegion bt_gz_mr;
+            static MemoryRegion bt_alias_mr;
+
+            memory_region_init_alias(&bt_gz_mr, OBJECT(s),
+                                     "mt6895.bt-watch-gz", &s->bt_mr,
+                                     0, 0x2000);
+            memory_region_add_subregion_overlap(sysmem,
+                                                MT6895_GZ_VMID1_OFFSET +
+                                                0x48600000ULL,
+                                                &bt_gz_mr, 1);
+            memory_region_init_alias(&bt_alias_mr, OBJECT(s),
+                                     "mt6895.bt-watch-alias", &s->bt_mr,
+                                     0, 0x2000);
+            memory_region_add_subregion_overlap(sysmem,
+                                                MT6895_DRAM_ALIAS_BASE +
+                                                0x48600000ULL,
+                                                &bt_alias_mr, 1);
+        }
 
     }
 

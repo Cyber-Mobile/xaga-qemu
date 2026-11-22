@@ -97,6 +97,13 @@ static uint8_t nvt_mem_read(Nvt36672cState *s, uint32_t addr)
     if (addr == 0x021c51) {
         return 0x00;
     }
+    if (addr >= 0x021c78 && addr < 0x021c78 + 8) {
+        static const uint8_t fw_info[8] = {
+            0x43, 0xBC, 18, 32, 0x04, 0x38, 0x09, 0x9c
+        };
+
+        return fw_info[addr - 0x021c78];
+    }
     return addr < NVT_MEM_SIZE ? s->mem[addr] : 0;
 }
 

@@ -979,8 +979,6 @@ struct Mt6895MachineState {
     MemoryRegion peri_fill_mr;  /* low-priority fill for 0x1000_0000 window */
     MemoryRegion atf_head_mr;   /* write-protected ATF console list head */
     MemoryRegion atf_node_mr;
-    MemoryRegion atf_uart_mr;
-    MemoryRegion atf_uartobj_mr;
     MemoryRegion atf_arg_mr;
     MemoryRegion atf_log_mr;
     MemoryRegion cpc_mr;

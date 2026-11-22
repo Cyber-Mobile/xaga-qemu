@@ -84,8 +84,10 @@ static void mtk_spi_start_xfer(MtkSpiState *s, bool resume)
         uint32_t cmd = s->regs[MTK_SPI_REG_CMD / 4];
         bool tx_dma = (cmd & BIT(11)) != 0;
         bool rx_dma = (cmd & BIT(10)) != 0;
-        uint64_t tx_addr = s->regs[MTK_SPI_REG_TX_SRC / 4];
-        uint64_t rx_addr = s->regs[MTK_SPI_REG_RX_DST / 4];
+        uint64_t tx_addr = (uint64_t)s->regs[MTK_SPI_REG_TX_SRC / 4] |
+                           ((uint64_t)(s->regs[MTK_SPI_REG_TX_SRC64 / 4] & 0xfu) << 32);
+        uint64_t rx_addr = (uint64_t)s->regs[MTK_SPI_REG_RX_DST / 4] |
+                           ((uint64_t)(s->regs[MTK_SPI_REG_RX_DST64 / 4] & 0xfu) << 32);
         uint8_t *txbuf = g_malloc0(nbytes);
         uint8_t *rxbuf = g_malloc0(nbytes);
 
