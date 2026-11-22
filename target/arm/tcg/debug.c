@@ -478,12 +478,12 @@ void arm_debug_excp_handler(CPUState *cs)
             if (mtk_watch_n < 20000) {
                 mtk_watch_n++;
                 fprintf(stderr,
-                        "MTK-ATFWATCH cpu=%u pc=%#llx addr=%#" PRIx64
-                        " len=%#" PRIx64 "\n",
+                        "MTK-ATFWATCH cpu=%u pc=%#llx addr=0x%" PRIx64
+                        " len=0x%" PRIx64 "\n",
                         cs->cpu_index,
                         (unsigned long long)(is_a64(env) ? env->pc
                                                          : env->regs[15]),
-                        wp_hit->hitaddr, wp_hit->len);
+                        (uint64_t)wp_hit->hitaddr, (uint64_t)wp_hit->len);
             }
             /* Fall through: the store commits via the CPU_INTERRUPT_DEBUG
              * re-entry, and the RR loop's guest_debug handling is gated by

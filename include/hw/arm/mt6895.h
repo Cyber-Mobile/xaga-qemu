@@ -500,6 +500,10 @@ static const struct { hwaddr base; hwaddr size; } mt6895_dramc_wins[] = {
 #define MT6895_REGION_PTR_BASE   0x020f3720ULL
 #define MT6895_REGION_PTR_SIZE   0x00000008ULL
 
+/* Legacy I2C compatibility view, ending before the PL log-store globals. */
+#define MT6895_I2C_DESC_BASE     0x020f369cULL
+#define MT6895_I2C_DESC_SIZE     0x94
+
 /*
  * The pointer the RKP path dereferences at 0x0200CFCC. The routine branches
  * past its "+28" step, so this is the word that must be non-zero. Read-only
@@ -1048,8 +1052,8 @@ struct Mt6895MachineState {
     uint32_t slottbl_store[MT6895_SLOTTBL_SIZE / 4];
     MemoryRegion objw;
      uint8_t objw_store[0x20];         /* partition object writes (0x020F4AC8) */
-    MemoryRegion i2c_desc;       /* I2C bus descriptor table (0x020F369C) */
-    uint32_t i2c_desc_store[0xa0 / 4];
+    MemoryRegion i2c_desc;       /* I2C descriptor compatibility view */
+    uint32_t i2c_desc_store[MT6895_I2C_DESC_SIZE / 4];
     MemoryRegion devtbl;         /* payload device table (0x020F48AC) */
     uint32_t devtbl_store[0x210 / 4];
     MemoryRegion rodata;         /* payload .data vtable region overlay */

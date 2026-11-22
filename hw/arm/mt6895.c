@@ -1993,8 +1993,8 @@ static const MemoryRegionOps mt6895_rodata_ops = {
  */
 
 /*
- * The MTK I2C device descriptor table at 0x020F369C: ten entries of 16 bytes,
- * indexed by the device id stored in the driver object at +4.
+ * The MTK I2C descriptor lookup at 0x020F369C uses a 16-byte stride and
+ * the device id stored in the driver object at +4.
  *
  * The poll core at 0x02034414 refuses to start a transfer unless the entry's
  * first byte is non-zero and either byte +1 or byte +0xf is non-zero:
@@ -2011,15 +2011,17 @@ static const MemoryRegionOps mt6895_rodata_ops = {
  * rejected before any register is touched, and the boot later dies in a
  * strcmp data abort with an uninitialised auxadc device object.
  *
- * This overlay supplies an entry for id 5 only; the other ids stay zero,
- * which the same code path treats as "no such bus" rather than as an error.
+ * This compatibility overlay supplies defaults only for id 5. End the
+ * window before 0x020f3730: the preloader owns the following log-store
+ * globals in SRAM. In particular, a byte store to the guard at 0x020f3735
+ * must not affect the separate log allocation gate at 0x020f3734.
  */
 static const uint8_t mt6895_i2c_desc_default[] = {
     /* 0x020F369C: id 0..4 left zero */
     [0x50] = 0x01,   /* id 5 + 0x00: present */
     [0x51] = 0x01,   /* id 5 + 0x01: bus is usable */
     /* 0x020F36F8: id 5 + 0x0c left zero */
-    /* 0x020F36FC: id 6..9 left zero */
+    /* 0x020F36FC onward: no I2C defaults. */
 };
 
 static uint64_t mt6895_i2c_desc_read(void *opaque, hwaddr off, unsigned size)
@@ -10081,6 +10083,12 @@ static void mt6895_create_cpus(Mt6895MachineState *s, Error **errp)
         cs->cpu_index = n;
         object_property_set_int(cpuobj, "mp-affinity",
                                 ms->possible_cpus->cpus[n].arch_id, &error_fatal);
+        /*
+         * DynamIQ cores advertise Aff1 as the core ID and Aff0 as the
+         * thread ID. Keep this MPIDR flag out of the affinity ID used by
+         * the GIC, CPC and PSCI target lookup.
+         */
+        object_property_set_bool(cpuobj, "mpidr-mt", true, &error_fatal);
 
     /*
          * The BootROM runs at EL3, which is also where QEMU leaves an ARMv8
@@ -10104,20 +10112,26 @@ static void mt6895_create_cpus(Mt6895MachineState *s, Error **errp)
         ARM_CPU(cpuobj)->env.cp15.tpidr_el[3] = 0x4824b000ULL + (uint64_t)n * 0x80;
         /*
          * PSCI conduit.  On the real phone there is no QEMU-side PSCI: the
-         * kernel's PSCI calls are HVCs that trap into GenieZone (EL2), which
-         * runs its own PSCI handler and forwards CPU_ON to BL31 with its
-         * per-vCPU stub entry (r1315: GZ issued the only 7 CPU_ON SMCs that
-         * reached EL3).  Leave QEMU's built-in PSCI out of the default boot
-         * (it intercepted the kernel's HVCs and answered ALREADY_ON because
-         * GZ had already powered the cores via CPC, so every secondary
-         * "failed to come online").  MTK_PSCI_HOST=1 restores the legacy
-         * machine-as-PSCI-provider mode for isolated experiments.
+         * kernel's PSCI calls are SMCs that trap into EL3 (DTB method=smc)
+         * and HVCs that trap into GenieZone (EL2), which forwards CPU_ON to
+         * BL31 with its own per-vCPU stub entry (r1315: GZ issued the only 7
+         * CPU_ON SMCs that reached EL3).  The default therefore disables
+         * QEMU's built-in PSCI entirely; MTK_PSCI_HOST=1 restores the legacy
+         * machine-as-PSCI-provider mode and MTK_PSCI_CONDUIT=hvc keeps the
+         * pre-r1315 interception behaviour for the bisect runs.
          */
-        object_property_set_uint(cpuobj, "psci-conduit",
-                                 mt6895_host_psci_mode(ms)
-                                     ? QEMU_PSCI_CONDUIT_SMC
-                                     : QEMU_PSCI_CONDUIT_DISABLED,
-                                 &error_fatal);
+        {
+            uint32_t conduit = QEMU_PSCI_CONDUIT_DISABLED;
+            const char *cenv = getenv("MTK_PSCI_CONDUIT");
+
+            if (mt6895_host_psci_mode(ms)) {
+                conduit = QEMU_PSCI_CONDUIT_SMC;
+            } else if (cenv && !strcmp(cenv, "hvc")) {
+                conduit = QEMU_PSCI_CONDUIT_HVC;
+            }
+            object_property_set_uint(cpuobj, "psci-conduit", conduit,
+                                     &error_fatal);
+        }
 
     /*
          * The MT6895 device tree declares the architected timer at 13 MHz
@@ -14038,7 +14052,7 @@ static const struct {
         { "mt6895.dev-peri_ptp_therm", 0x10315000ULL, 0x1000 },
         { "mt6895.dev-peri_ptp_therm", 0x10316000ULL, 0x1000 },
         { "mt6895.dev-sys_cirq", 0x10350000ULL, 0x1000 },
-        { "mt6895.dev-sys_cirq", 0x10351000ULL, 0x1000 },
+        { "mt6895.dev-miu",      0x10351000ULL, 0x1000 },
         { "mt6895.dev-sys_cirq", 0x10352000ULL, 0x1000 },
         { "mt6895.dev-sys_cirq", 0x10354000ULL, 0x1000 },
         { "mt6895.dev-sys_cirq", 0x10355000ULL, 0x1000 },
@@ -14740,6 +14754,9 @@ static const struct {
         qdev_prop_set_uint32(dev, "size", blocks[i].size);
         /* Names the window in the trace, so accesses can be attributed. */
         qdev_prop_set_string(dev, "name", n);
+        if (!strcmp(n, "mt6895.dev-miu")) {
+            qdev_prop_set_bit(dev, "miu-end-address-readback", true);
+        }
         if (!strcmp(n, "mt6895.pinctrl") && mt6895_dram_is_6g(s)) {
             /*
              * The xaga board pulls the pinctrl DRAM-generation strap high;
@@ -16385,8 +16402,8 @@ static const uint8_t stub_cmd_def[0x80] = {
     memory_region_add_subregion(sysmem, 0x020793d8, &s->secpol);
 
     memory_region_init_io(&s->i2c_desc, OBJECT(s), &mt6895_i2c_desc_ops, s,
-                          "mt6895.i2c-desc", 0xa0);
-    memory_region_add_subregion(sysmem, 0x020f369c, &s->i2c_desc);
+                          "mt6895.i2c-desc", MT6895_I2C_DESC_SIZE);
+    memory_region_add_subregion(sysmem, MT6895_I2C_DESC_BASE, &s->i2c_desc);
 
     memory_region_init_io(&s->name_tbl, OBJECT(s), &mt6895_name_tbl_ops, s,
                           "mt6895.name-tbl", MT6895_NAME_TABLE_SIZE);

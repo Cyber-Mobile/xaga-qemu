@@ -724,7 +724,7 @@ void HELPER(exception_return)(CPUARMState *env, uint64_t new_pc)
         int el = arm_current_el(env);
 
         if (mtk_cpu < 16 &&
-            logged[mtk_cpu] < 14) {
+            logged[mtk_cpu] < 60) {
             logged[mtk_cpu]++;
             fprintf(stderr, "MT6895-ERET c%u#%d el%d pc=%#" PRIx64 " spsr=%#x"
                     " x0=%#" PRIx64 " x1=%#" PRIx64 " x2=%#" PRIx64
@@ -880,6 +880,22 @@ void HELPER(exception_return)(CPUARMState *env, uint64_t new_pc)
         }
     }
 
+    if (cur_el == 2 && return_to_aa64 && extract32(spsr, 2, 2) == 1) {
+        /*
+         * r1315: bounded log of EL2->EL1 returns, i.e. the answers GZ hands
+         * back to the guest after handling a trapped SMC/HVC.  The x0 value
+         * is the SIP/PSCI return the guest consumes.
+         */
+        static int mtk_eret1_n;
+
+        if (mtk_eret1_n < 800) {
+            mtk_eret1_n++;
+            fprintf(stderr, "MTK-RET1#%d pc=%#" PRIx64 " x0=%#" PRIx64
+                    " x1=%#" PRIx64 "\n",
+                    mtk_eret1_n, (uint64_t)new_pc, env->xregs[0],
+                    env->xregs[1]);
+        }
+    }
     aarch64_save_sp(env, cur_el);
 
     arm_clear_exclusive(env);

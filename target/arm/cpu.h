@@ -1070,6 +1070,8 @@ struct ArchCPU {
 
     /* Uniprocessor system with MP extensions */
     bool mp_is_up;
+    /* Report the configured MPIDR_EL1.MT topology feature bit. */
+    bool mpidr_mt;
 
     /* True if we tried kvm_arm_host_cpu_features() during CPU instance_init
      * and the probe failed (so we need to report the error in realize)

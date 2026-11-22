@@ -51,6 +51,7 @@ struct MtkSysconState {
     uint32_t *regs;
     uint32_t size;
     char *name;
+    bool miu_end_address_readback;
     /* Bus-protection request masks; see mtk_syscon_bp_decode(). */
     uint32_t bprot[16];
     /* Hardware-voter clock-gate votes / done acks; see mtk_hwv_cg_decode(). */
@@ -573,6 +574,30 @@ static bool mtk_syscon_trace_on(void)
     return on;
 }
 
+/*
+ * MT6895 MIU primary protection aperture. Each 0x200-byte group has
+ * ordinary range descriptors of four words, with the end high word at +0xc.
+ * BL31 writes bit 15 there as a separate programming flag, not as part of
+ * the end address. Keep the written flag in the backing register; only the
+ * address readback excludes it. The separate enable bitmap at group +0x1d8
+ * retains its own firmware-written state.
+ *
+ * Do not extend this readback to the special final descriptor in each
+ * group, the preceding aperture, or the second write bank: the ordinary
+ * primary descriptors are the ones corroborated by device range logs.
+ */
+static uint32_t mtk_syscon_read_word(MtkSysconState *s, hwaddr offset)
+{
+    uint32_t value = s->regs[offset / 4];
+    hwaddr word = offset & ~3;
+
+    if (s->miu_end_address_readback && word < 3 * 0x200 &&
+        (word & 0x1ff) < 0xf0 && (word & 0xf) == 0xc) {
+        value &= ~(1u << 15);
+    }
+    return value;
+}
+
 static uint64_t mtk_syscon_read(void *opaque, hwaddr offset, unsigned size)
 {
     if (mtk_syscon_trace_on()) {
@@ -768,7 +793,7 @@ static uint64_t mtk_syscon_read(void *opaque, hwaddr offset, unsigned size)
         hwaddr o = offset + i;
 
         if (o + 4 <= s->size) {
-            val |= (uint64_t)s->regs[o / 4] << (8 * i);
+            val |= (uint64_t)mtk_syscon_read_word(s, o) << (8 * i);
         }
     }
     if (size == 4) {
@@ -1279,6 +1304,8 @@ static const Property mtk_syscon_props[] = {
      * impossible to attribute. The machine sets this per window.
      */
     DEFINE_PROP_STRING("name", MtkSysconState, name),
+    DEFINE_PROP_BOOL("miu-end-address-readback", MtkSysconState,
+                     miu_end_address_readback, false),
     DEFINE_PROP_BOOL("lpdd5x-strap", MtkSysconState, lpdd5x_strap, false),
     /* Board pulls the fastmeta pad (GPIO5) high; see the read handler. */
     DEFINE_PROP_BOOL("fastmeta-strap", MtkSysconState, fastmeta_strap, true),

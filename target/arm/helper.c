@@ -3234,6 +3234,9 @@ static uint64_t mpidr_read_val(CPUARMState *env)
 
     if (arm_feature(env, ARM_FEATURE_V7MP)) {
         mpidr |= (1U << 31);
+        if (cpu->mpidr_mt) {
+            mpidr |= (1U << 24);
+        }
         /*
          * Cores which are uniprocessor (non-coherent)
          * but still implement the MP extensions set
@@ -10158,11 +10161,20 @@ void arm_cpu_do_interrupt(CPUState *cs)
         if (mtk_abort64_n < 8) {
             mtk_abort64_n++;
             fprintf(stderr, "MTK-ABORT64 cpu=%u el=%d pc=%#llx vaddr=%#" PRIx64
-                    " synd=%#" PRIx64 "\n",
+                    " synd=%#" PRIx64 " sctlr1=%#" PRIx64 " ttbr0=%#" PRIx64
+                    " hcr=%#" PRIx64 " vttbr=%#" PRIx64 " vtcr=%#" PRIx64
+                    " sctlr2=%#" PRIx64 " ttbr2=%#" PRIx64 "\n",
                     cs->cpu_index, arm_current_el(env),
                     (unsigned long long)last_pc,
                     env->exception.vaddress,
-                    env->exception.syndrome);
+                    env->exception.syndrome,
+                    (unsigned long long)env->cp15.sctlr_el[1],
+                    (unsigned long long)env->cp15.ttbr0_el[1],
+                    (unsigned long long)env->cp15.hcr_el2,
+                    (unsigned long long)env->cp15.vttbr_el2,
+                    (unsigned long long)env->cp15.vtcr_el2,
+                    (unsigned long long)env->cp15.sctlr_el[2],
+                    (unsigned long long)env->cp15.ttbr0_el[2]);
         }
     }
     if (cs->exception_index == EXCP_PREFETCH_ABORT && is_a64(env)) {
@@ -10190,6 +10202,25 @@ void arm_cpu_do_interrupt(CPUState *cs)
                     (unsigned long long)env->cp15.scr_el3);
         }
     }
+    if (cs->exception_index == EXCP_HYP_TRAP && is_a64(env)) {
+        /*
+         * r1315: with GZ's HCR.TSC=1 every guest SMC arrives here (EC=0x1a
+         * HYP trap) instead of EXCP_SMC, so the MTK-SMC trace never saw
+         * them.  Log the arriving fid/args to expose what GZ is asked.
+         */
+        static int mtk_hypt_n;
+
+        if (mtk_hypt_n < 200) {
+            mtk_hypt_n++;
+            fprintf(stderr,
+                    "MTK-HYT cpu=%u pc=%#llx x0=%#" PRIx64 " x1=%#" PRIx64
+                    " x2=%#" PRIx64 " x3=%#" PRIx64 "\n",
+                    cs->cpu_index,
+                    (unsigned long long)last_pc,
+                    env->xregs[0], env->xregs[1], env->xregs[2],
+                    env->xregs[3]);
+        }
+    }
     if (cs->exception_index == EXCP_HVC && is_a64(env) &&
         arm_current_el(env) >= 1) {
         /*
@@ -10205,12 +10236,13 @@ void arm_cpu_do_interrupt(CPUState *cs)
             fprintf(stderr,
                     "MTK-HVC cpu=%u from_el=%d pc=%#llx x0=%#" PRIx64
                     " x1=%#" PRIx64 " x2=%#" PRIx64 " x3=%#" PRIx64
-                    " vttbr=%#" PRIx64 "\n",
+                    " vttbr=%#" PRIx64 " ttbr2=%#" PRIx64 "\n",
                     cs->cpu_index, arm_current_el(env),
                     (unsigned long long)last_pc,
                     env->xregs[0], env->xregs[1], env->xregs[2],
                     env->xregs[3],
-                    (unsigned long long)env->cp15.vttbr_el2);
+                    (unsigned long long)env->cp15.vttbr_el2,
+                    (unsigned long long)env->cp15.ttbr0_el[2]);
         }
     }
 
