@@ -746,8 +746,17 @@ static uint32_t mtk_syscon_read_word(MtkSysconState *s, hwaddr offset)
     value = s->regs[offset / 4];
     hwaddr word = offset & ~3;
 
+    /*
+     * The programming flag BL31 leaves in bit 15 of an end high word is not
+     * part of the address, so the readback clears it.  The range must cover
+     * every descriptor slot: each group holds sixteen 16-byte descriptors and
+     * the last one is the one the MPU hands out to region 16, 32 and 48.  With
+     * the old < 0xf0 bound that slot kept the flag, which the MPU consumer
+     * reads as address bit 43 -- region 32 then looked like it ended at
+     * 0x800d2710000 and the hypervisor rejected the whole unmap set.
+     */
     if (s->miu_end_address_readback && word < 3 * 0x200 &&
-        (word & 0x1ff) < 0xf0 && (word & 0xf) == 0xc) {
+        (word & 0x1ff) < 0x100 && (word & 0xf) == 0xc) {
         value &= ~(1u << 15);
     }
     return value;
