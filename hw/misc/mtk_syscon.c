@@ -64,6 +64,12 @@ struct MtkSysconState {
     bool lpdd5x_strap;
     /* Board pulls the fastmeta pad (GPIO5) high. */
     bool fastmeta_strap;
+    /*
+     * Pads the GPIO controller drives, for the pinctrl window: it defines
+     * the register-bank geometry only.  Zero leaves the window a plain
+     * register file; see mtk_pio_bank().
+     */
+    uint32_t gpios;
 };
 
 static bool mtk_infracfg_b4_ctl;
@@ -586,9 +592,158 @@ static bool mtk_syscon_trace_on(void)
  * group, the preceding aperture, or the second write bank: the ordinary
  * primary descriptors are the ones corroborated by device range logs.
  */
+/*
+ * MT6895 GPIO controller (pinctrl window 0x10005000, 0x1000 bytes).
+ *
+ * The block exposes DIR at +0x000, DOUT at +0x100, DIN at +0x200 and MODE at
+ * +0x300, each register bank occupying a 0x10-byte group whose first word is
+ * the data and whose next two words are write-one aliases:
+ *
+ *     +0x00 data    +0x04 SET    +0x08 CLR
+ *
+ * DIR and DOUT carry one bit per pin (32 pins per word); MODE carries one
+ * 4-bit field per pin (8 pins per word).  MODE additionally has a masked-write
+ * alias at +0x0c (MWR): each nibble's bit 3 enables the write of that pin's
+ * mode in bits [2:0].
+ *
+ * ATF's mtgpio driver spells out DIR/DOUT/DIN/MODE plus SET/CLR and uses the
+ * aliases exactly this way.  LK's bl2_ext programs the DT default GPIO modes
+ * through the MWR alias -- the dtbo entry for GPIO197 lands on
+ * 0x1000530c + (197 >> 3) * 0x10 = 0x1000548c -- while the preloader, bl2_ext
+ * and the vendor pinctrl driver set and clear single mode fields through
+ * +0x04 and +0x08.  Without the aliases those writes land in three unrelated
+ * slots and the mode word keeps reading back zero, which is why scp.ko's
+ * mt_scp_dts_gpio_check() never sees the gpio-vreq pin in mode 1.
+ *
+ * The pad count comes from the vendor DT (gpio-ranges = <&pio 0 0 227>); it
+ * only defines the bank geometry and seeds no register value.
+ */
+#define MTK_PIO_DIR_BASE       0x000
+#define MTK_PIO_DOUT_BASE      0x100
+#define MTK_PIO_MODE_BASE      0x300
+#define MTK_PIO_BANK_STRIDE    0x10
+#define MTK_PIO_REG_SET        0x04
+#define MTK_PIO_REG_CLR        0x08
+#define MTK_PIO_REG_MWR        0x0c
+/* Three mode bits per pin; bit 3 of each nibble is the MWR write enable. */
+#define MTK_PIO_MODE_MASK      0x77777777u
+
+static bool mtk_pio_is_controller(MtkSysconState *s)
+{
+    return s->gpios != 0 && s->name && strstr(s->name, "pinctrl");
+}
+
+/*
+ * Map @offset onto the data word of a modelled bank.  @pins_per_word is 32
+ * for the one-bit banks and 8 for the 4-bit MODE banks.  Returns false when
+ * the offset lies outside every bank, so the caller keeps the plain register
+ * file behaviour there.
+ */
+static bool mtk_pio_bank(MtkSysconState *s, hwaddr offset,
+                         hwaddr *data_off, unsigned *pins_per_word)
+{
+    static const hwaddr bases[] = { MTK_PIO_DIR_BASE, MTK_PIO_DOUT_BASE,
+                                    MTK_PIO_MODE_BASE };
+    static const unsigned pins[] = { 32, 32, 8 };
+    unsigned i;
+
+    if (!mtk_pio_is_controller(s)) {
+        return false;
+    }
+    for (i = 0; i < ARRAY_SIZE(bases); i++) {
+        hwaddr words = DIV_ROUND_UP(s->gpios, pins[i]);
+        hwaddr start = bases[i];
+        hwaddr end = start + words * MTK_PIO_BANK_STRIDE;
+
+        if (offset >= start && offset < end) {
+            uint32_t rel = offset - start;
+
+            *data_off = start + (rel & ~(uint32_t)(MTK_PIO_BANK_STRIDE - 1));
+            *pins_per_word = pins[i];
+            return true;
+        }
+    }
+    return false;
+}
+
+static bool mtk_pio_read(MtkSysconState *s, hwaddr offset, uint32_t *value)
+{
+    hwaddr data_off;
+    unsigned pins_per_word;
+
+    if (!mtk_pio_bank(s, offset, &data_off, &pins_per_word)) {
+        return false;
+    }
+    /* SET/CLR/MWR are write aliases; only the bank's data word reads back. */
+    *value = offset == data_off ? s->regs[data_off / 4] : 0;
+    return true;
+}
+
+static bool mtk_pio_write(MtkSysconState *s, hwaddr offset, uint32_t value)
+{
+    hwaddr data_off;
+    unsigned pins_per_word;
+    uint32_t rel, data;
+
+    if (!mtk_pio_bank(s, offset, &data_off, &pins_per_word)) {
+        return false;
+    }
+    rel = offset - data_off;
+    data = s->regs[data_off / 4];
+
+    if (pins_per_word == 8) {
+        unsigned i;
+
+        switch (rel) {
+        case 0:
+            data = value & MTK_PIO_MODE_MASK;
+            break;
+        case MTK_PIO_REG_SET:
+            data |= value & MTK_PIO_MODE_MASK;
+            break;
+        case MTK_PIO_REG_CLR:
+            data &= ~(value & MTK_PIO_MODE_MASK);
+            break;
+        case MTK_PIO_REG_MWR:
+            for (i = 0; i < 8; i++) {
+                unsigned shift = i * 4;
+
+                if (value & (1u << (shift + 3))) {
+                    data &= ~(7u << shift);
+                    data |= ((value >> shift) & 7u) << shift;
+                }
+            }
+            break;
+        default:
+            return false;
+        }
+    } else {
+        switch (rel) {
+        case 0:
+            data = value;
+            break;
+        case MTK_PIO_REG_SET:
+            data |= value;
+            break;
+        case MTK_PIO_REG_CLR:
+            data &= ~value;
+            break;
+        default:
+            return false;
+        }
+    }
+    s->regs[data_off / 4] = data;
+    return true;
+}
+
 static uint32_t mtk_syscon_read_word(MtkSysconState *s, hwaddr offset)
 {
-    uint32_t value = s->regs[offset / 4];
+    uint32_t value;
+
+    if (mtk_pio_read(s, offset, &value)) {
+        return value;
+    }
+    value = s->regs[offset / 4];
     hwaddr word = offset & ~3;
 
     if (s->miu_end_address_readback && word < 3 * 0x200 &&
@@ -1100,8 +1255,14 @@ static void mtk_syscon_write(void *opaque, hwaddr offset, uint64_t value,
         }
     }
     unsigned int i;
+    /*
+     * A write to a GPIO bank's SET/CLR/MWR alias updates that bank's data
+     * word instead of storing a word of its own, so the plain register
+     * store below must not consume it.
+     */
+    bool pio_handled = size == 4 && mtk_pio_write(s, offset, (uint32_t)value);
 
-    for (i = 0; !efuse_ignored && i < size; i += 4) {
+    for (i = 0; !efuse_ignored && !pio_handled && i < size; i += 4) {
         hwaddr o = offset + i;
 
         if (o + 4 <= s->size) {
@@ -1297,6 +1458,8 @@ static const Property mtk_syscon_props[] = {
     DEFINE_PROP_BOOL("lpdd5x-strap", MtkSysconState, lpdd5x_strap, false),
     /* Board pulls the fastmeta pad (GPIO5) high; see the read handler. */
     DEFINE_PROP_BOOL("fastmeta-strap", MtkSysconState, fastmeta_strap, true),
+    /* Pads behind a GPIO controller window; 0 means plain register file. */
+    DEFINE_PROP_UINT32("gpios", MtkSysconState, gpios, 0),
 };
 
 static void mtk_syscon_class_init(ObjectClass *klass, const void *data)

@@ -14791,6 +14791,14 @@ static const struct {
         if (!strcmp(n, "mt6895.dev-miu")) {
             qdev_prop_set_bit(dev, "miu-end-address-readback", true);
         }
+        if (!strcmp(n, "mt6895.pinctrl")) {
+            /*
+             * The controller drives 227 pads (vendor DT
+             * gpio-ranges = <&pio 0 0 227>); the pin count only defines the
+             * register-bank geometry of the window, it seeds no value.
+             */
+            qdev_prop_set_uint32(dev, "gpios", 227);
+        }
         if (!strcmp(n, "mt6895.pinctrl") && mt6895_dram_is_6g(s)) {
             /*
              * The xaga board pulls the pinctrl DRAM-generation strap high;
