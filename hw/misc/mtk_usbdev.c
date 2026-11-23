@@ -680,6 +680,11 @@ static void usbdev_host_connect(MtkUsbDevState *s)
     s->setup_pending = false;
     s->regs[R_EP0CSR / 4] = 0;
     s->ep_isr = 0;
+    if (s->rxq) {
+        g_byte_array_set_size(s->rxq, 0);
+    }
+    s->rx_armed_addr = 0;
+    s->rx_armed_ms = 0;
     usbdev_log(s, "CONNECTED");
     usbdev_update_irq(s);
 }
@@ -1009,14 +1014,20 @@ static void usbdev_write(void *opaque, hwaddr off, uint64_t value,
         s->regs[idx] = v;
         return;
     case R_TXQCSR1:
-        /* Report the queue as ACTIVE so the driver's start_qmu() poll
-         * succeeds. */
-        s->regs[idx] = (v | QMU_Q_ACTIVE) & ~QMU_Q_STOP;
-        if (v & QMU_Q_START) {
+        if (v & QMU_Q_STOP) {
+            s->qmu_tx_on = false;
+            s->tx_gpd_last = 0;
+            s->regs[idx] = 0;
+        } else if (v & QMU_Q_START) {
+            /* Report the queue as ACTIVE so the driver's start_qmu() poll
+             * succeeds. */
+            s->regs[idx] = (v | QMU_Q_ACTIVE) & ~QMU_Q_STOP;
             s->tx_gpd_last = usbdev_qmu_start_addr(s, true);
+            usbdev_qmu_set_cpr(s, true, s->tx_gpd_last);
             s->qmu_tx_on = true;
             usbdev_tx_kick(s, v);
         } else if (v & QMU_Q_RESUME) {
+            s->regs[idx] = (v | QMU_Q_ACTIVE) & ~QMU_Q_STOP;
             if (!s->tx_gpd_last) {
                 s->tx_gpd_last = usbdev_qmu_start_addr(s, true);
             }
@@ -1024,9 +1035,10 @@ static void usbdev_write(void *opaque, hwaddr off, uint64_t value,
             /* The driver re-arms the queue (RESUME) after it has processed
              * the previous completions and queued new GPDs. */
             usbdev_tx_kick(s, v);
-        }
-        if (v & QMU_Q_STOP) {
-            s->qmu_tx_on = false;
+        } else {
+            s->regs[idx] = (v & ~(QMU_Q_START | QMU_Q_RESUME | QMU_Q_STOP |
+                                  QMU_Q_ACTIVE)) |
+                           (s->qmu_tx_on ? QMU_Q_ACTIVE : 0);
         }
         return;
     case R_TXQCPR1:
@@ -1036,13 +1048,28 @@ static void usbdev_write(void *opaque, hwaddr off, uint64_t value,
         s->regs[idx] = v;
         return;
     case R_RXQCSR1:
-        s->regs[idx] = (v | QMU_Q_ACTIVE) & ~QMU_Q_STOP;
-        if (v & QMU_Q_START) {
-            /* Hardware restarts its current-GPD pointer at the ring base. */
-            s->rx_gpd_next = usbdev_qmu_start_addr(s, false);
-            usbdev_qmu_set_cpr(s, false, s->rx_gpd_next);
-        }
-        if (v & (QMU_Q_START | QMU_Q_RESUME)) {
+        if (v & QMU_Q_STOP) {
+            s->qmu_rx_on = false;
+            s->qmu_ready = false;
+            s->rx_gpd_next = 0;
+            s->rx_armed_addr = 0;
+            s->rx_armed_ms = 0;
+            if (s->rx_timer) {
+                timer_del(s->rx_timer);
+            }
+            if (s->rxq) {
+                g_byte_array_set_size(s->rxq, 0);
+            }
+            s->regs[idx] = 0;
+        } else if (v & (QMU_Q_START | QMU_Q_RESUME)) {
+            s->regs[idx] = (v | QMU_Q_ACTIVE) & ~QMU_Q_STOP;
+            if (v & QMU_Q_START) {
+                /* Hardware restarts its current-GPD pointer at the ring base. */
+                s->rx_gpd_next = usbdev_qmu_start_addr(s, false);
+                usbdev_qmu_set_cpr(s, false, s->rx_gpd_next);
+                s->rx_armed_addr = 0;
+                s->rx_armed_ms = 0;
+            }
             s->qmu_rx_on = true;
             if (!s->qmu_ready) {
                 s->qmu_ready = true;
@@ -1054,9 +1081,10 @@ static void usbdev_write(void *opaque, hwaddr off, uint64_t value,
             if (s->rxq && s->rxq->len) {
                 usbdev_rx_arm_timer(s, 1);
             }
-        }
-        if (v & QMU_Q_STOP) {
-            s->qmu_rx_on = false;
+        } else {
+            s->regs[idx] = (v & ~(QMU_Q_START | QMU_Q_RESUME | QMU_Q_STOP |
+                                  QMU_Q_ACTIVE)) |
+                           (s->qmu_rx_on ? QMU_Q_ACTIVE : 0);
         }
         return;
     case R_RXQCPR1:
