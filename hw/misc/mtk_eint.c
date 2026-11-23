@@ -51,6 +51,7 @@ OBJECT_DECLARE_SIMPLE_TYPE(MtkEintState, MTK_EINT)
 #define MTK_EINT_MASK           0x080
 #define MTK_EINT_MASK_SET       0x0c0
 #define MTK_EINT_MASK_CLR       0x100
+#define MTK_EINT_SENS           0x140
 #define MTK_EINT_SENS_SET       0x180
 #define MTK_EINT_SENS_CLR       0x1c0
 #define MTK_EINT_RAW_STAT       0xa00
@@ -73,6 +74,10 @@ struct MtkEintState {
     uint32_t pend[MTK_EINT_INSTANCES][MTK_EINT_NREGS];
     /* Per-port interrupt mask, 1 = masked. */
     uint32_t mask[MTK_EINT_INSTANCES][MTK_EINT_NREGS];
+    /* Per-port sensitivity, 1 = level-sensitive, 0 = edge-sensitive. */
+    uint32_t sens[MTK_EINT_INSTANCES][MTK_EINT_NREGS];
+    /* Current raw input state per pin for level-sensitive re-latching. */
+    uint32_t raw_level[MTK_EINT_INSTANCES][MTK_EINT_NREGS];
 
     /* Pin wired to GPIO input line 0 (SPMI PMIC RCS line). */
     uint32_t rcs_instance;
@@ -80,6 +85,9 @@ struct MtkEintState {
     /* Touch IRQ line (GPIO input 1). */
     uint32_t touch_instance;
     uint32_t touch_index;
+    /* Sub-PMIC MT6375 IRQ line (GPIO input 2, DT pin 0x74 = inst 1 idx 18). */
+    uint32_t mt6375_instance;
+    uint32_t mt6375_index;
 
     bool trace;
 };
@@ -121,9 +129,11 @@ static uint64_t mtk_eint_read(void *opaque, hwaddr off, unsigned size)
     if (off >= MTK_EINT_RAW_STAT) {
         val = s->pend[inst][(off - MTK_EINT_RAW_STAT) / 4];
     } else if (off < MTK_EINT_MASK) {
-        val = s->pend[inst][off / 4];
+        val = s->pend[inst][off / 4] & ~s->mask[inst][off / 4];
     } else if (off < MTK_EINT_MASK_SET) {
         val = s->mask[inst][(off - MTK_EINT_MASK) / 4];
+    } else if (off >= MTK_EINT_SENS && off < MTK_EINT_SENS_SET) {
+        val = s->sens[inst][(off - MTK_EINT_SENS) / 4];
     } else {
         val = s->regs[inst][off / 4];
     }
@@ -148,17 +158,31 @@ static void mtk_eint_write(void *opaque, hwaddr off, uint64_t value,
     }
 
     if (off >= MTK_EINT_ACK && off < MTK_EINT_MASK) {
-        s->pend[inst][(off - MTK_EINT_ACK) / 4] &= ~v;
+        uint32_t w = (off - MTK_EINT_ACK) / 4;
+        s->pend[inst][w] &= ~v;
+        s->pend[inst][w] |= s->raw_level[inst][w] & s->sens[inst][w];
     } else if (off >= MTK_EINT_MASK_SET && off < MTK_EINT_MASK_CLR) {
         s->mask[inst][(off - MTK_EINT_MASK_SET) / 4] |= v;
-    } else if (off >= MTK_EINT_MASK_CLR && off < 0x140) {
-        s->mask[inst][(off - MTK_EINT_MASK_CLR) / 4] &= ~v;
+    } else if (off >= MTK_EINT_MASK_CLR && off < MTK_EINT_SENS) {
+        uint32_t w = (off - MTK_EINT_MASK_CLR) / 4;
+        s->mask[inst][w] &= ~v;
+        s->pend[inst][w] |= s->raw_level[inst][w] & s->sens[inst][w];
+    } else if (off >= MTK_EINT_SENS && off < MTK_EINT_SENS_SET) {
+        uint32_t w = (off - MTK_EINT_SENS) / 4;
+        s->sens[inst][w] = v;
+        s->pend[inst][w] |= s->raw_level[inst][w] & s->sens[inst][w];
     } else if (off >= MTK_EINT_SENS_SET && off < MTK_EINT_SENS_CLR) {
+        uint32_t w = (off - MTK_EINT_SENS_SET) / 4;
         s->regs[inst][off / 4] = v;
-        s->pend[inst][(off - MTK_EINT_SENS_SET) / 4] &= ~v;
+        s->sens[inst][w] |= v;
+        s->pend[inst][w] &= ~v;
+        s->pend[inst][w] |= s->raw_level[inst][w] & s->sens[inst][w];
     } else if (off >= MTK_EINT_SENS_CLR && off < 0x200) {
+        uint32_t w = (off - MTK_EINT_SENS_CLR) / 4;
         s->regs[inst][off / 4] = v;
-        s->pend[inst][(off - MTK_EINT_SENS_CLR) / 4] &= ~v;
+        s->sens[inst][w] &= ~v;
+        s->pend[inst][w] &= ~v;
+        s->pend[inst][w] |= s->raw_level[inst][w] & s->sens[inst][w];
     } else if (off < MTK_EINT_ACK) {
         /* STAT is read-only. */
     } else {
@@ -186,21 +210,36 @@ static const MemoryRegionOps mtk_eint_ops = {
     },
 };
 
-/* GPIO input 0: the SPMI PMIC RCS interrupt line (pin 243). */
+/* GPIO inputs: 0 = SPMI PMIC RCS (pin 243), 1 = Touch, 2 = MT6375 (pin 0x74). */
 static void mtk_eint_line_in(void *opaque, int n, int level)
 {
     MtkEintState *s = MTK_EINT(opaque);
-    unsigned inst = n == 0 ? s->rcs_instance : s->touch_instance;
-    unsigned index = n == 0 ? s->rcs_index : s->touch_index;
+    unsigned inst;
+    unsigned index;
     uint32_t bit;
+
+    if (n == 0) {
+        inst = s->rcs_instance;
+        index = s->rcs_index;
+    } else if (n == 1) {
+        inst = s->touch_instance;
+        index = s->touch_index;
+    } else if (n == 2) {
+        inst = s->mt6375_instance;
+        index = s->mt6375_index;
+    } else {
+        return;
+    }
 
     if (inst >= MTK_EINT_INSTANCES || index >= 32 * MTK_EINT_NREGS) {
         return;
     }
     bit = 1u << (index & 31);
     if (level) {
+        s->raw_level[inst][index >> 5] |= bit;
         s->pend[inst][index >> 5] |= bit;
     } else {
+        s->raw_level[inst][index >> 5] &= ~bit;
         s->pend[inst][index >> 5] &= ~bit;
     }
     if (s->trace) {
@@ -222,6 +261,8 @@ static void mtk_eint_reset(DeviceState *dev)
             s->regs[i][p] = 0;
             s->pend[i][p] = 0;
             s->mask[i][p] = 0;
+            s->sens[i][p] = 0;
+            s->raw_level[i][p] = 0;
         }
     }
     mtk_eint_update_irq(s);
@@ -250,7 +291,7 @@ static void mtk_eint_realize(DeviceState *dev, Error **errp)
         sysbus_init_mmio(SYS_BUS_DEVICE(dev), &s->bank[i].mr);
     }
     sysbus_init_irq(SYS_BUS_DEVICE(dev), &s->irq);
-    qdev_init_gpio_in(dev, mtk_eint_line_in, 2);
+    qdev_init_gpio_in(dev, mtk_eint_line_in, 3);
 }
 
 static void mtk_eint_class_init(ObjectClass *klass, const void *data)
@@ -261,6 +302,8 @@ static void mtk_eint_class_init(ObjectClass *klass, const void *data)
         DEFINE_PROP_UINT32("rcs-index", MtkEintState, rcs_index, 16),
         DEFINE_PROP_UINT32("touch-instance", MtkEintState, touch_instance, 0),
         DEFINE_PROP_UINT32("touch-index", MtkEintState, touch_index, 0),
+        DEFINE_PROP_UINT32("mt6375-instance", MtkEintState, mt6375_instance, 1),
+        DEFINE_PROP_UINT32("mt6375-index", MtkEintState, mt6375_index, 18),
     };
 
     dc->realize = mtk_eint_realize;

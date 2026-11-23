@@ -18,15 +18,18 @@ OBJECT_DECLARE_SIMPLE_TYPE(MtkI2CState, MTK_I2C)
 
 #define MTK_I2C_FIFO_SIZE 16
 #define MTK_I2C_MMIO_SIZE 0x1000
+#define MTK_I2C_DMA_SIZE  0x80
 
 struct MtkI2CState {
     SysBusDevice parent_obj;
 
     MemoryRegion iomem;
+    MemoryRegion dma_iomem;
     I2CBus *bus;
     qemu_irq irq;
 
     uint32_t regs[MTK_I2C_MMIO_SIZE / 4];
+    uint32_t dma_regs[MTK_I2C_DMA_SIZE / 4];
     uint8_t tx_fifo[MTK_I2C_FIFO_SIZE];
     uint8_t tx_n;
     uint8_t rx_fifo[MTK_I2C_FIFO_SIZE];

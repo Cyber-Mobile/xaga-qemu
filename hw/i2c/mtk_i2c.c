@@ -17,8 +17,8 @@
  *
  * Transfers complete synchronously on the START write and are carried out
  * on a real QEMU I2CBus, so a missing slave produces ACKERR (as on silicon)
- * instead of a timeout.  DMA mode (CONTROL bit2) is not modelled yet; such a
- * transfer is reported as an ACK error and logged under LOG_UNIMP.
+ * instead of a timeout.  36-bit APDMA transfers (CONTROL bit2 + dma_iomem
+ * registers +0x00..+0x58) are supported via address_space_memory.
  *
  * SPDX-License-Identifier: GPL-2.0-or-later
  */
@@ -29,6 +29,8 @@
 #include "hw/core/irq.h"
 #include "hw/core/qdev-properties.h"
 #include "hw/i2c/mtk_i2c.h"
+#include "system/address-spaces.h"
+#include "system/dma.h"
 
 #define R_DATA_PORT        0x00
 #define R_INTR_MASK        0x08
@@ -50,6 +52,21 @@
 #define CTL_RS             (1u << 1)
 #define CTL_DMA_EN         (1u << 2)
 #define CTL_DIR_CHANGE     (1u << 4)
+
+#define R_DMA_INT_FLAG     0x00
+#define R_DMA_INT_EN       0x04
+#define R_DMA_EN           0x08
+#define R_DMA_RST          0x0c
+#define R_DMA_CON          0x18
+#define R_DMA_TX_ADDR      0x1c
+#define R_DMA_RX_ADDR      0x20
+#define R_DMA_TX_LEN       0x24
+#define R_DMA_RX_LEN       0x28
+#define R_DMA_DEBUG_STA    0x50
+#define R_DMA_TX_4G_MODE   0x54
+#define R_DMA_RX_4G_MODE   0x58
+
+#define MTK_I2C_DMA_MAX    4096u
 
 static void mtk_i2c_update_irq(MtkI2CState *s)
 {
@@ -100,6 +117,70 @@ static bool mtk_i2c_do_read(MtkI2CState *s, uint8_t addr7, unsigned len)
     return true;
 }
 
+static bool mtk_i2c_do_dma_write(MtkI2CState *s, uint8_t addr7,
+                                 uint64_t addr, unsigned len)
+{
+    g_autofree uint8_t *buf = NULL;
+    unsigned i;
+
+    if (len > MTK_I2C_DMA_MAX) {
+        qemu_log_mask(LOG_GUEST_ERROR,
+                      "mtk-i2c%u: DMA TX length %u exceeds %u\n",
+                      s->id, len, MTK_I2C_DMA_MAX);
+        return false;
+    }
+    if (len > 0) {
+        buf = g_malloc(len);
+        if (dma_memory_read(&address_space_memory, addr, buf, len,
+                            MEMTXATTRS_UNSPECIFIED) != MEMTX_OK) {
+            qemu_log_mask(LOG_GUEST_ERROR,
+                          "mtk-i2c%u: DMA TX read failed at %#" PRIx64 "\n",
+                          s->id, addr);
+            return false;
+        }
+    }
+    if (i2c_start_send(s->bus, addr7)) {
+        return false;
+    }
+    for (i = 0; i < len; i++) {
+        if (i2c_send(s->bus, buf[i])) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static bool mtk_i2c_do_dma_read(MtkI2CState *s, uint8_t addr7,
+                                uint64_t addr, unsigned len)
+{
+    g_autofree uint8_t *buf = NULL;
+    unsigned i;
+
+    if (len > MTK_I2C_DMA_MAX) {
+        qemu_log_mask(LOG_GUEST_ERROR,
+                      "mtk-i2c%u: DMA RX length %u exceeds %u\n",
+                      s->id, len, MTK_I2C_DMA_MAX);
+        return false;
+    }
+    if (i2c_start_recv(s->bus, addr7)) {
+        return false;
+    }
+    if (len > 0) {
+        buf = g_malloc(len);
+        for (i = 0; i < len; i++) {
+            buf[i] = i2c_recv(s->bus);
+        }
+        if (dma_memory_write(&address_space_memory, addr, buf, len,
+                             MEMTXATTRS_UNSPECIFIED) != MEMTX_OK) {
+            qemu_log_mask(LOG_GUEST_ERROR,
+                          "mtk-i2c%u: DMA RX write failed at %#" PRIx64 "\n",
+                          s->id, addr);
+            return false;
+        }
+    }
+    return true;
+}
+
 static void mtk_i2c_start(MtkI2CState *s)
 {
     uint32_t ctl = s->regs[R_CONTROL / 4];
@@ -117,8 +198,33 @@ static void mtk_i2c_start(MtkI2CState *s)
         nx = 1;
     }
     if (ctl & CTL_DMA_EN) {
-        qemu_log_mask(LOG_UNIMP, "mtk-i2c%u: DMA mode not modelled\n", s->id);
-        ok = false;
+        uint64_t tx_addr = (uint64_t)s->dma_regs[R_DMA_TX_ADDR / 4] |
+                           ((uint64_t)(s->dma_regs[R_DMA_TX_4G_MODE / 4] & 0xfu) << 32);
+        uint64_t rx_addr = (uint64_t)s->dma_regs[R_DMA_RX_ADDR / 4] |
+                           ((uint64_t)(s->dma_regs[R_DMA_RX_4G_MODE / 4] & 0xfu) << 32);
+        unsigned tx_len = s->dma_regs[R_DMA_TX_LEN / 4] & 0xffffu;
+        unsigned rx_len = s->dma_regs[R_DMA_RX_LEN / 4] & 0xffffu;
+
+        if (tx_len == 0 && (!(ctl & CTL_DIR_CHANGE) ? !rd : true)) {
+            tx_len = len;
+        }
+        if (rx_len == 0 && ((ctl & CTL_DIR_CHANGE) || rd)) {
+            rx_len = (ctl & CTL_DIR_CHANGE) ? (aux ? aux : 1) : len;
+        }
+
+        if (ctl & CTL_DIR_CHANGE) {
+            ok = mtk_i2c_do_dma_write(s, addr7, tx_addr, tx_len) &&
+                 mtk_i2c_do_dma_read(s, addr7, rx_addr, rx_len);
+            i2c_end_transfer(s->bus);
+        } else if (rd) {
+            ok = mtk_i2c_do_dma_read(s, addr7, rx_addr, rx_len);
+            i2c_end_transfer(s->bus);
+        } else {
+            ok = mtk_i2c_do_dma_write(s, addr7, tx_addr, tx_len);
+            i2c_end_transfer(s->bus);
+        }
+        s->dma_regs[R_DMA_EN / 4] &= ~1u;
+        s->dma_regs[R_DMA_INT_FLAG / 4] |= 1u;
     } else if (ctl & CTL_DIR_CHANGE) {
         /* write_read: write len bytes, repeated start, read aux bytes */
         s->rx_n = s->rx_rd = 0;
@@ -230,12 +336,65 @@ static const MemoryRegionOps mtk_i2c_ops = {
     .impl = { .min_access_size = 4, .max_access_size = 4 },
 };
 
+static uint64_t mtk_i2c_dma_read(void *opaque, hwaddr off, unsigned size)
+{
+    MtkI2CState *s = opaque;
+
+    off &= ~3ULL;
+    return off < sizeof(s->dma_regs) ? s->dma_regs[off / 4] : 0;
+}
+
+static void mtk_i2c_dma_write(void *opaque, hwaddr off, uint64_t val,
+                              unsigned size)
+{
+    MtkI2CState *s = opaque;
+    uint32_t v = val;
+
+    off &= ~3ULL;
+    if (off >= sizeof(s->dma_regs)) {
+        return;
+    }
+    switch (off) {
+    case R_DMA_INT_FLAG:
+        if (v == 0) {
+            s->dma_regs[R_DMA_INT_FLAG / 4] = 0;
+        } else {
+            s->dma_regs[R_DMA_INT_FLAG / 4] &= ~v;
+        }
+        break;
+    case R_DMA_RST:
+        if (v) {
+            s->dma_regs[R_DMA_INT_FLAG / 4] = 0;
+            s->dma_regs[R_DMA_EN / 4] = 0;
+            s->dma_regs[R_DMA_RST / 4] = 0;
+        }
+        break;
+    case R_DMA_TX_4G_MODE:
+    case R_DMA_RX_4G_MODE:
+        s->dma_regs[off / 4] = v & 0xfu;
+        break;
+    default:
+        s->dma_regs[off / 4] = v;
+        break;
+    }
+}
+
+static const MemoryRegionOps mtk_i2c_dma_ops = {
+    .read = mtk_i2c_dma_read,
+    .write = mtk_i2c_dma_write,
+    .endianness = DEVICE_LITTLE_ENDIAN,
+    .valid = { .min_access_size = 1, .max_access_size = 4 },
+    .impl = { .min_access_size = 4, .max_access_size = 4 },
+};
+
 static void mtk_i2c_reset(DeviceState *dev)
 {
     MtkI2CState *s = MTK_I2C(dev);
 
     memset(s->regs, 0, sizeof(s->regs));
+    memset(s->dma_regs, 0, sizeof(s->dma_regs));
     mtk_i2c_fifo_clear(s);
+    mtk_i2c_update_irq(s);
 }
 
 static void mtk_i2c_realize(DeviceState *dev, Error **errp)
@@ -246,6 +405,9 @@ static void mtk_i2c_realize(DeviceState *dev, Error **errp)
     memory_region_init_io(&s->iomem, OBJECT(dev), &mtk_i2c_ops, s,
                           TYPE_MTK_I2C, MTK_I2C_MMIO_SIZE);
     sysbus_init_mmio(sbd, &s->iomem);
+    memory_region_init_io(&s->dma_iomem, OBJECT(dev), &mtk_i2c_dma_ops, s,
+                          TYPE_MTK_I2C ".dma", MTK_I2C_DMA_SIZE);
+    sysbus_init_mmio(sbd, &s->dma_iomem);
     sysbus_init_irq(sbd, &s->irq);
     s->bus = i2c_init_bus(dev, "i2c");
 }

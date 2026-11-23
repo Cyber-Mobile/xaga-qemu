@@ -55,12 +55,14 @@
 #include "hw/misc/mtk_iommu.h"
 #include "hw/misc/mtk_gce.h"
 #include "hw/i2c/mtk_i2c.h"
+#include "hw/i2c/mt6375.h"
 #include "hw/i2c/bq28z610.h"
 #include "hw/ssi/mtk_spi.h"
 #include "hw/ssi/nvt36672c.h"
 
-/* Set where the EINT controller is created; the touch IRQ is wired to it. */
+/* Set where the EINT controller is created; the touch and MT6375 IRQs are wired to it. */
 static DeviceState *mt6895_eint_dev;
+static DeviceState *mt6895_mt6375_dev;
 static void mt6895_create_spi(Mt6895MachineState *s, Error **errp);
 #include "hw/misc/ktz8863a.h"
 #include "hw/display/mtk_disp.h"
@@ -11002,10 +11004,13 @@ ufs_done:
         };
         DeviceState *eint = qdev_new("mtk-eint");
     fprintf(stderr, "INITMARK INITMARK eint-new\n");
-        /* Board wiring: the touch IRQ line maps to this EINT pin. */
+        /* Board wiring: the touch and MT6375 IRQ lines map to these EINT pins. */
         /* Touch INT: EINT instance 1, index 31 (discovered from the guest own request_irq programming). */
         qdev_prop_set_uint32(eint, "touch-instance", 1);
         qdev_prop_set_uint32(eint, "touch-index", 31);
+        /* MT6375 INT: FDT pin 0x74 (116) -> instance 1, index 18. */
+        qdev_prop_set_uint32(eint, "mt6375-instance", 1);
+        qdev_prop_set_uint32(eint, "mt6375-index", 18);
 
         mt6895_eint_dev = eint;
         size_t ei;
@@ -11020,6 +11025,10 @@ ufs_done:
                            qdev_get_gpio_in(s->gic, 259));
         sysbus_connect_irq(SYS_BUS_DEVICE(s->spmi), 0,
                            qdev_get_gpio_in(eint, 0));
+        if (mt6895_mt6375_dev) {
+            qdev_connect_gpio_out(mt6895_mt6375_dev, 0,
+                                  qdev_get_gpio_in(eint, 2));
+        }
         /*
          * Touch stack: SPI controllers + Novatek NT36672C client.  Default ON
          * since r1315: the display/CMDQ defect that originally gated it
@@ -11569,39 +11578,27 @@ static void mt6895_create_i2c(Mt6895MachineState *s, Error **errp)
      */
     if (!MTK_ENV_CACHED("MTK_NO_I2CMODEL")) {
         /*
-         * 0x11280000 (id=5) is NOT modelled here: the preloader's battery
-         * path talks to the sub-PMIC mt6375 (0x34/0x4a) on it and the only
-         * mt6375 we have is the fake register file inside the diagnostic
-         * window.  With a real bus and no mt6375 slave every access ACKERRs
-         * and the preloader loops on "bat NOT exist" (OUT_disp3_1.log).
-         */
-        /*
-         * Address, DT bus number and GIC SPI of every modelled controller.
-         * The SPI numbers are the ones from the i2c nodes' interrupts
-         * property ("interrupts = <0 spi irq-type>"): i2c6@11281000 ->
-         * SPI 150, i2c1..i2c4@11d00000..11d03000 -> 145..148 and
-         * i2c7..i2c9@11d04000..11d06000 -> 151..153.  QEMU GICv3 input lines
-         * take the SPI number unchanged (see include/hw/arm/mt6895.h).
-         *
-         * The kernel driver (drivers/i2c/busses/i2c-mt65xx.c) waits for
-         * msg_complete on that IRQ: with the line unconnected the controller
-         * still ACKs the transfer (INTR_STAT bit0 gets set) but the caller
-         * times out after 2 s - which made every ktz8863a backlight write
-         * stall for ~2 s while holding mtk_crtc->lock.
+         * Address, APDMA channel MMIO, DT bus number and GIC SPI of every
+         * modelled controller: i2c5@11280000 (MT6375 sub-PMIC/TCPC/BC1.2),
+         * i2c6@11281000 (KTZ8863A), i2c1..i2c4@11d00000..11d03000, and
+         * i2c7@11d04000 (BQ28Z610)..i2c9@11d06000.  APDMA channels sit under
+         * 0x11300080..0x113007ff from the FDT node reg pairs.
          */
         static const struct {
             uint64_t addr;
+            uint64_t dma_addr;
             uint32_t id;
             int spi;
         } ctl[] = {
-            { 0x11281000ULL, 6, 150 },
-            { 0x11d00000ULL, 1, 145 },
-            { 0x11d01000ULL, 2, 146 },
-            { 0x11d02000ULL, 3, 147 },
-            { 0x11d03000ULL, 4, 148 },
-            { 0x11d04000ULL, 7, 151 },
-            { 0x11d05000ULL, 8, 152 },
-            { 0x11d06000ULL, 9, 153 },
+            { 0x11280000ULL, 0x11300400ULL, 5, 149 },
+            { 0x11281000ULL, 0x11300480ULL, 6, 150 },
+            { 0x11d00000ULL, 0x11300100ULL, 1, 145 },
+            { 0x11d01000ULL, 0x11300180ULL, 2, 146 },
+            { 0x11d02000ULL, 0x11300280ULL, 3, 147 },
+            { 0x11d03000ULL, 0x11300300ULL, 4, 148 },
+            { 0x11d04000ULL, 0x11300500ULL, 7, 151 },
+            { 0x11d05000ULL, 0x11300600ULL, 8, 152 },
+            { 0x11d06000ULL, 0x11300700ULL, 9, 153 },
         };
 
         for (i = 0; i < ARRAY_SIZE(ctl); i++) {
@@ -11615,6 +11612,12 @@ static void mt6895_create_i2c(Mt6895MachineState *s, Error **errp)
             memory_region_add_subregion_overlap(sysmem, ctl[i].addr,
                                                 sysbus_mmio_get_region(sbd, 0),
                                                 1);
+            memory_region_add_subregion_overlap(sysmem, ctl[i].dma_addr,
+                                                sysbus_mmio_get_region(sbd, 1),
+                                                1);
+            if (ctl[i].addr == 0x11280000ULL) {
+                mt6895_mt6375_dev = mt6375_attach(MTK_I2C(dev)->bus, NULL);
+            }
             if (ctl[i].addr == 0x11281000ULL) {
                 /*
                  * KTZ8863A backlight/bias controller at 7-bit address 0x11.
@@ -12515,8 +12518,16 @@ static void mtk_smpdbg_init(Mt6895MachineState *s)
  *   MTK_KMEM_SCAN   needle to look for
  *   MTK_KMEM_MS     when to scan, default 120000 ms after machine init
  */
+#define MTK_KMEM_MAX_WINDOWS 4
+#define MTK_KMEM_MAX_NEEDLES 4
+
 static QEMUTimer *mtk_kmem_timer;
-static int64_t mtk_kmem_deadline;
+static int64_t mtk_kmem_deadlines[MTK_KMEM_MAX_WINDOWS];
+static int mtk_kmem_nwindows;
+static int mtk_kmem_window_idx;
+static char mtk_kmem_needles[MTK_KMEM_MAX_NEEDLES][128];
+static size_t mtk_kmem_nlens[MTK_KMEM_MAX_NEEDLES];
+static int mtk_kmem_nneedles;
 static bool mtk_kmem_done;
 
 static void mtk_kmem_dump(Mt6895MachineState *s, uint64_t off, uint64_t len)
@@ -12552,58 +12563,134 @@ static void mtk_kmem_dump(Mt6895MachineState *s, uint64_t off, uint64_t len)
 static void mtk_kmem_tick(void *opaque)
 {
     Mt6895MachineState *s = opaque;
-    const char *needle = getenv("MTK_KMEM_SCAN");
+    const char *scan_env = getenv("MTK_KMEM_SCAN");
     uint8_t *ram = memory_region_get_ram_ptr(s->ddr);
     uint64_t size = MACHINE(s)->ram_size;
-    size_t nlen;
+    int needle_hits[MTK_KMEM_MAX_NEEDLES] = { 0 };
+    bool first_char[256] = { false };
+    int per_needle_cap;
+    int active_needles = 0;
     uint64_t off;
     int hits = 0;
+    int i;
     int64_t now = qemu_clock_get_ms(QEMU_CLOCK_REALTIME);
 
-    if (mtk_kmem_done) {
+    if (mtk_kmem_done || mtk_kmem_window_idx >= mtk_kmem_nwindows ||
+        mtk_kmem_nneedles <= 0) {
         return;
     }
-    if (now < mtk_kmem_deadline) {
+    if (now < mtk_kmem_deadlines[mtk_kmem_window_idx]) {
         timer_mod(mtk_kmem_timer, now + 1000);
         return;
     }
-    mtk_kmem_done = true;
-    if (!needle || !*needle) {
-        return;
+
+    for (i = 0; i < mtk_kmem_nneedles; i++) {
+        first_char[(uint8_t)mtk_kmem_needles[i][0]] = true;
     }
-    nlen = strlen(needle);
+    per_needle_cap = (mtk_kmem_nneedles == 1) ? 3 : 2;
+    active_needles = mtk_kmem_nneedles;
+
     fprintf(stderr, "MTK-KLOG: scanning %#" PRIx64 " bytes for \"%s\"\n",
-            size, needle);
-    for (off = 0; off + nlen < size; off++) {
-        if (ram[off] != (uint8_t)needle[0] ||
-            memcmp(ram + off, needle, nlen)) {
+            size, scan_env ? scan_env : mtk_kmem_needles[0]);
+    for (off = 0; off < size && active_needles > 0; off++) {
+        if (!first_char[ram[off]]) {
             continue;
         }
-        hits++;
-        fprintf(stderr, "MTK-KLOG: hit #%d at %#" PRIx64 "\n", hits, off);
-        mtk_kmem_dump(s, off > 0x40000 ? off - 0x40000 : 0, 0x80000);
-        if (hits >= 3) {
-            break;
+        for (i = 0; i < mtk_kmem_nneedles; i++) {
+            size_t nlen = mtk_kmem_nlens[i];
+
+            if (needle_hits[i] >= per_needle_cap ||
+                off + nlen > size ||
+                ram[off] != (uint8_t)mtk_kmem_needles[i][0] ||
+                memcmp(ram + off, mtk_kmem_needles[i], nlen) != 0) {
+                continue;
+            }
+            hits++;
+            needle_hits[i]++;
+            if (needle_hits[i] >= per_needle_cap) {
+                active_needles--;
+            }
+            fprintf(stderr, "MTK-KLOG: hit #%d at %#" PRIx64 " (%s)\n",
+                    hits, off, mtk_kmem_needles[i]);
+            mtk_kmem_dump(s, off > 0x40000 ? off - 0x40000 : 0, 0x80000);
         }
     }
-    fprintf(stderr, "MTK-KLOG: scan done, hits=%d\n", hits);
+
+    mtk_kmem_window_idx++;
+    if (mtk_kmem_window_idx < mtk_kmem_nwindows) {
+        fprintf(stderr, "MTK-KLOG: window %d done, hits=%d\n",
+                mtk_kmem_window_idx, hits);
+        timer_mod(mtk_kmem_timer, qemu_clock_get_ms(QEMU_CLOCK_REALTIME) + 1000);
+    } else {
+        mtk_kmem_done = true;
+        fprintf(stderr, "MTK-KLOG: scan done, hits=%d\n", hits);
+    }
 }
 
 static void mtk_kmem_init(Mt6895MachineState *s)
 {
     const char *e = getenv("MTK_KMEM_SCAN");
     const char *ms = getenv("MTK_KMEM_MS");
+    int64_t now = qemu_clock_get_ms(QEMU_CLOCK_REALTIME);
+    const char *p;
 
     if (!e || !*e) {
         return;
     }
-    mtk_kmem_deadline = qemu_clock_get_ms(QEMU_CLOCK_REALTIME) +
-                        (ms ? strtoll(ms, NULL, 0) : 120000);
+
+    mtk_kmem_nneedles = 0;
+    p = e;
+    while (*p && mtk_kmem_nneedles < MTK_KMEM_MAX_NEEDLES) {
+        const char *sep = strchr(p, '|');
+        size_t raw_len = sep ? (size_t)(sep - p) : strlen(p);
+        if (raw_len > 0) {
+            size_t copy_len = raw_len;
+            if (copy_len >= sizeof(mtk_kmem_needles[0])) {
+                copy_len = sizeof(mtk_kmem_needles[0]) - 1;
+            }
+            memcpy(mtk_kmem_needles[mtk_kmem_nneedles], p, copy_len);
+            mtk_kmem_needles[mtk_kmem_nneedles][copy_len] = '\0';
+            mtk_kmem_nlens[mtk_kmem_nneedles] = copy_len;
+            mtk_kmem_nneedles++;
+        }
+        if (!sep) {
+            break;
+        }
+        p = sep + 1;
+    }
+    if (mtk_kmem_nneedles == 0) {
+        return;
+    }
+
+    mtk_kmem_nwindows = 0;
+    if (ms && *ms) {
+        p = ms;
+        while (*p && mtk_kmem_nwindows < MTK_KMEM_MAX_WINDOWS) {
+            char *end = NULL;
+            int64_t delay = strtoll(p, &end, 0);
+            if (end != p) {
+                mtk_kmem_deadlines[mtk_kmem_nwindows++] = now + delay;
+            }
+            p = strchr(p, ',');
+            if (!p) {
+                break;
+            }
+            p++;
+        }
+    }
+    if (mtk_kmem_nwindows == 0) {
+        mtk_kmem_deadlines[0] = now + 120000;
+        mtk_kmem_nwindows = 1;
+    }
+
+    mtk_kmem_window_idx = 0;
+    mtk_kmem_done = false;
     mtk_kmem_timer = timer_new_ms(QEMU_CLOCK_REALTIME, mtk_kmem_tick, s);
-    timer_mod(mtk_kmem_timer, qemu_clock_get_ms(QEMU_CLOCK_REALTIME) + 1000);
+    timer_mod(mtk_kmem_timer, now + 1000);
     fprintf(stderr, "mt6895: MTK_KMEM_SCAN armed for \"%s\" at +%" PRId64
-            " ms\n", e, mtk_kmem_deadline -
-            qemu_clock_get_ms(QEMU_CLOCK_REALTIME));
+            " ms (%d window(s), %d needle(s))\n", e,
+            mtk_kmem_deadlines[0] - now,
+            mtk_kmem_nwindows, mtk_kmem_nneedles);
 }
 
 /*
@@ -13509,14 +13596,19 @@ static void mt6895_create_syscons(Mt6895MachineState *s, Error **errp)
      * read/write behaviour.  MTK_NO_USBGLUE=1 keeps the plain syscon window.
      */
     if (!MTK_ENV_CACHED("MTK_NO_USBGLUE")) {
-        DeviceState *ippc = qdev_new("mtk-usb-ippc");
+        static const uint64_t ippc_bases[2] = { 0x11203e00ULL, 0x11213e00ULL };
+        size_t ui;
 
-        if (!sysbus_realize(SYS_BUS_DEVICE(ippc), errp)) {
-            return;
+        for (ui = 0; ui < ARRAY_SIZE(ippc_bases); ui++) {
+            DeviceState *ippc = qdev_new("mtk-usb-ippc");
+
+            if (!sysbus_realize(SYS_BUS_DEVICE(ippc), errp)) {
+                return;
+            }
+            memory_region_add_subregion_overlap(
+                get_system_memory(), ippc_bases[ui],
+                sysbus_mmio_get_region(SYS_BUS_DEVICE(ippc), 0), 1);
         }
-        memory_region_add_subregion_overlap(
-            get_system_memory(), 0x11203e00ULL,
-            sysbus_mmio_get_region(SYS_BUS_DEVICE(ippc), 0), 1);
     }
     /*
      * LK fastboot UDC (mtu3 device mode) minimal model.  Env MTK_USBDEV=1
