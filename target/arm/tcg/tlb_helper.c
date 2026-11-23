@@ -241,6 +241,23 @@ void arm_deliver_fault(ARMCPU *cpu, vaddr addr,
     if (fi->stage2) {
         target_el = 2;
         env->cp15.hpfar_el2 = extract64(fi->s2addr, 12, 47) << 4;
+        /*
+         * DIAGNOSTIC (MTK_S2IPA=1): report the intermediate physical address
+         * a stage-2 fault resolved to.  HPFAR only keeps bits [47:12]; the
+         * full IPA and the fault level are what identify which guest region
+         * the hypervisor removed from the stage-2 tables.
+         */
+        if (getenv("MTK_S2IPA")) {
+            static int mtk_s2ipa_n;
+
+            if (mtk_s2ipa_n++ < 96) {
+                fprintf(stderr, "MTK-S2IPA vaddr=%#" HWADDR_PRIx
+                        " ipa=%#" HWADDR_PRIx " level=%d pc=%#" PRIx64
+                        " el=%d\n",
+                        (hwaddr)addr, (hwaddr)fi->s2addr, fi->level,
+                        (uint64_t)env->pc, arm_current_el(env));
+            }
+        }
         if (arm_is_secure_below_el3(env) && fi->s1ns) {
             env->cp15.hpfar_el2 |= HPFAR_NS;
         }
