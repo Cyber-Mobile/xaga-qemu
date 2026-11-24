@@ -58,34 +58,43 @@ struct MtkTinysysMboxState {
 };
 
 /*
- * Minimal SCMI agent.
+ * Minimal SCMI platform responder.
  *
- * Firmware side (research/dts/vendor-mt6895.dts:827): tinysys_mbox@1C351000
- * has two register windows (0x1c351000 / 0x1c361000) and two shared-memory
- * windows (tx 0x1c350000 / rx 0x1c360000, 0x80 bytes each), interrupts
- * GIC_SPI 291/292.  mtk-mbox-mailbox.ko is the transport:
- * tinysys_mbox_send_data writes 1 to window0+0x00 (the doorbell) and
- * tinysys_mbox_rx_interrupt tests window1+0x04 and clears it by writing 1.
- * arm-scmi's mailbox client lays the message out as arm_scmi/shmem.c does:
+ * Firmware side (dts: tinysys_mbox@1C351000): tinysys_mbox has two register
+ * windows (0x1c351000 for TX/A2P chan[0] / GIC_SPI 291, 0x1c361000 for
+ * RX/P2A chan[1] / GIC_SPI 292) and two 0x80-byte shared-memory windows
+ * (0x1c350000 for TX/A2P, 0x1c360000 for RX/P2A). mtk-mbox-mailbox.ko
+ * implements the transport: tinysys_mbox_send_data writes profiling timestamps
+ * at window+0x70/+0x74 and rings the doorbell by writing 1 to window0+0x00,
+ * while tinysys_mbox_rx_interrupt tests window+0x04 and clears it (W1C) with 1
+ * before forwarding to mbox_chan_received_data -> scmi_rx_callback.
  *
+ * Per ARM DEN0056 and Linux arm_scmi/shmem.c:
  *   +0x00 reserved        +0x04 channel_status (bit0 FREE, bit1 ERROR)
- *   +0x10 flags           +0x14 length (header + payload)
- *   +0x18 message header  +0x1c payload[0] = status, then the return values
+ *   +0x10 flags (bit0 INTR) +0x14 length (4-byte header + payload bytes)
+ *   +0x18 message header  +0x1c payload[0] = return status, then return values
  *
- * So a reply is: echo the request header (same protocol/message id and token,
- * type 0), status 0, protocol payload; set CHANNEL_FREE, raise the receive
- * status register and the receive interrupt.  MTK_NO_SCMI=1 turns the agent
- * off and leaves the plain register windows; MTK_SCMILOG=1 logs every reply.
+ * Message header layout (DEN0056):
+ *   [7:0] message_id, [9:8] message_type, [17:10] protocol_id, [27:18] token.
+ *
+ * Synchronous A2P replies are written back in place into the TX shared memory
+ * window (shmem_base): set CHANNEL_FREE, clear message_type [9:8] to 0 while
+ * preserving protocol_id/msg_id/token, status=0 (SCMI_SUCCESS), and payload.
+ * Raise chan[0] IRQ (irq[0], window0+0x04) only when flags bit0 (INTR) is set;
+ * polling transfers inspect CHANNEL_FREE in shmem_base directly.
+ * MTK_NO_SCMI=1 disables the responder; MTK_SCMILOG=1 logs every reply.
  */
-#define MTK_SCMI_OFF_STATUS   0x04
-#define MTK_SCMI_OFF_FLAGS    0x10
-#define MTK_SCMI_OFF_LENGTH   0x14
-#define MTK_SCMI_OFF_HDR      0x18
-#define MTK_SCMI_OFF_PAYLOAD  0x1c
+#define MTK_SCMI_OFF_STATUS          0x04
+#define MTK_SCMI_OFF_FLAGS           0x10
+#define MTK_SCMI_OFF_LENGTH          0x14
+#define MTK_SCMI_OFF_HDR             0x18
+#define MTK_SCMI_OFF_PAYLOAD         0x1c
 
-#define MTK_SCMI_CHAN_FREE    0x1
-#define MTK_SCMI_PROTO_BASE   0x00
-#define MTK_SCMI_PROTO_TINYSYS 0x80
+#define MTK_SCMI_CHAN_FREE           0x1
+#define MTK_SCMI_FLAG_INTR           0x1
+#define MTK_SCMI_PROTO_BASE          0x10
+#define MTK_SCMI_PROTO_TINYSYS       0x80
+#define MTK_SCMI_TINYSYS_NUM_SOURCES 20
 
 static bool mtk_scmi_off(void)
 {
@@ -130,12 +139,11 @@ static unsigned mtk_scmi_fill_payload(MtkTinysysMboxState *s,
     switch (protocol) {
     case MTK_SCMI_PROTO_BASE:
         switch (msg_id) {
-        case 0x0:   /* PROTOCOL_VERSION: request payload is the protocol id */
-            v = ldl_le_p(tx + MTK_SCMI_OFF_PAYLOAD);
-            stl_le_p(pl, v == MTK_SCMI_PROTO_TINYSYS ? 0x00010000 : 0x00020000);
+        case 0x0:   /* PROTOCOL_VERSION */
+            stl_le_p(pl, 0x00020000);
             return 4;
         case 0x1:   /* PROTOCOL_ATTRIBUTES: u8 num_protocols, u8 num_agents */
-            stl_le_p(pl, 2 | (1 << 8));
+            stl_le_p(pl, 1 | (1 << 8));
             return 4;
         case 0x2:   /* PROTOCOL_MESSAGE_ATTRIBUTES */
             stl_le_p(pl, 0);
@@ -146,34 +154,53 @@ static unsigned mtk_scmi_fill_payload(MtkTinysysMboxState *s,
             memcpy(pl, "MTK", 3);
             return 16;
         case 0x5:   /* DISCOVER_IMPLEMENTATION_VERSION */
-            stl_le_p(pl, 0);
+            stl_le_p(pl, 0x00010000);
             return 4;
         case 0x6:   /* DISCOVER_LIST_PROTOCOLS: u32 num_ret, u8 list[] */
             v = ldl_le_p(tx + MTK_SCMI_OFF_PAYLOAD);   /* num_skip */
             if (v == 0) {
                 stl_le_p(pl, 1);
                 pl[4] = MTK_SCMI_PROTO_TINYSYS;
-                return 5;
+                return 8;
             }
             stl_le_p(pl, 0);
             return 4;
         case 0x7:   /* DISCOVER_AGENT */
+            memset(pl, 0, 20);
             stl_le_p(pl, 0);
-            return 4;
+            memcpy(pl + 4, "OSPM", 4);
+            return 20;
         default:    /* NOTIFY_ERRORS / SET_DEVICE_PERMISSIONS / ... */
             return 0;
         }
     case MTK_SCMI_PROTO_TINYSYS:
         /*
-         * Vendor protocol 0x80.  tinysys_scmi_protocol_init sends message 1
-         * with a 4-byte reply and stores it in its private info (the number of
-         * tinysys sources); everything else only needs the status word.
+         * Vendor protocol 0x80 (tinysys-scmi.ko):
+         *   msg 0: PROTOCOL_VERSION (4B)
+         *   msg 1: PROTOCOL_ATTRIBUTES -> num_sources (4B, cb_array[20])
+         *   msg 2: PROTOCOL_MESSAGE_ATTRIBUTES (4B)
+         *   msg 3: TINYSYS_COMMON_SET (status only)
+         *   msg 4: TINYSYS_COMMON_GET (12B state response)
+         *   msg 5: TINYSYS_EVENT_NOTIFY (status only)
          */
-        if (msg_id == 0x1) {
-            stl_le_p(pl, 1);
+        switch (msg_id) {
+        case 0x0:
+            stl_le_p(pl, 0x00010000);
             return 4;
+        case 0x1:
+            stl_le_p(pl, MTK_SCMI_TINYSYS_NUM_SOURCES);
+            return 4;
+        case 0x2:
+            stl_le_p(pl, 0);
+            return 4;
+        case 0x4:
+            memset(pl, 0, 12);
+            return 12;
+        case 0x3:
+        case 0x5:
+        default:
+            return 0;
         }
-        return 0;
     default:
         return 0;
     }
@@ -181,40 +208,41 @@ static unsigned mtk_scmi_fill_payload(MtkTinysysMboxState *s,
 
 static void mtk_scmi_handle(MtkTinysysMboxState *s)
 {
-    uint8_t tx[0x40], rx[0x40], pl[0x28];
-    uint32_t hdr, protocol, msg_id, token, plen;
+    uint8_t tx[0x70], reply[0x70], pl[0x50];
+    uint32_t flags, hdr, protocol, msg_id, token, plen;
 
-    memset(rx, 0, sizeof(rx));
+    memset(reply, 0, sizeof(reply));
     memset(pl, 0, sizeof(pl));
     mtk_scmi_shmem_read(s, s->shmem_base, tx, sizeof(tx));
 
+    flags = ldl_le_p(tx + MTK_SCMI_OFF_FLAGS);
     hdr = ldl_le_p(tx + MTK_SCMI_OFF_HDR);
-    protocol = (hdr >> 8) & 0xff;
     msg_id = hdr & 0xff;
+    protocol = (hdr >> 10) & 0xff;
     token = (hdr >> 18) & 0x3ff;
 
     plen = mtk_scmi_fill_payload(s, tx, protocol, msg_id, pl);
+    if (plen > sizeof(pl)) {
+        plen = sizeof(pl);
+    }
 
-    stl_le_p(rx + MTK_SCMI_OFF_STATUS, MTK_SCMI_CHAN_FREE);
-    stl_le_p(rx + MTK_SCMI_OFF_LENGTH, 8 + plen);
-    stl_le_p(rx + MTK_SCMI_OFF_HDR, (hdr & ~(3u << 16)) | (token << 18));
-    stl_le_p(rx + MTK_SCMI_OFF_PAYLOAD, 0);            /* status: success */
-    memcpy(rx + MTK_SCMI_OFF_PAYLOAD + 4, pl, plen);
-    mtk_scmi_shmem_write(s, s->shmem_rx_base, rx, sizeof(rx));
+    stl_le_p(reply + MTK_SCMI_OFF_STATUS, MTK_SCMI_CHAN_FREE);
+    stl_le_p(reply + MTK_SCMI_OFF_LENGTH, 8 + plen);
+    stl_le_p(reply + MTK_SCMI_OFF_HDR, hdr & ~(3u << 8));
+    stl_le_p(reply + MTK_SCMI_OFF_PAYLOAD, 0);         /* status: success */
+    memcpy(reply + MTK_SCMI_OFF_PAYLOAD + 4, pl, plen);
+    mtk_scmi_shmem_write(s, s->shmem_base, reply, sizeof(reply));
 
-    /* Release the transmit channel so the next transfer can start. */
-    stl_le_p(tx + MTK_SCMI_OFF_STATUS, MTK_SCMI_CHAN_FREE);
-    mtk_scmi_shmem_write(s, s->shmem_base + MTK_SCMI_OFF_STATUS,
-                         tx + MTK_SCMI_OFF_STATUS, 4);
-
-    s->regs_rx[MTK_SCMI_OFF_STATUS / 4] = 1;
-    qemu_set_irq(s->irq[1], 1);
+    if (flags & MTK_SCMI_FLAG_INTR) {
+        s->regs[MTK_SCMI_OFF_STATUS / 4] = 1;
+        qemu_set_irq(s->irq[0], 1);
+    }
     s->scmi_replies++;
 
     if (mtk_scmi_verbose() || s->scmi_replies <= 24) {
-        fprintf(stderr, "MTK-SCMI reply %u: proto=%#x msg=%u token=%u len=%u"
-                " req=%08x %08x %08x\n", s->scmi_replies, protocol, msg_id,
-                token, 8 + plen,
+        fprintf(stderr, "MTK-SCMI reply %u: proto=%#x msg=%u token=%u"
+                " flags=%#x len=%u req=%08x %08x %08x\n",
+                s->scmi_replies, protocol, msg_id, token, flags, 8 + plen,
                 ldl_le_p(tx + MTK_SCMI_OFF_PAYLOAD),
                 ldl_le_p(tx + MTK_SCMI_OFF_PAYLOAD + 4),
                 ldl_le_p(tx + MTK_SCMI_OFF_PAYLOAD + 8));
@@ -297,6 +325,12 @@ static void mtk_tinysys_mbox_write(void *opaque, hwaddr offset, uint64_t value,
             return;
         }
         mtk_tinysys_mbox_echo_char(value);
+    }
+
+    if (offset == MTK_SCMI_OFF_STATUS) {
+        s->regs[MTK_SCMI_OFF_STATUS / 4] = 0;
+        qemu_set_irq(s->irq[0], 0);
+        return;
     }
 
     for (i = 0; i < size; i += 4) {
