@@ -9707,6 +9707,150 @@ static void arm_cpu_do_interrupt_aarch64(CPUState *cs)
      * MTK_INIT_CRASH_TRACE=1: trace Android first-stage init sigaction registration
      * and reboot system call from EL0.
      */
+    /*
+     * DIAGNOSTIC (MTK_SYS_MAP=1): record the first syscall seen for each
+     * distinct (number, pc page) pair after the guest has been up for a
+     * while.  Unlike a full trace this stays cheap and still shows which
+     * code addresses are making syscalls, which is how the boot HAL's
+     * activity can be located without knowing its load address.
+     */
+    {
+        static int mtk_sys_map = -1;
+        static struct { uint64_t key; } seen[512];
+        static int nseen;
+
+        if (mtk_sys_map < 0) {
+            mtk_sys_map = getenv("MTK_SYS_MAP") != NULL;
+        }
+        if (mtk_sys_map && arm_current_el(env) == 0 &&
+            (env->exception.syndrome >> 26) == 0x15 &&
+            qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL) >= 200000) {
+            uint64_t key = (env->xregs[8] << 48) ^ ((uint64_t)env->pc >> 12);
+            int found = 0;
+
+            for (int i = 0; i < nseen; i++) {
+                if (seen[i].key == key) {
+                    found = 1;
+                    break;
+                }
+            }
+            if (!found && nseen < 512) {
+                seen[nseen++].key = key;
+                fprintf(stderr, "SYSMAP nr=%" PRIu64 " pc=%#" PRIx64 "\n",
+                        env->xregs[8], (uint64_t)env->pc);
+            }
+        }
+    }
+    /*
+     * DIAGNOSTIC (MTK_HAL_PC=1): log every syscall issued from the boot HAL's
+     * address range.  The HAL starts, opens /dev/block/by-name/misc and never
+     * registers its AIDL interface; its last syscall is the evidence of where
+     * it blocks.  The range is the one the misc open reports.
+     */
+    {
+        static int mtk_hal_pc = -1;
+
+        if (mtk_hal_pc < 0) {
+            mtk_hal_pc = getenv("MTK_HAL_PC") != NULL;
+        }
+        if (mtk_hal_pc && arm_current_el(env) == 0 &&
+            (env->exception.syndrome >> 26) == 0x15) {
+            uint64_t pc = (uint64_t)env->pc;
+
+            if (pc >= 0x7a00000000ULL && pc < 0x7b00000000ULL) {
+                static int nhp;
+
+                if (nhp++ < 2000) {
+                    fprintf(stderr,
+                            "HALPC nr=%" PRIu64 " a0=%#" PRIx64 " a1=%#" PRIx64
+                            " a2=%#" PRIx64 " a3=%#" PRIx64 " pc=%#" PRIx64
+                            "\n",
+                            env->xregs[8], env->xregs[0], env->xregs[1],
+                            env->xregs[2], env->xregs[3], pc);
+                }
+            }
+        }
+    }
+    /*
+     * DIAGNOSTIC (MTK_IOCTL_PROBE=1): log the block-layer ioctls (the misc
+     * partition size/discard/etc. requests the boot HAL issues while it
+     * initialises) without enabling the general syscall trace.
+     */
+    {
+        static int mtk_ioctl_probe = -1;
+
+        if (mtk_ioctl_probe < 0) {
+            mtk_ioctl_probe = getenv("MTK_IOCTL_PROBE") != NULL;
+        }
+        if (mtk_ioctl_probe && arm_current_el(env) == 0 &&
+            (env->exception.syndrome >> 26) == 0x15 && env->xregs[8] == 29) {
+            uint64_t req = env->xregs[1];
+
+            if ((req >= 0x125d && req <= 0x1280) ||
+                (req & 0xffffff00) == 0x80081200) {
+                fprintf(stderr, "IOCTLP fd=%" PRId64 " req=%#" PRIx64
+                        " arg=%#" PRIx64 " pc=%#" PRIx64 "\n",
+                        (int64_t)env->xregs[0], req, env->xregs[2],
+                        (uint64_t)env->pc);
+            }
+        }
+    }
+    /*
+     * DIAGNOSTIC (MTK_HAL_OPEN=1): log every openat that touches the block
+     * layer, so the storage probes of the boot HAL are visible without the
+     * general syscall trace (which slows the guest enough to stall it).
+     */
+    {
+        static int mtk_hal_open = -1;
+
+        if (mtk_hal_open < 0) {
+            mtk_hal_open = getenv("MTK_HAL_OPEN") != NULL;
+        }
+        if (mtk_hal_open && arm_current_el(env) == 0 &&
+            (env->exception.syndrome >> 26) == 0x15 && env->xregs[8] == 56) {
+            char hp[160] = { 0 };
+
+            if (env->xregs[1]) {
+                cpu_memory_rw_debug(cs, env->xregs[1], (uint8_t *)hp, 159, false);
+            }
+            if (strstr(hp, "/dev/block") || strstr(hp, "bsg") ||
+                strstr(hp, "misc") || strstr(hp, "by-name")) {
+                fprintf(stderr, "HALOPEN path='%s' flags=%#" PRIx64
+                        " pc=%#" PRIx64 "\n",
+                        hp, env->xregs[2], (uint64_t)env->pc);
+            }
+        }
+    }
+    /*
+     * DIAGNOSTIC (MTK_INIT_LOG=1): surface init's own kmsg lines without the
+     * general syscall trace.  The service lifecycle (start/exited), vold's
+     * boot-control lookup and the mount failures are the only userspace
+     * evidence this model can show, and turning the full trace on to get them
+     * slows the guest enough to stall it before the interesting phase.
+     */
+    {
+        static int mtk_init_log = -1;
+
+        if (mtk_init_log < 0) {
+            mtk_init_log = getenv("MTK_INIT_LOG") != NULL;
+        }
+        if (mtk_init_log && arm_current_el(env) == 0 &&
+            (env->exception.syndrome >> 26) == 0x15 && env->xregs[8] == 64) {
+            char b[401] = { 0 };
+            uint64_t len = env->xregs[2];
+
+            if (env->xregs[1] && len) {
+                cpu_memory_rw_debug(cs, env->xregs[1], (uint8_t *)b,
+                                    len > 400 ? 400 : len, false);
+            }
+            if (strstr(b, "init: ") || strstr(b, "vold") ||
+                strstr(b, "IBootControl") || strstr(b, "InitFatalReboot") ||
+                strstr(b, "Failed to mount") ||
+                strstr(b, "exited with status")) {
+                fprintf(stderr, "INITLOG %.400s\n", b);
+            }
+        }
+    }
     {
         static int mtk_init_trace = -1;
 
@@ -9817,12 +9961,25 @@ static void arm_cpu_do_interrupt_aarch64(CPUState *cs)
                                 (int64_t)env->xregs[0], env->xregs[1], env->xregs[2],
                                 (uint64_t)env->pc);
                     } else if (nr == 64) {   /* write */
-                        char buf[201] = {0};
+                        char buf[401] = {0};
                         uint64_t len = env->xregs[2];
 
                         if (env->xregs[1] && len) {
                             cpu_memory_rw_debug(cs, env->xregs[1], (uint8_t *)buf,
-                                                len > 200 ? 200 : len, false);
+                                                len > 400 ? 400 : len, false);
+                        }
+                        /*
+                         * DIAGNOSTIC (MTK_INIT_LOG=1): surface the init
+                         * service lifecycle and the storage/reboot messages
+                         * without spending the general syscall-trace budget.
+                         */
+                        if (getenv("MTK_INIT_LOG") &&
+                            (strstr(buf, "init: ") || strstr(buf, "vold") ||
+                             strstr(buf, "IBootControl") ||
+                             strstr(buf, "InitFatalReboot") ||
+                             strstr(buf, "Failed to mount") ||
+                             strstr(buf, "exited with status"))) {
+                            fprintf(stderr, "INITLOG %.400s\n", buf);
                         }
                         nlogged++;
                         fprintf(stderr, "MTK-SYS write fd=%" PRId64 " len=%" PRIu64
