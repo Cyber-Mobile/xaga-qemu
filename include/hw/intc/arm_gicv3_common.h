@@ -186,11 +186,14 @@ struct GICv3CPUState {
     int pribits; /* number of physical priority bits */
     int prebits; /* number of physical preemption bits */
 
-    /* Current highest priority pending interrupt for this CPU.
-     * This is cached information that can be recalculated from the
-     * real state above; it doesn't need to be migrated.
+    /* Current highest priority pending interrupt per group (maintained by
+     * distributor/redistributor), and effective winning pending interrupt
+     * across groups enabled at the CPU interface.
+     * Both are cached information that can be recalculated from the real state
+     * above; neither needs to be migrated.
      */
     PendingIrq hppi;
+    PendingIrq hppi_grp[3];
 
     /*
      * Cached information recalculated from LPI tables
@@ -202,7 +205,7 @@ struct GICv3CPUState {
     PendingIrq hppvlpi;
 
     /* This is temporary working state, to avoid a malloc in gicv3_update() */
-    bool seenbetter;
+    bool seenbetter[3];
 
     /*
      * Whether the CPU interface has NMI support (FEAT_GICv3_NMI). The

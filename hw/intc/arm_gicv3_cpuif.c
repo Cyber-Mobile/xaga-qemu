@@ -1044,6 +1044,39 @@ static bool icc_hppi_can_preempt(GICv3CPUState *cs)
     return false;
 }
 
+void gicv3_cpuif_select_hppi(GICv3CPUState *cs)
+{
+    ARMCPU *cpu = ARM_CPU(cs->cpu);
+    CPUARMState *env = &cpu->env;
+    PendingIrq best = { .irq = 0, .prio = 0xff, .grp = GICV3_G0, .nmi = false };
+    int g;
+
+    for (g = 0; g < ARRAY_SIZE(cs->hppi_grp); g++) {
+        PendingIrq cand = cs->hppi_grp[g];
+        int eff_grp = g;
+
+        if (cand.prio == 0xff) {
+            continue;
+        }
+        if (eff_grp == GICV3_G1 && !arm_feature(env, ARM_FEATURE_EL3)) {
+            /* If a Security-enabled GIC sends a G1S interrupt to a
+             * Security-disabled CPU, we must treat it as if it were G0.
+             */
+            eff_grp = GICV3_G0;
+        }
+        if (cs->icc_igrpen[eff_grp] == 0) {
+            continue;
+        }
+        cand.grp = eff_grp;
+        if (cand.prio < best.prio ||
+            (cand.prio == best.prio &&
+             (cand.nmi != best.nmi ? cand.nmi : cand.irq < best.irq))) {
+            best = cand;
+        }
+    }
+    cs->hppi = best;
+}
+
 void gicv3_cpuif_update(GICv3CPUState *cs)
 {
     /* Tell the CPU about its highest priority pending interrupt */
@@ -1055,14 +1088,10 @@ void gicv3_cpuif_update(GICv3CPUState *cs)
 
     g_assert(bql_locked());
 
+    gicv3_cpuif_select_hppi(cs);
+
     trace_gicv3_cpuif_update(gicv3_redist_affid(cs), cs->hppi.irq,
                              cs->hppi.grp, cs->hppi.prio);
-    if (cs->hppi.grp == GICV3_G1 && !arm_feature(env, ARM_FEATURE_EL3)) {
-        /* If a Security-enabled GIC sends a G1S interrupt to a
-         * Security-disabled CPU, we must treat it as if it were G0.
-         */
-        cs->hppi.grp = GICV3_G0;
-    }
 
     if (icc_hppi_can_preempt(cs)) {
         /* We have an interrupt: should we signal it as IRQ or FIQ?
@@ -2448,6 +2477,8 @@ static void icc_reset(CPUARMState *env, const ARMCPRegInfo *ri)
     cs->icc_bpr[GICV3_G1NS] = icc_min_bpr_ns(cs);
     memset(cs->icc_apr, 0, sizeof(cs->icc_apr));
     memset(cs->icc_igrpen, 0, sizeof(cs->icc_igrpen));
+    cs->hppi.prio = 0xff;
+    cs->hppi.nmi = false;
     cs->icc_ctlr_el3 = ICC_CTLR_EL3_NDS | ICC_CTLR_EL3_A3V |
         (1 << ICC_CTLR_EL3_IDBITS_SHIFT) |
         ((cs->pribits - 1) << ICC_CTLR_EL3_PRIBITS_SHIFT);

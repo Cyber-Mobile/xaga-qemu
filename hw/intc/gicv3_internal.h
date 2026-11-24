@@ -735,6 +735,15 @@ void gicv3_init_cpuif(GICv3State *s, Error **errp);
  */
 void gicv3_cpuif_update(GICv3CPUState *cs);
 
+/**
+ * gicv3_cpuif_select_hppi:
+ * @cs: GICv3CPUState for the CPU to update
+ *
+ * Select the highest priority pending interrupt for @cs across interrupt
+ * groups enabled at the CPU interface, updating @cs->hppi.
+ */
+void gicv3_cpuif_select_hppi(GICv3CPUState *cs);
+
 /*
  * gicv3_cpuif_virt_irq_fiq_update:
  * @cs: GICv3CPUState for the CPU to update

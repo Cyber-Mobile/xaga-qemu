@@ -21,24 +21,24 @@
 #include "hw/intc/arm_gicv3.h"
 #include "gicv3_internal.h"
 
-static bool irqbetter(GICv3CPUState *cs, int irq, uint8_t prio, bool nmi)
+static bool irqbetter(const PendingIrq *cur, int irq, uint8_t prio, bool nmi)
 {
     /* Return true if this IRQ at this priority should take
      * precedence over the current recorded highest priority
-     * pending interrupt for this CPU. We also return true if
+     * pending interrupt for this group. We also return true if
      * the current recorded highest priority pending interrupt
      * is the same as this one (a property which the calling code
      * relies on).
      */
-    if (prio != cs->hppi.prio) {
-        return prio < cs->hppi.prio;
+    if (prio != cur->prio) {
+        return prio < cur->prio;
     }
 
     /*
      * The same priority IRQ with non-maskable property should signal to
      * the CPU as it have the priority higher than the labelled 0x80 or 0x00.
      */
-    if (nmi != cs->hppi.nmi) {
+    if (nmi != cur->nmi) {
         return nmi;
     }
 
@@ -46,7 +46,7 @@ static bool irqbetter(GICv3CPUState *cs, int irq, uint8_t prio, bool nmi)
      * IMPDEF choice which of them to signal to the CPU. We choose to
      * signal the one with the lowest interrupt number.
      */
-    if (irq <= cs->hppi.irq) {
+    if (irq <= cur->irq) {
         return true;
     }
     return false;
@@ -177,12 +177,12 @@ static bool gicv3_get_priority(GICv3CPUState *cs, bool is_redist, int irq,
  */
 static void gicv3_redist_update_noirqset(GICv3CPUState *cs)
 {
-    /* Find the highest priority pending interrupt among the
+    /* Find the highest priority pending interrupt per group among the
      * redistributor interrupts (SGIs and PPIs).
      */
-    bool seenbetter = false;
+    bool seenbetter[3] = { false, false, false };
     uint8_t prio;
-    int i;
+    int i, g;
     uint32_t pend;
     bool nmi = false;
 
@@ -193,50 +193,53 @@ static void gicv3_redist_update_noirqset(GICv3CPUState *cs)
 
     if (pend) {
         for (i = 0; i < GIC_INTERNAL; i++) {
-            if (!(pend & (1 << i))) {
+            int grp;
+
+            if (!(pend & (1U << i))) {
                 continue;
             }
+            grp = gicv3_irq_group(cs->gic, cs, i);
             nmi = gicv3_get_priority(cs, true, i, &prio);
-            if (irqbetter(cs, i, prio, nmi)) {
-                cs->hppi.irq = i;
-                cs->hppi.prio = prio;
-                cs->hppi.nmi = nmi;
-                seenbetter = true;
+            if (irqbetter(&cs->hppi_grp[grp], i, prio, nmi)) {
+                cs->hppi_grp[grp].irq = i;
+                cs->hppi_grp[grp].prio = prio;
+                cs->hppi_grp[grp].grp = grp;
+                cs->hppi_grp[grp].nmi = nmi;
+                seenbetter[grp] = true;
             }
         }
-    }
-
-    if (seenbetter) {
-        cs->hppi.grp = gicv3_irq_group(cs->gic, cs, cs->hppi.irq);
     }
 
     if ((cs->gicr_ctlr & GICR_CTLR_ENABLE_LPIS) && cs->gic->lpi_enable &&
         (cs->gic->gicd_ctlr & GICD_CTLR_EN_GRP1NS) &&
         (cs->hpplpi.prio != 0xff)) {
-        if (irqbetter(cs, cs->hpplpi.irq, cs->hpplpi.prio, cs->hpplpi.nmi)) {
-            cs->hppi.irq = cs->hpplpi.irq;
-            cs->hppi.prio = cs->hpplpi.prio;
-            cs->hppi.nmi = cs->hpplpi.nmi;
-            cs->hppi.grp = cs->hpplpi.grp;
-            seenbetter = true;
+        int grp = cs->hpplpi.grp;
+
+        if (irqbetter(&cs->hppi_grp[grp], cs->hpplpi.irq,
+                      cs->hpplpi.prio, cs->hpplpi.nmi)) {
+            cs->hppi_grp[grp] = cs->hpplpi;
+            seenbetter[grp] = true;
         }
     }
 
-    /* If the best interrupt we just found would preempt whatever
-     * was the previous best interrupt before this update, then
+    /* If the best interrupt we just found in a group would preempt whatever
+     * was the previous best interrupt in that group before this update, then
      * we know it's definitely the best one now.
-     * If we didn't find an interrupt that would preempt the previous
-     * best, and the previous best is outside our range (or there was no
-     * previous pending interrupt at all), then that is still valid, and
-     * we leave it as the best.
-     * Otherwise, we need to do a full update (because the previous best
-     * interrupt has reduced in priority and any other interrupt could
-     * now be the new best one).
+     * If for a group we didn't find an interrupt that would preempt the
+     * previous best, and that group's previous best is outside our range
+     * (or there was no previous pending interrupt at all), then that is still
+     * valid, and we leave it as the best.
+     * Otherwise, we need to do a full update (because a group's previous best
+     * interrupt has reduced in priority or changed group and any other
+     * interrupt could now be the new best one).
      */
-    if (!seenbetter && cs->hppi.prio != 0xff &&
-        (cs->hppi.irq < GIC_INTERNAL ||
-         cs->hppi.irq >= GICV3_LPI_INTID_START)) {
-        gicv3_full_update_noirqset(cs->gic);
+    for (g = 0; g < ARRAY_SIZE(cs->hppi_grp); g++) {
+        if (!seenbetter[g] && cs->hppi_grp[g].prio != 0xff &&
+            (cs->hppi_grp[g].irq < GIC_INTERNAL ||
+             cs->hppi_grp[g].irq >= GICV3_LPI_INTID_START)) {
+            gicv3_full_update_noirqset(cs->gic);
+            break;
+        }
     }
 }
 
@@ -256,7 +259,7 @@ void gicv3_redist_update(GICv3CPUState *cs)
  */
 static void gicv3_update_noirqset(GICv3State *s, int start, int len)
 {
-    int i;
+    int i, g;
     uint8_t prio;
     uint32_t pend = 0;
     bool nmi = false;
@@ -265,19 +268,22 @@ static void gicv3_update_noirqset(GICv3State *s, int start, int len)
     assert(len > 0);
 
     for (i = 0; i < s->num_cpu; i++) {
-        s->cpu[i].seenbetter = false;
+        for (g = 0; g < ARRAY_SIZE(s->cpu[i].seenbetter); g++) {
+            s->cpu[i].seenbetter[g] = false;
+        }
     }
 
-    /* Find the highest priority pending interrupt in this range. */
+    /* Find the highest priority pending interrupt per group in this range. */
     for (i = start; i < start + len; i++) {
         GICv3CPUState *cs;
+        int grp;
 
         if (i == start || (i & 0x1f) == 0) {
             /* Calculate the next 32 bits worth of pending status */
             pend = gicd_int_pending(s, i & ~0x1f);
         }
 
-        if (!(pend & (1 << (i & 0x1f)))) {
+        if (!(pend & (1U << (i & 0x1f)))) {
             continue;
         }
         cs = s->gicd_irouter_target[i];
@@ -287,37 +293,38 @@ static void gicv3_update_noirqset(GICv3State *s, int start, int len)
              */
             continue;
         }
+        grp = gicv3_irq_group(s, cs, i);
         nmi = gicv3_get_priority(cs, false, i, &prio);
-        if (irqbetter(cs, i, prio, nmi)) {
-            cs->hppi.irq = i;
-            cs->hppi.prio = prio;
-            cs->hppi.nmi = nmi;
-            cs->seenbetter = true;
+        if (irqbetter(&cs->hppi_grp[grp], i, prio, nmi)) {
+            cs->hppi_grp[grp].irq = i;
+            cs->hppi_grp[grp].prio = prio;
+            cs->hppi_grp[grp].grp = grp;
+            cs->hppi_grp[grp].nmi = nmi;
+            cs->seenbetter[grp] = true;
         }
     }
 
-    /* If the best interrupt we just found would preempt whatever
-     * was the previous best interrupt before this update, then
+    /* If the best interrupt we just found in a group would preempt whatever
+     * was the previous best interrupt in that group before this update, then
      * we know it's definitely the best one now.
-     * If we didn't find an interrupt that would preempt the previous
-     * best, and the previous best is outside our range (or there was
-     * no previous pending interrupt at all), then that
+     * If for a group we didn't find an interrupt that would preempt the
+     * previous best, and that group's previous best is outside our range
+     * (or there was no previous pending interrupt at all), then that
      * is still valid, and we leave it as the best.
-     * Otherwise, we need to do a full update (because the previous best
-     * interrupt has reduced in priority and any other interrupt could
-     * now be the new best one).
+     * Otherwise, we need to do a full update (because a group's previous best
+     * interrupt has reduced in priority or changed group and any other
+     * interrupt could now be the new best one).
      */
     for (i = 0; i < s->num_cpu; i++) {
         GICv3CPUState *cs = &s->cpu[i];
 
-        if (cs->seenbetter) {
-            cs->hppi.grp = gicv3_irq_group(cs->gic, cs, cs->hppi.irq);
-        }
-
-        if (!cs->seenbetter && cs->hppi.prio != 0xff &&
-            cs->hppi.irq >= start && cs->hppi.irq < start + len) {
-            gicv3_full_update_noirqset(s);
-            break;
+        for (g = 0; g < ARRAY_SIZE(cs->hppi_grp); g++) {
+            if (!cs->seenbetter[g] && cs->hppi_grp[g].prio != 0xff &&
+                cs->hppi_grp[g].irq >= start &&
+                cs->hppi_grp[g].irq < start + len) {
+                gicv3_full_update_noirqset(s);
+                return;
+            }
         }
     }
 }
@@ -340,8 +347,12 @@ void gicv3_full_update_noirqset(GICv3State *s)
     int i;
 
     for (i = 0; i < s->num_cpu; i++) {
-        s->cpu[i].hppi.prio = 0xff;
-        s->cpu[i].hppi.nmi = false;
+        int g;
+
+        for (g = 0; g < ARRAY_SIZE(s->cpu[i].hppi_grp); g++) {
+            s->cpu[i].hppi_grp[g].prio = 0xff;
+            s->cpu[i].hppi_grp[g].nmi = false;
+        }
     }
 
     /* Note that we can guarantee that these functions will not
@@ -411,6 +422,9 @@ static void arm_gicv3_post_load(GICv3State *s)
     gicv3_full_update_noirqset(s);
     /* Repopulate the cache of GICv3CPUState pointers for target CPUs */
     gicv3_cache_all_target_cpustates(s);
+    for (i = 0; i < s->num_cpu; i++) {
+        gicv3_cpuif_select_hppi(&s->cpu[i]);
+    }
 }
 
 static const MemoryRegionOps gic_ops[] = {

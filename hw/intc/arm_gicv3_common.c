@@ -533,6 +533,10 @@ static void arm_gicv3_common_reset_hold(Object *obj, ResetType type)
 
         cs->hppi.prio = 0xff;
         cs->hppi.nmi = false;
+        for (int g = 0; g < ARRAY_SIZE(cs->hppi_grp); g++) {
+            cs->hppi_grp[g].prio = 0xff;
+            cs->hppi_grp[g].nmi = false;
+        }
         cs->hpplpi.prio = 0xff;
         cs->hpplpi.nmi = false;
         cs->hppvlpi.prio = 0xff;
