@@ -70,6 +70,18 @@ struct MtkSysconState {
      * register file; see mtk_pio_bank().
      */
     uint32_t gpios;
+    /*
+     * EMI MPU AID attribute records (dev-miu, 0x10351000).  Software latches a
+     * selector at +0x980, writes the record into a staging window at +0x984
+     * and commits it with a write to the kick register at +0x800; the block
+     * then publishes the committed record through +0x9c8.  The firmware
+     * clears the staging window right after the kick, so without the commit
+     * the record - and the NS-CPU bitmap the exception firmware derives from
+     * it - reads back as zero.
+     */
+    uint32_t mpu_sel;
+    uint32_t mpu_stage[7];
+    uint32_t mpu_rec[256][7];
 };
 
 static bool mtk_infracfg_b4_ctl;
@@ -743,6 +755,24 @@ static uint32_t mtk_syscon_read_word(MtkSysconState *s, hwaddr offset)
     if (mtk_pio_read(s, offset, &value)) {
         return value;
     }
+    if (s->name && !strcmp(s->name, "mt6895.dev-miu") && (offset & 3) == 0) {
+        unsigned sel = s->mpu_sel & 0xff;
+
+        if (offset >= 0x984 && offset < 0x9a0) {
+            return s->mpu_stage[(offset - 0x984) / 4];
+        }
+        if (offset >= 0x9c8 && offset < 0x9e0) {
+            unsigned word = (offset - 0x9c8) / 4 + 1;
+
+            if (MTK_ENV_CACHED("MTK_MIU_PACK") && offset == 0x9c8) {
+                fprintf(stderr, "MIU-REC sel=%#x: %#x %#x %#x %#x %#x %#x\n",
+                        sel, s->mpu_rec[sel][1], s->mpu_rec[sel][2],
+                        s->mpu_rec[sel][3], s->mpu_rec[sel][4],
+                        s->mpu_rec[sel][5], s->mpu_rec[sel][6]);
+            }
+            return s->mpu_rec[sel][word];
+        }
+    }
     value = s->regs[offset / 4];
     hwaddr word = offset & ~3;
 
@@ -1178,6 +1208,20 @@ static void mtk_syscon_write(void *opaque, hwaddr offset, uint64_t value,
      */
     if (s->name && !strcmp(s->name, "vlp_cksys_clk") && offset == 0x200) {
         mtk_vlp_ulposc_con0 = (uint32_t)value;
+    }
+    /*
+     * EMI MPU AID record: latch the selector, stage the seven words, and
+     * commit them when the kick register is written.
+     */
+    if (s->name && !strcmp(s->name, "mt6895.dev-miu") && size == 4) {
+        if (offset == 0x980) {
+            s->mpu_sel = (uint32_t)value & 0xff;
+        } else if (offset >= 0x984 && offset < 0x9a0) {
+            s->mpu_stage[(offset - 0x984) / 4] = (uint32_t)value;
+        } else if (offset == 0x800 && (value & 1)) {
+            memcpy(s->mpu_rec[s->mpu_sel & 0xff], s->mpu_stage,
+                   sizeof s->mpu_stage);
+        }
     }
 
 

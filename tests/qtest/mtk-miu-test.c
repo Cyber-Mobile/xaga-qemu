@@ -112,6 +112,45 @@ static void test_miu_aperture_scope(void)
     qtest_quit(qts);
 }
 
+/* EMI MPU AID records: a write to the kick register commits the staging. */
+static void test_miu_aid_commit(void)
+{
+    QTestState *qts = qtest_init("-machine mt6895 -m 256M -smp 1 -nodefaults");
+    const uint64_t sel = MIU_BASE + 0x980;
+    const uint64_t stg = MIU_BASE + 0x984;
+    const uint64_t kick = MIU_BASE + 0x800;
+    const uint64_t pack = MIU_BASE + 0x9c8;
+
+    /* The vendor firmware programs selector 0xF1 from its static table. */
+    qtest_writel(qts, sel, 0xf1);
+    qtest_writel(qts, stg + 0x04, 0x0300);
+    qtest_writel(qts, stg + 0x08, 0x0000);
+    qtest_writel(qts, stg + 0x0c, 0x003c);
+    qtest_writel(qts, stg + 0x10, 0x33b3);
+    qtest_writel(qts, stg + 0x14, 0x2000);
+    qtest_writel(qts, stg + 0x18, 0x3cfe);
+
+    /* Nothing is published before the kick. */
+    g_assert_cmphex(qtest_readl(qts, pack + 0x00), ==, 0);
+    qtest_writel(qts, kick, 1);
+    g_assert_cmphex(qtest_readl(qts, pack + 0x00), ==, 0x0300);
+    g_assert_cmphex(qtest_readl(qts, pack + 0x04), ==, 0x0000);
+    g_assert_cmphex(qtest_readl(qts, pack + 0x08), ==, 0x003c);
+    g_assert_cmphex(qtest_readl(qts, pack + 0x0c), ==, 0x33b3);
+    g_assert_cmphex(qtest_readl(qts, pack + 0x10), ==, 0x2000);
+    g_assert_cmphex(qtest_readl(qts, pack + 0x14), ==, 0x3cfe);
+
+    /*
+     * The firmware clears the staging window right after the kick; the
+     * committed record must survive, and another selector keeps its own.
+     */
+    qtest_writel(qts, stg + 0x04, 0);
+    g_assert_cmphex(qtest_readl(qts, pack + 0x00), ==, 0x0300);
+    qtest_writel(qts, sel, 0x10);
+    g_assert_cmphex(qtest_readl(qts, pack + 0x00), ==, 0);
+    qtest_quit(qts);
+}
+
 int main(int argc, char **argv)
 {
     g_test_init(&argc, &argv, NULL);
@@ -119,5 +158,6 @@ int main(int argc, char **argv)
     qtest_add_func("/mtk-miu/aperture-scope", test_miu_aperture_scope);
     qtest_add_func("/mtk-miu/last-slot-end-readback",
                    test_miu_last_slot_end_readback);
+    qtest_add_func("/mtk-miu/aid-record-commit", test_miu_aid_commit);
     return g_test_run();
 }
