@@ -42,6 +42,7 @@
 #include "exec/watchpoint.h"
 #include "target/arm/cpu.h"
 #include "target/arm/cpregs.h"
+#include "target/arm/internals.h"
 #include "hw/char/mtk_uart.h"
 #include "hw/misc/mtk_scpsys.h"
 #include "hw/misc/mtk_tinysys_mbox.h"
@@ -116,6 +117,7 @@ extern unsigned mtk_pc_hist_idx;
 #include "exec/watchpoint.h"
 #include "target/arm/cpu.h"
 #include "target/arm/cpregs.h"
+#include "target/arm/internals.h"
 
 /* ---- Boot LUN image format -------------------------------------------------
  *
@@ -10397,11 +10399,7 @@ static void mt6895_kstall_dump(void *opaque)
     Mt6895MachineState *s = opaque;
     static QEMUTimer *t;
     static int64_t period_ms;
-    CPUState *cs = qemu_get_cpu(0);
-    ARMCPU *cpu = ARM_CPU(cs);
-    CPUARMState *env = &cpu->env;
     GICv3State *gs = ARM_GICV3_COMMON(s->gic);
-    GICv3CPUState *c = &gs->cpu[0];
     int64_t vns = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
 
     if (!t) {
@@ -10415,32 +10413,46 @@ static void mt6895_kstall_dump(void *opaque)
         timer_mod(t, qemu_clock_get_ms(QEMU_CLOCK_REALTIME) + period_ms);
         return;
     }
-    fprintf(stderr, "MTK-KSTALL vns=%" PRId64 " cnt=%#" PRIx64
-            " pc=%#" PRIx64 " pstate=%#x daif=%#" PRIx64
-            " ireq=%#x halted=%u\n",
-            vns, (uint64_t)(vns / gt_cntfrq_period_ns(cpu)), env->pc,
-            (unsigned)pstate_read(env), (uint64_t)env->daif,
-            (unsigned)cs->interrupt_request, (unsigned)cs->halted);
-    fprintf(stderr, "MTK-KSTALL  vctl=%#" PRIx64 " vcval=%#" PRIx64
-            " voff=%#" PRIx64 " vexp=%" PRId64 " pctl=%#" PRIx64
-            " pcval=%#" PRIx64 " pexp=%" PRId64 "\n",
-            env->cp15.c14_timer[GTIMER_VIRT].ctl,
-            env->cp15.c14_timer[GTIMER_VIRT].cval,
-            env->cp15.cntvoff_el2,
-            timer_expire_time_ns(cpu->gt_timer[GTIMER_VIRT]),
-            env->cp15.c14_timer[GTIMER_PHYS].ctl,
-            env->cp15.c14_timer[GTIMER_PHYS].cval,
-            timer_expire_time_ns(cpu->gt_timer[GTIMER_PHYS]));
-    fprintf(stderr, "MTK-KSTALL  gicr pend=%#x en=%#x act=%#x lvl=%#x"
-            " grp=%#x mod=%#x waker=%#x hppi=%d/%#x/%d pmr=%#" PRIx64
-            " apr0=%#" PRIx64 " apr1s=%#" PRIx64 " apr1ns=%#" PRIx64
-            " igrpen1ns=%#" PRIx64 " gicd_ctlr=%#x\n",
-            c->gicr_ipendr0, c->gicr_ienabler0, c->gicr_iactiver0, c->level,
-            c->gicr_igroupr0, c->gicr_igrpmodr0, c->gicr_waker,
-            (int)c->hppi.irq, (unsigned)c->hppi.prio, (int)c->hppi.grp,
-            c->icc_pmr_el1, c->icc_apr[GICV3_G0][0], c->icc_apr[GICV3_G1][0],
-            c->icc_apr[GICV3_G1NS][0], c->icc_igrpen[GICV3_G1NS],
-            gs->gicd_ctlr);
+    fprintf(stderr, "MTK-KSTALL-TICK vns=%" PRId64 " gicd_ctlr=%#x\n",
+            vns, gs->gicd_ctlr);
+    for (unsigned ci = 0; ci < MACHINE(s)->smp.cpus; ci++) {
+        CPUState *cs = qemu_get_cpu(ci);
+        ARMCPU *cpu;
+        CPUARMState *env;
+        GICv3CPUState *c;
+
+        if (!cs) {
+            continue;
+        }
+        cpu = ARM_CPU(cs);
+        env = &cpu->env;
+        c = &gs->cpu[ci];
+
+        fprintf(stderr, "MTK-KSTALL cpu=%u pc=%#" PRIx64 " el=%u sec=%u"
+                " pstate=%#x daif=%#" PRIx64 " scr=%#" PRIx64
+                " ireq=%#x halted=%u cnt=%#" PRIx64 "\n",
+                ci, env->pc, (unsigned)arm_current_el(env),
+                (unsigned)arm_is_secure(env), (unsigned)pstate_read(env),
+                (uint64_t)env->daif, (uint64_t)env->cp15.scr_el3,
+                (unsigned)cs->interrupt_request, (unsigned)cs->halted,
+                (uint64_t)(vns / gt_cntfrq_period_ns(cpu)));
+        fprintf(stderr, "MTK-KSTALL cpu=%u sctl=%#" PRIx64 " scval=%#" PRIx64
+                " sexp=%" PRId64 " gicr pend=%#x en=%#x act=%#x lvl=%#x"
+                " grp=%#x mod=%#x p29=%#x waker=%#x hppi=%d/%#x/%d"
+                " pmr=%#" PRIx64 " igrpen=%#" PRIx64 "/%#" PRIx64 "/%#" PRIx64
+                " apr=%#" PRIx64 "/%#" PRIx64 "/%#" PRIx64 "\n",
+                ci, env->cp15.c14_timer[GTIMER_SEC].ctl,
+                env->cp15.c14_timer[GTIMER_SEC].cval,
+                timer_expire_time_ns(cpu->gt_timer[GTIMER_SEC]),
+                c->gicr_ipendr0, c->gicr_ienabler0, c->gicr_iactiver0, c->level,
+                c->gicr_igroupr0, c->gicr_igrpmodr0,
+                (unsigned)c->gicr_ipriorityr[29], c->gicr_waker,
+                (int)c->hppi.irq, (unsigned)c->hppi.prio, (int)c->hppi.grp,
+                c->icc_pmr_el1, c->icc_igrpen[GICV3_G0],
+                c->icc_igrpen[GICV3_G1], c->icc_igrpen[GICV3_G1NS],
+                c->icc_apr[GICV3_G0][0], c->icc_apr[GICV3_G1][0],
+                c->icc_apr[GICV3_G1NS][0]);
+    }
     timer_mod(t, qemu_clock_get_ms(QEMU_CLOCK_REALTIME) + period_ms);
 }
 /* ---- end -dev block ---------------------------------------------- */
