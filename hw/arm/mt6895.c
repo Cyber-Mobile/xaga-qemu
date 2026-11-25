@@ -3192,73 +3192,6 @@ static const MemoryRegionOps mt6895_atfctx_ops = {
     .valid = { .min_access_size = 1, .max_access_size = 8 },
 };
 
-;
-
-/*
- * Write watch on ATF's SIP-dispatch mode flag (0x4825abd8). When it reads as 1
- * the dispatcher routes the crypto SiP call to a real handler; with 0 it falls
- * through to the "unhandled" path. Logging writes shows whether BL31's init
- * ever sets it.
- */
-static uint64_t mt6895_atfflag_read(void *opaque, hwaddr off, unsigned size)
-{
-    Mt6895MachineState *s = opaque;
-    uint8_t *p = mt6895_guest_ptr(s, 0x4825abd8ULL + off, size);
-    uint64_t v = 0;
-    unsigned i;
-
-    {
-        static int n;
-
-        if (n < 10) {
-            n++;
-            fprintf(stderr, "MTK-ATFFLAG-RD off=%#x size=%u\n",
-                    (unsigned)off, size);
-        }
-    }
-    /*
-     * The SiP dispatch mode selects the 64-bit MTK SiP ID table. A real
-     * device running a 64-bit BL33 (LK v2.0) has it set -- LK issues
-     * 0xc2000xxx SiP calls and they are handled on hardware. The vendor
-     * ATF sets it from platform configuration that this model does not
-     * receive (no writer exists in the ATF image and the BL2 hand-off
-     * arguments carry no such field), so report the real-device value.
-     * MTK_DIAG_FLAG0 keeps the old behaviour for comparison.
-     */
-    if (!MTK_ENV_CACHED("MTK_DIAG_FLAG0")) {
-        return 1;
-    }
-    if (!p) {
-        return 0;
-    }
-    for (i = 0; i < size; i++) {
-        v |= (uint64_t)p[i] << (8 * i);
-    }
-    return v;
-}
-
-static void mt6895_atfflag_write(void *opaque, hwaddr off, uint64_t val,
-                                 unsigned size)
-{
-    Mt6895MachineState *s = opaque;
-    uint8_t *p = mt6895_guest_ptr(s, 0x4825abd8ULL + off, size);
-    static int n;
-    unsigned i;
-
-    if (n < 12) {
-        n++;
-        fprintf(stderr, "MTK-ATFFLAG-WR off=%#x val=%#" PRIx64 " size=%u pc=%#"
-                PRIx64 "\n", (unsigned)off, val, size,
-                current_cpu ? (uint64_t)ARM_CPU(current_cpu)->env.regs[15] : 0);
-    }
-    if (!p) {
-        return;
-    }
-    for (i = 0; i < size; i++) {
-        p[i] = (val >> (8 * i)) & 0xff;
-    }
-}
-
 /*
  * DIAGNOSTIC (MTK_BL33_64BIT): BL31 picks the next image's SPSR from bit 4 of
  * the byte at 0x4825b823 (0x48227b38: w1 = 1 - bit4; w1==1 -> SPSR 0x1d3
@@ -3302,14 +3235,6 @@ static const MemoryRegionOps mt6895_bl33flag_ops = {
     .endianness = DEVICE_NATIVE_ENDIAN,
     .valid = { .min_access_size = 1, .max_access_size = 4 },
     .impl = { .min_access_size = 1, .max_access_size = 4 },
-};
-
-static const MemoryRegionOps mt6895_atfflag_ops = {
-    .read = mt6895_atfflag_read,
-    .write = mt6895_atfflag_write,
-    .endianness = DEVICE_NATIVE_ENDIAN,
-    .valid = { .min_access_size = 1, .max_access_size = 8 },
-    .impl = { .min_access_size = 1, .max_access_size = 8 },
 };
 
 /* DIAGNOSTIC (temporary): force the ATF SIP-handler precondition global to
@@ -16779,10 +16704,6 @@ static const uint8_t stub_cmd_def[0x80] = {
             memory_region_add_subregion_overlap(sysmem, 0x4825a8ccULL,
                                                 &s->diagg_mr, 3);
         }
-        memory_region_init_io(&s->atfflag_mr, OBJECT(s), &mt6895_atfflag_ops,
-                              s, "mt6895.atfflag", 4);
-        memory_region_add_subregion_overlap(sysmem, 0x4825abd8ULL,
-                                            &s->atfflag_mr, 2);
         if (MTK_ENV_CACHED("MTK_BL33_64BIT")) {
             memory_region_init_io(&s->bl33flag_mr, OBJECT(s),
                                   &mt6895_bl33flag_ops, s,

@@ -1003,7 +1003,6 @@ struct Mt6895MachineState {
     MemoryRegion atfarg2_mr;
     MemoryRegion atfctx_mr;
     uint64_t atfctx_val;
-    MemoryRegion atfflag_mr;
     MemoryRegion bl33flag_mr;
     /* DISP mutex register block (0x14001000): EN/MUTEX/RST state machine so
      * the vendor DRM driver's hardware mutex acquire (poll MUTEXn bit1) and
