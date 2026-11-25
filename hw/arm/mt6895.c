@@ -47,6 +47,7 @@
 #include "hw/misc/mtk_scpsys.h"
 #include "hw/misc/mtk_tinysys_mbox.h"
 #include "hw/misc/mtk_adsp.h"
+#include "hw/misc/mtk_gpueb.h"
 #include "hw/timer/mtk_systimer.h"
 #include "hw/misc/mtk_ufshci.h"
 #include "hw/misc/mtk_ufs.h"
@@ -2969,48 +2970,8 @@ static const MemoryRegionOps mt6895_adsp_sram_ops = {
 ;
 
 /*
- * GPUEB (RV33 executor) boot mailbox, 0x13c5fd24.
- *
- * LK stages the gpueb_a firmware, writes 3 to +0x8dc to start the core, then
- * polls +0x00 until the firmware reports 0x55667788 ("booted").  The RV33 is
- * not emulated, so model the handshake the way the firmware drives it: the
- * magic appears only after the start command was actually posted, which keeps
- * the protocol meaningful instead of hard-coding a ready status.
+ * GPUEB boot handshake and mbox0 IPI responder live in hw/misc/mtk_gpueb.c.
  */
-#define MT6895_GPUEB_MBOX_BASE  0x13c5fd24ULL
-#define MT6895_GPUEB_MBOX_SIZE  0x1000ULL
-#define MT6895_GPUEB_BOOT_MAGIC 0x55667788u
-#define MT6895_GPUEB_START_OFS  0x8dc
-
-static uint32_t mt6895_gpueb_mbox[MT6895_GPUEB_MBOX_SIZE / 4];
-static bool mt6895_gpueb_started;
-
-static uint64_t mt6895_gpueb_mbox_read(void *opaque, hwaddr off, unsigned size)
-{
-    (void)opaque; (void)size;
-    if (off == 0 && mt6895_gpueb_started) {
-        return MT6895_GPUEB_BOOT_MAGIC;
-    }
-    return mt6895_gpueb_mbox[(off >> 2) & (MT6895_GPUEB_MBOX_SIZE / 4 - 1)];
-}
-
-static void mt6895_gpueb_mbox_write(void *opaque, hwaddr off, uint64_t val,
-                                    unsigned size)
-{
-    (void)opaque; (void)size;
-    mt6895_gpueb_mbox[(off >> 2) & (MT6895_GPUEB_MBOX_SIZE / 4 - 1)] =
-        (uint32_t)val;
-    if (off == MT6895_GPUEB_START_OFS && val) {
-        /* The RV33 would fetch the staged image and then report booted. */
-        mt6895_gpueb_started = true;
-    }
-}
-
-static const MemoryRegionOps mt6895_gpueb_mbox_ops = {
-    .read = mt6895_gpueb_mbox_read,
-    .write = mt6895_gpueb_mbox_write,
-    .endianness = DEVICE_LITTLE_ENDIAN,
-};
 
 /*
  * SPM power-down/power-up request window (0x1c001c40).
@@ -9638,7 +9599,6 @@ static void mt6895_machine_reset(MachineState *machine, ResetType type)
     s->dsi_display_on = false;
     s->dsi_cmdq_ready = false;
     mt6895_hacc2_done = false;
-    mt6895_gpueb_started = false;
     mt6895_spm_req_pending = false;
     if (mt6895_warm_reset_requested) {
         fprintf(stderr, "mt6895: WDT software reset -- devices reset, PMIC/DRAM preserved\n");
@@ -12774,8 +12734,8 @@ static void mtk_smpdbg_init(Mt6895MachineState *s)
  *   MTK_KMEM_SCAN   needle to look for
  *   MTK_KMEM_MS     when to scan, default 120000 ms after machine init
  */
-#define MTK_KMEM_MAX_WINDOWS 4
-#define MTK_KMEM_MAX_NEEDLES 4
+#define MTK_KMEM_MAX_WINDOWS 8
+#define MTK_KMEM_MAX_NEEDLES 16
 
 static QEMUTimer *mtk_kmem_timer;
 static int64_t mtk_kmem_deadlines[MTK_KMEM_MAX_WINDOWS];
@@ -17368,15 +17328,16 @@ static const uint8_t stub_cmd_def[0x80] = {
                     mt6895_adsp_windows[i].stage_va);
         }
     }
-    {
-        static MemoryRegion gpueb_mbox_mr;
-
-        memory_region_init_io(&gpueb_mbox_mr, OBJECT(s),
-                              &mt6895_gpueb_mbox_ops, s,
-                              "mt6895.gpueb_mbox", MT6895_GPUEB_MBOX_SIZE);
-        memory_region_add_subregion_overlap(sysmem, MT6895_GPUEB_MBOX_BASE,
-                                            &gpueb_mbox_mr, 4);
-    }
+    s->gpueb = qdev_new(TYPE_MTK_GPUEB);
+    sysbus_realize_and_unref(SYS_BUS_DEVICE(s->gpueb), &error_fatal);
+    memory_region_add_subregion_overlap(
+        sysmem, MTK_GPUEB_BOOT_BASE,
+        sysbus_mmio_get_region(SYS_BUS_DEVICE(s->gpueb), 0), 4);
+    memory_region_add_subregion_overlap(
+        sysmem, MTK_GPUEB_IRQ_BASE,
+        sysbus_mmio_get_region(SYS_BUS_DEVICE(s->gpueb), 1), 4);
+    sysbus_connect_irq(SYS_BUS_DEVICE(s->gpueb), 0,
+                       qdev_get_gpio_in(s->gic, MTK_GPUEB_SPI));
     {
         static MemoryRegion spm_req_mr;
 

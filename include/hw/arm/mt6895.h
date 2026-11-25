@@ -1116,6 +1116,7 @@ struct Mt6895MachineState {
     DeviceState *ufshci;
     DeviceState *tinysys_mbox;
     DeviceState *adsp;
+    DeviceState *gpueb;
     MemoryRegion pcie_ecam_alias;
     DeviceState *uart[2];
 
