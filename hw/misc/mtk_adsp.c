@@ -200,6 +200,9 @@ static void mtk_adsp_start_core(MtkAdspState *s, unsigned core)
     uint32_t sleep = ldl_le_p(&s->cfg[ADSP_CFG_SLEEP_STATUS]);
     uint32_t c_le = core;
 
+    if (s->trace_enabled) {
+        fprintf(stderr, "MTK-ADSP start core=%u\n", core);
+    }
     sleep &= ~(core == 0 ? ADSP_SLEEP_C0_BITS : ADSP_SLEEP_C1_BITS);
     stl_le_p(&s->cfg[ADSP_CFG_SLEEP_STATUS], sleep);
     stl_le_p(&s->dtcm[core][ADSP_DTCM_WAKELOCK_OFF], 0);
@@ -278,6 +281,17 @@ static void mtk_adsp_cfg_write(void *opaque, hwaddr off, uint64_t val,
     }
 
     mtk_adsp_write_bytes(s->cfg, off, val, size);
+    if (s->trace_enabled && size == 4 &&
+        (off == ADSP_CFG_SW_INT || off == ADSP_CFG_HIFI_IO_CONFIG ||
+         off == ADSP_CFG_CORE0_MEM_PWR || off == ADSP_CFG_CORE1_MEM_PWR ||
+         off == ADSP_CFG_MEM_PWR_ACK || off == ADSP_CFG_SLEEP_STATUS)) {
+        fprintf(stderr,
+                "MTK-ADSP cfg W off=%#x old=%#x val=%#x ldr=%#x pwr0=%#x pwr1=%#x\n",
+                (unsigned)off, old_val, (uint32_t)val,
+                (uint32_t)ldl_le_p(&s->cfg2[ADSP_CFG2_BOOT_LOADER_CTRL]),
+                (uint32_t)ldl_le_p(&s->cfg[ADSP_CFG_CORE0_MEM_PWR]),
+                (uint32_t)ldl_le_p(&s->cfg[ADSP_CFG_CORE1_MEM_PWR]));
+    }
 
     if (!s->responder_enabled || size != 4) {
         return;
@@ -340,6 +354,12 @@ static void mtk_adsp_cfg2_write(void *opaque, hwaddr off, uint64_t val,
         return;
     }
     mtk_adsp_write_bytes(s->cfg2, off, val, size);
+    if (s->trace_enabled && size == 4 &&
+        (off == 0x0004 || off == ADSP_CFG2_BOOT_LOADER_CTRL ||
+         off == 0x4a00)) {
+        fprintf(stderr, "MTK-ADSP cfg2 W off=%#x val=%#x\n",
+                (unsigned)off, (uint32_t)val);
+    }
 }
 
 static const MemoryRegionOps mtk_adsp_cfg2_ops = {
@@ -394,6 +414,10 @@ static void mtk_adsp_mbox_write(void *opaque, hwaddr off, uint64_t val,
     }
 
     if (off == ADSP_MBOX_OFF_SET) {
+        if (s->trace_enabled) {
+            fprintf(stderr, "MTK-ADSP mbox%u SET val=%#x\n",
+                    m, (uint32_t)val);
+        }
         if (!s->responder_enabled) {
             s->mbox_irq_set[m] |= (uint32_t)val;
             stl_le_p(&s->mbox_regs[m][ADSP_MBOX_OFF_SET -
@@ -409,6 +433,10 @@ static void mtk_adsp_mbox_write(void *opaque, hwaddr off, uint64_t val,
         }
     } else if (off == ADSP_MBOX_OFF_CLR) {
         s->mbox_irq_clr[m] &= ~(uint32_t)val;
+        if (s->trace_enabled) {
+            fprintf(stderr, "MTK-ADSP mbox%u CLR val=%#x rem=%#x\n",
+                    m, (uint32_t)val, s->mbox_irq_clr[m]);
+        }
         stl_le_p(&s->mbox_regs[m][ADSP_MBOX_OFF_CLR -
                                   MTK_ADSP_MBOX_DATA_SIZE],
                  s->mbox_irq_clr[m]);
@@ -466,7 +494,7 @@ static void mtk_adsp_realize(DeviceState *dev, Error **errp)
     unsigned i;
 
     s->responder_enabled = !mtk_adsp_env_enabled("MTK_NO_ADSP");
-    s->trace_enabled = mtk_adsp_env_enabled("MTK_ADSPTRACE");
+    s->trace_enabled = mtk_adsp_env_enabled("MTK_ADSP_LOG");
 
     memory_region_init_io(&s->cfg_mr, OBJECT(dev), &mtk_adsp_cfg_ops, s,
                           TYPE_MTK_ADSP ".cfg", MTK_ADSP_CFG_SIZE);
