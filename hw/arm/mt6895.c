@@ -14184,6 +14184,19 @@ static const struct {
          */
         { "mt6895.dev-0d040000", 0x0d040000ULL, 0x1000 },
         /*
+         * MT6895 DebugTop / Bus Tracer / DEM windows from vendor DTS
+         * (research/dts/vendor-mt6895.dts): conninfra.ko
+         * consys_set_if_pinmux_mt6895 reads 0x0d0a0088 (dbg_dem@0d0a0000)
+         * during CONSYS pre-cal power-on.
+         */
+        { "mt6895.dev-bus-tracer-dbgao", 0x0d01a000ULL, 0x1000 },
+        { "mt6895.dev-dbg-cti",          0x0d020000ULL, 0x10000 },
+        { "mt6895.dev-dbg-etr",          0x0d030000ULL, 0x1000 },
+        { "mt6895.dev-bus-tracer-etr",   0x0d041000ULL, 0x3000 },
+        { "mt6895.dev-bus-tracer-etf",   0x0d044000ULL, 0x1000 },
+        { "mt6895.dev-dbg-dem",          0x0d0a0000ULL, 0x10000 },
+        { "mt6895.dev-dbg-mdsys1",       0x0d100000ULL, 0x100000 },
+        /*
          * The twelve HRE (hardware reset engine) latch blocks.
          *
          * 0x0200dbd6 walks a table at 0x02069c64 -- twelve {base, name}
@@ -14544,6 +14557,17 @@ static const struct {
         { "mt6895.dev-consys", 0x18070000ULL, 0x8004 },
         { "mt6895.dev-bt", 0x18800000ULL, 0x1000 },
         { "mt6895.dev-bt", 0x18812000ULL, 0x1000 },
+        /*
+         * CONSYS Wi-Fi (0x184x/0x185x) and BT/BGF (0x188x/0x189x) host CSR
+         * and sysram windows probed by wlan_drv_gen4m_6895.ko and bt_drv_6895.ko.
+         */
+        { "mt6895.dev-consys-wf-top",    0x18400000ULL, 0x1000 },
+        { "mt6895.dev-consys-wf-cfg",    0x184b0000ULL, 0x10000 },
+        { "mt6895.dev-consys-wf-mcu",    0x184c0000ULL, 0x10000 },
+        { "mt6895.dev-consys-wf-misc",   0x184f0000ULL, 0x20000 },
+        { "mt6895.dev-consys-bgf-cfg",   0x18820000ULL, 0x2000 },
+        { "mt6895.dev-consys-bgf-sram",  0x18830000ULL, 0x30000 },
+        { "mt6895.dev-consys-bgf-top",   0x18900000ULL, 0x1000 },
         { "mt6895.dev-gps", 0x18c00000ULL, 0x100000 },
         { "mt6895.dev-apusys_reviser", 0x19001000ULL, 0x1000 },
         { "mt6895.dev-iommu", 0x19010000ULL, 0x1000 },
