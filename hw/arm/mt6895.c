@@ -9592,6 +9592,7 @@ static void mtk_secondary_atf_init(ARMCPU *cpu, unsigned n)
 }
 
 extern uint64_t mtk_bl_params_ptr;
+static void mt6895_dsu_pmu_reset(void);
 
 static void mt6895_machine_reset(MachineState *machine, ResetType type)
 {
@@ -9651,6 +9652,10 @@ static void mt6895_machine_reset(MachineState *machine, ResetType type)
     memset(s->gz_remap_regs, 0, sizeof(s->gz_remap_regs));
     memory_region_set_enabled(&s->gz_ddr_remap, false);
     mt6895_cpc_state_reset();
+    mt6895_dsu_pmu_reset();
+    if (s->direct_boot) {
+        return;
+    }
     {
         bool was_warm = mt6895_warm_reset_requested;
 
@@ -9920,6 +9925,306 @@ static void mt6895_impdef_c15_c2_0_write(CPUARMState *env,
     mtk_impdef_c15_c2_0[env_cpu(env)->cpu_index] = v;
 }
 
+/*
+ * ARM DynamIQ Shared Unit (DSU) PMU cluster registers (ARM DSU TRM
+ * 100453_0401_00_en, section 3.4, op0=3, op1=0, CRn=15, CRm=5..6).
+ * Vendor module arm_dsu_pmu.ko probes CLUSTERPMCR_EL1 (S3_0_C15_C5_0),
+ * CLUSTERPMCEID0/1_EL1, and programs the CLUSTERPM* bank at EL1.
+ * Reporting 6 event counters (N=6) and standard L3/bus/cycle events avoids
+ * EL1 undefined-instruction panics without injecting synthetic behavior.
+ */
+#define MTK_DSU_PMU_NUM_COUNTERS 6U
+#define MTK_DSU_PMU_CNT_MASK     0x8000003fU
+#define MTK_DSU_PMCR_RO_BITS     0x41003000U /* IMP=0x41, IDCODE=0, N=6 */
+#define MTK_DSU_PMCR_RW_MASK     0x11U       /* E (bit 0) | X (bit 4) */
+#define MTK_DSU_PMCEID0_VAL      0x22220000U /* 0x11, 0x15, 0x19, 0x1d */
+#define MTK_DSU_PMCEID1_VAL      0x00000e00U /* 0x29, 0x2a, 0x2b */
+
+static struct {
+    uint32_t pmcr;
+    uint32_t cnten;
+    uint32_t ovs;
+    uint32_t inten;
+    uint32_t mdcr;
+    uint32_t pmselr[MT6895_NUM_CPUS];
+    uint32_t evtyper[MTK_DSU_PMU_NUM_COUNTERS];
+    uint32_t evcntr[MTK_DSU_PMU_NUM_COUNTERS];
+    uint64_t ccntr;
+} mtk_dsu_pmu = {
+    .pmcr = MTK_DSU_PMCR_RO_BITS,
+};
+
+static void mt6895_dsu_pmu_reset(void)
+{
+    memset(&mtk_dsu_pmu, 0, sizeof(mtk_dsu_pmu));
+    mtk_dsu_pmu.pmcr = MTK_DSU_PMCR_RO_BITS;
+}
+
+static uint64_t mtk_dsu_pmcr_read(CPUARMState *env, const ARMCPRegInfo *ri)
+{
+    return mtk_dsu_pmu.pmcr;
+}
+
+static void mtk_dsu_pmcr_write(CPUARMState *env, const ARMCPRegInfo *ri,
+                               uint64_t v)
+{
+    if (v & (1ULL << 1)) {
+        memset(mtk_dsu_pmu.evcntr, 0, sizeof(mtk_dsu_pmu.evcntr));
+    }
+    if (v & (1ULL << 2)) {
+        mtk_dsu_pmu.ccntr = 0;
+    }
+    mtk_dsu_pmu.pmcr = MTK_DSU_PMCR_RO_BITS | ((uint32_t)v & MTK_DSU_PMCR_RW_MASK);
+}
+
+typedef struct {
+    uint32_t *reg;
+    bool is_set;
+} MtkDsuMaskTarget;
+
+static MtkDsuMaskTarget mtk_dsu_mask_target(uint8_t opc2)
+{
+    switch (opc2) {
+    case 1:
+        return (MtkDsuMaskTarget){ &mtk_dsu_pmu.cnten, true };
+    case 2:
+        return (MtkDsuMaskTarget){ &mtk_dsu_pmu.cnten, false };
+    case 3:
+        return (MtkDsuMaskTarget){ &mtk_dsu_pmu.ovs, true };
+    case 4:
+        return (MtkDsuMaskTarget){ &mtk_dsu_pmu.ovs, false };
+    case 6:
+        return (MtkDsuMaskTarget){ &mtk_dsu_pmu.inten, true };
+    case 7:
+        return (MtkDsuMaskTarget){ &mtk_dsu_pmu.inten, false };
+    default:
+        g_assert_not_reached();
+    }
+}
+
+static uint64_t mtk_dsu_mask_read(CPUARMState *env, const ARMCPRegInfo *ri)
+{
+    return *mtk_dsu_mask_target(ri->opc2).reg;
+}
+
+static void mtk_dsu_mask_write(CPUARMState *env, const ARMCPRegInfo *ri,
+                               uint64_t v)
+{
+    MtkDsuMaskTarget t = mtk_dsu_mask_target(ri->opc2);
+    uint32_t bits = (uint32_t)v & MTK_DSU_PMU_CNT_MASK;
+
+    if (t.is_set) {
+        *t.reg |= bits;
+    } else {
+        *t.reg &= ~bits;
+    }
+}
+
+static uint32_t mtk_dsu_pmu_sel(CPUARMState *env)
+{
+    unsigned idx = env_cpu(env)->cpu_index;
+
+    return (idx < MT6895_NUM_CPUS) ? mtk_dsu_pmu.pmselr[idx] : 0;
+}
+
+static uint64_t mtk_dsu_pmselr_read(CPUARMState *env, const ARMCPRegInfo *ri)
+{
+    return mtk_dsu_pmu_sel(env);
+}
+
+static void mtk_dsu_pmselr_write(CPUARMState *env, const ARMCPRegInfo *ri,
+                                 uint64_t v)
+{
+    unsigned idx = env_cpu(env)->cpu_index;
+
+    if (idx < MT6895_NUM_CPUS) {
+        mtk_dsu_pmu.pmselr[idx] = (uint32_t)v & 0x1fU;
+    }
+}
+
+static uint64_t mtk_dsu_ccntr_read(CPUARMState *env, const ARMCPRegInfo *ri)
+{
+    return mtk_dsu_pmu.ccntr;
+}
+
+static void mtk_dsu_ccntr_write(CPUARMState *env, const ARMCPRegInfo *ri,
+                                uint64_t v)
+{
+    mtk_dsu_pmu.ccntr = v;
+}
+
+static uint64_t mtk_dsu_evtyper_read(CPUARMState *env, const ARMCPRegInfo *ri)
+{
+    uint32_t sel = mtk_dsu_pmu_sel(env);
+
+    return (sel < MTK_DSU_PMU_NUM_COUNTERS) ? mtk_dsu_pmu.evtyper[sel] : 0;
+}
+
+static void mtk_dsu_evtyper_write(CPUARMState *env, const ARMCPRegInfo *ri,
+                                  uint64_t v)
+{
+    uint32_t sel = mtk_dsu_pmu_sel(env);
+
+    if (sel < MTK_DSU_PMU_NUM_COUNTERS) {
+        mtk_dsu_pmu.evtyper[sel] = (uint32_t)v & 0x3ffU;
+    }
+}
+
+static uint64_t mtk_dsu_evcntr_read(CPUARMState *env, const ARMCPRegInfo *ri)
+{
+    uint32_t sel = mtk_dsu_pmu_sel(env);
+
+    return (sel < MTK_DSU_PMU_NUM_COUNTERS) ? mtk_dsu_pmu.evcntr[sel] : 0;
+}
+
+static void mtk_dsu_evcntr_write(CPUARMState *env, const ARMCPRegInfo *ri,
+                                 uint64_t v)
+{
+    uint32_t sel = mtk_dsu_pmu_sel(env);
+
+    if (sel < MTK_DSU_PMU_NUM_COUNTERS) {
+        mtk_dsu_pmu.evcntr[sel] = (uint32_t)v;
+    }
+}
+
+static uint64_t mtk_dsu_mdcr_read(CPUARMState *env, const ARMCPRegInfo *ri)
+{
+    return mtk_dsu_pmu.mdcr;
+}
+
+static void mtk_dsu_mdcr_write(CPUARMState *env, const ARMCPRegInfo *ri,
+                               uint64_t v)
+{
+    mtk_dsu_pmu.mdcr = (uint32_t)v;
+}
+
+static const ARMCPRegInfo mtk_dsu_pmu_regs[] = {
+    {
+        .name = "CLUSTERPMCR_EL1",
+        .crn = 15, .crm = 5, .opc0 = 3, .opc1 = 0, .opc2 = 0,
+        .access = PL1_RW,
+        .state = ARM_CP_STATE_AA64,
+        .type = ARM_CP_NO_RAW,
+        .readfn = mtk_dsu_pmcr_read,
+        .writefn = mtk_dsu_pmcr_write,
+    },
+    {
+        .name = "CLUSTERPMCNTENSET_EL1",
+        .crn = 15, .crm = 5, .opc0 = 3, .opc1 = 0, .opc2 = 1,
+        .access = PL1_RW,
+        .state = ARM_CP_STATE_AA64,
+        .type = ARM_CP_NO_RAW,
+        .readfn = mtk_dsu_mask_read,
+        .writefn = mtk_dsu_mask_write,
+    },
+    {
+        .name = "CLUSTERPMCNTENCLR_EL1",
+        .crn = 15, .crm = 5, .opc0 = 3, .opc1 = 0, .opc2 = 2,
+        .access = PL1_RW,
+        .state = ARM_CP_STATE_AA64,
+        .type = ARM_CP_NO_RAW,
+        .readfn = mtk_dsu_mask_read,
+        .writefn = mtk_dsu_mask_write,
+    },
+    {
+        .name = "CLUSTERPMOVSSET_EL1",
+        .crn = 15, .crm = 5, .opc0 = 3, .opc1 = 0, .opc2 = 3,
+        .access = PL1_RW,
+        .state = ARM_CP_STATE_AA64,
+        .type = ARM_CP_NO_RAW,
+        .readfn = mtk_dsu_mask_read,
+        .writefn = mtk_dsu_mask_write,
+    },
+    {
+        .name = "CLUSTERPMOVSCLR_EL1",
+        .crn = 15, .crm = 5, .opc0 = 3, .opc1 = 0, .opc2 = 4,
+        .access = PL1_RW,
+        .state = ARM_CP_STATE_AA64,
+        .type = ARM_CP_NO_RAW,
+        .readfn = mtk_dsu_mask_read,
+        .writefn = mtk_dsu_mask_write,
+    },
+    {
+        .name = "CLUSTERPMSELR_EL1",
+        .crn = 15, .crm = 5, .opc0 = 3, .opc1 = 0, .opc2 = 5,
+        .access = PL1_RW,
+        .state = ARM_CP_STATE_AA64,
+        .type = ARM_CP_NO_RAW,
+        .readfn = mtk_dsu_pmselr_read,
+        .writefn = mtk_dsu_pmselr_write,
+    },
+    {
+        .name = "CLUSTERPMINTENSET_EL1",
+        .crn = 15, .crm = 5, .opc0 = 3, .opc1 = 0, .opc2 = 6,
+        .access = PL1_RW,
+        .state = ARM_CP_STATE_AA64,
+        .type = ARM_CP_NO_RAW,
+        .readfn = mtk_dsu_mask_read,
+        .writefn = mtk_dsu_mask_write,
+    },
+    {
+        .name = "CLUSTERPMINTENCLR_EL1",
+        .crn = 15, .crm = 5, .opc0 = 3, .opc1 = 0, .opc2 = 7,
+        .access = PL1_RW,
+        .state = ARM_CP_STATE_AA64,
+        .type = ARM_CP_NO_RAW,
+        .readfn = mtk_dsu_mask_read,
+        .writefn = mtk_dsu_mask_write,
+    },
+    {
+        .name = "CLUSTERPMCCNTR_EL1",
+        .crn = 15, .crm = 6, .opc0 = 3, .opc1 = 0, .opc2 = 0,
+        .access = PL1_RW,
+        .state = ARM_CP_STATE_AA64,
+        .type = ARM_CP_NO_RAW,
+        .readfn = mtk_dsu_ccntr_read,
+        .writefn = mtk_dsu_ccntr_write,
+    },
+    {
+        .name = "CLUSTERPMXEVTYPER_EL1",
+        .crn = 15, .crm = 6, .opc0 = 3, .opc1 = 0, .opc2 = 1,
+        .access = PL1_RW,
+        .state = ARM_CP_STATE_AA64,
+        .type = ARM_CP_NO_RAW,
+        .readfn = mtk_dsu_evtyper_read,
+        .writefn = mtk_dsu_evtyper_write,
+    },
+    {
+        .name = "CLUSTERPMXEVCNTR_EL1",
+        .crn = 15, .crm = 6, .opc0 = 3, .opc1 = 0, .opc2 = 2,
+        .access = PL1_RW,
+        .state = ARM_CP_STATE_AA64,
+        .type = ARM_CP_NO_RAW,
+        .readfn = mtk_dsu_evcntr_read,
+        .writefn = mtk_dsu_evcntr_write,
+    },
+    {
+        .name = "CLUSTERPMMDCR_EL1",
+        .crn = 15, .crm = 6, .opc0 = 3, .opc1 = 0, .opc2 = 3,
+        .access = PL2_RW,
+        .state = ARM_CP_STATE_AA64,
+        .type = ARM_CP_NO_RAW,
+        .readfn = mtk_dsu_mdcr_read,
+        .writefn = mtk_dsu_mdcr_write,
+    },
+    {
+        .name = "CLUSTERPMCEID0_EL1",
+        .crn = 15, .crm = 6, .opc0 = 3, .opc1 = 0, .opc2 = 4,
+        .access = PL1_R,
+        .state = ARM_CP_STATE_AA64,
+        .type = ARM_CP_CONST,
+        .resetvalue = MTK_DSU_PMCEID0_VAL,
+    },
+    {
+        .name = "CLUSTERPMCEID1_EL1",
+        .crn = 15, .crm = 6, .opc0 = 3, .opc1 = 0, .opc2 = 5,
+        .access = PL1_R,
+        .state = ARM_CP_STATE_AA64,
+        .type = ARM_CP_CONST,
+        .resetvalue = MTK_DSU_PMCEID1_VAL,
+    },
+};
+
 static void mt6895_add_impdef_regs(ARMCPU *cpu)
 {
     /*
@@ -9952,6 +10257,9 @@ static void mt6895_add_impdef_regs(ARMCPU *cpu)
 
     define_one_arm_cp_reg(cpu, &mtk_impdef_c15_c3_6);
     define_one_arm_cp_reg(cpu, &mtk_impdef_c15_c2_0);
+    for (size_t i = 0; i < ARRAY_SIZE(mtk_dsu_pmu_regs); i++) {
+        define_one_arm_cp_reg(cpu, &mtk_dsu_pmu_regs[i]);
+    }
 }
 
 static void mt6895_create_cpus(Mt6895MachineState *s, Error **errp)
