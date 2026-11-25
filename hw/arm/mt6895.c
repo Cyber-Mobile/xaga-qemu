@@ -46,6 +46,7 @@
 #include "hw/char/mtk_uart.h"
 #include "hw/misc/mtk_scpsys.h"
 #include "hw/misc/mtk_tinysys_mbox.h"
+#include "hw/misc/mtk_adsp.h"
 #include "hw/timer/mtk_systimer.h"
 #include "hw/misc/mtk_ufshci.h"
 #include "hw/misc/mtk_ufs.h"
@@ -2894,6 +2895,8 @@ static const struct {
 
 typedef struct Mt6895AdspWin {
     uint64_t stage_va;
+    DeviceState *adsp;
+    int core_id;
 } Mt6895AdspWin;
 
 static Mt6895AdspWin mt6895_adsp_win_ctx[ARRAY_SIZE(mt6895_adsp_windows)];
@@ -2906,8 +2909,8 @@ static uint64_t mt6895_adsp_sram_read(void *opaque, hwaddr off, unsigned size)
     uint64_t v = 0;
     unsigned i;
 
-    if (cs && size <= sizeof(buf)) {
-        cpu_memory_rw_debug(cs, w->stage_va + off, buf, size, false);
+    if (cs && size <= sizeof(buf) &&
+        cpu_memory_rw_debug(cs, w->stage_va + off, buf, size, false) == 0) {
         {
             static int nrd;
 
@@ -2921,22 +2924,30 @@ static uint64_t mt6895_adsp_sram_read(void *opaque, hwaddr off, unsigned size)
                 }
             }
         }
+        for (i = 0; i < size; i++) {
+            v |= (uint64_t)buf[i] << (8 * i);
+        }
+        return v;
     }
-    for (i = 0; i < size; i++) {
-        v |= (uint64_t)buf[i] << (8 * i);
+    if (w->adsp && w->core_id >= 0 && off + size <= MTK_ADSP_DTCM_SIZE) {
+        return mtk_adsp_dtcm_read(w->adsp, w->core_id, off, size);
     }
-    return v;
+    return 0;
 }
 
 /*
- * Writes are accepted and dropped: this window is the read-only SRAM view the
- * ack/verify path inspects after the loader has fetched the staged image.  The
- * staging copy stays authoritative, so a write here must never disturb it.
+ * When LK's staging view is active, writes here are dropped so the staging copy
+ * stays authoritative. Under Linux, DTCM writes update mtk-adsp's backing
+ * store without touching LK's staging memory.
  */
 static void mt6895_adsp_sram_write(void *opaque, hwaddr off, uint64_t val,
                                    unsigned size)
 {
-    (void)opaque; (void)off; (void)val; (void)size;
+    Mt6895AdspWin *w = opaque;
+
+    if (w->adsp && w->core_id >= 0 && off + size <= MTK_ADSP_DTCM_SIZE) {
+        mtk_adsp_dtcm_write(w->adsp, w->core_id, off, val, size);
+    }
 }
 
 static const MemoryRegionOps mt6895_adsp_sram_ops = {
@@ -14641,6 +14652,10 @@ static const struct {
         if (!strcmp(blocks[i].name, "mt6895.dev-tinysys_mbox")) {
             continue;
         }
+        if (!strcmp(blocks[i].name, "mt6895.dev-adspsys") &&
+            blocks[i].base < 0x1e010000ULL) {
+            continue;
+        }
 
         if (!strcmp(blocks[i].name, "mt6895.dev-iommu") &&
             !getenv("MTK_NO_IOMMU")) {
@@ -17050,6 +17065,23 @@ static const uint8_t stub_cmd_def[0x80] = {
         memory_region_add_subregion_overlap(sysmem, 0, &spy_mr, -1000);
     }
     /*
+     * ADSP subsystem (cfg, mbox0..3, cfg2) for ATF start/stop handshakes and
+     * Linux ADSP/audio IPI exchanges. Created before the SRAM windows below so
+     * DTCM accesses fall back to mtk-adsp once LK's staging VAs unmap.
+     */
+    s->adsp = qdev_new(TYPE_MTK_ADSP);
+    sysbus_realize_and_unref(SYS_BUS_DEVICE(s->adsp), &error_fatal);
+    sysbus_mmio_map(SYS_BUS_DEVICE(s->adsp), 0, MT6895_ADSP_CFG_BASE);
+    sysbus_mmio_map(SYS_BUS_DEVICE(s->adsp), 1, MT6895_ADSP_MBOX0_BASE);
+    sysbus_mmio_map(SYS_BUS_DEVICE(s->adsp), 2, MT6895_ADSP_MBOX1_BASE);
+    sysbus_mmio_map(SYS_BUS_DEVICE(s->adsp), 3, MT6895_ADSP_MBOX2_BASE);
+    sysbus_mmio_map(SYS_BUS_DEVICE(s->adsp), 4, MT6895_ADSP_MBOX3_BASE);
+    sysbus_mmio_map(SYS_BUS_DEVICE(s->adsp), 5, MT6895_ADSP_CFG2_BASE);
+    for (int i = 0; i < 4; i++) {
+        sysbus_connect_irq(SYS_BUS_DEVICE(s->adsp), i,
+                           qdev_get_gpio_in(s->gic, MT6895_ADSP_MBOX_SPI0 + i));
+    }
+    /*
      * ADSP core0 SRAM view (0x1e050000).
      *
      * LK stages the audio_dsp_a sections into its own DRAM staging window
@@ -17069,6 +17101,8 @@ static const uint8_t stub_cmd_def[0x80] = {
         for (i = 0; i < ARRAY_SIZE(mt6895_adsp_windows); i++) {
             mt6895_adsp_win_ctx[i].stage_va =
                 mt6895_adsp_windows[i].stage_va;
+            mt6895_adsp_win_ctx[i].adsp = s->adsp;
+            mt6895_adsp_win_ctx[i].core_id = (i == 0 ? 0 : (i == 2 ? 1 : -1));
             memory_region_init_io(&adsp_sram_mr[i], OBJECT(s),
                                   &mt6895_adsp_sram_ops,
                                   &mt6895_adsp_win_ctx[i],

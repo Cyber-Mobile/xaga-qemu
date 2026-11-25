@@ -237,6 +237,18 @@ OBJECT_DECLARE_SIMPLE_TYPE(Mt6895MachineState, MT6895_MACHINE)
 #define MT6895_SCMI_SHMEM_TX_BASE   0x1c350000ULL
 #define MT6895_SCMI_SHMEM_RX_BASE   0x1c360000ULL
 
+/* ADSP subsystem CFG, CFG2, and 4-channel mailbox (dt: adspsys@1e000000) */
+#define MT6895_ADSP_CFG_BASE        0x1e000000ULL
+#define MT6895_ADSP_CFG_SIZE        0x00006000
+#define MT6895_ADSP_MBOX0_BASE      0x1e006000ULL
+#define MT6895_ADSP_MBOX1_BASE      0x1e007000ULL
+#define MT6895_ADSP_MBOX2_BASE      0x1e008000ULL
+#define MT6895_ADSP_MBOX3_BASE      0x1e009000ULL
+#define MT6895_ADSP_MBOX_SIZE       0x00001000
+#define MT6895_ADSP_CFG2_BASE       0x1e00b000ULL
+#define MT6895_ADSP_CFG2_SIZE       0x00005000
+#define MT6895_ADSP_MBOX_SPI0       644     /* GIC SPI 644..647 */
+
 #define MT6895_SCPSYS_BASE      0x1c001000ULL
 #define MT6895_SCPSYS_SIZE      0x00001000
 
@@ -1104,6 +1116,7 @@ struct Mt6895MachineState {
     DeviceState *scpsys;
     DeviceState *ufshci;
     DeviceState *tinysys_mbox;
+    DeviceState *adsp;
     MemoryRegion pcie_ecam_alias;
     DeviceState *uart[2];
 

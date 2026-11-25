@@ -11,6 +11,7 @@ config MT6895
     select MTK_SCPSYS
     select MTK_UFSHCI
     select MTK_TINYSYS_MBOX
+    select MTK_ADSP
     select MTK_AFE
     select MTK_I2C
     select MTK_DISP
