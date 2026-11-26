@@ -260,6 +260,9 @@ OBJECT_DECLARE_SIMPLE_TYPE(Mt6895MachineState, MT6895_MACHINE)
 #define MT6895_SRCLKEN_RC_BASE  0x1c00d000ULL
 #define MT6895_SRCLKEN_RC_SIZE  0x00000800
 
+#define MT6895_MD1_SEQ_BASE     0x1c803000ULL
+#define MT6895_MD1_SEQ_SIZE     0x00001000ULL
+
 /*
  * dxcc_sec@10210000 -- "mediatek,dxcc_sec". The security engine's HRE
  * (host ring engine). The preloader drives it through a six-word descriptor
@@ -1117,6 +1120,10 @@ struct Mt6895MachineState {
     DeviceState *tinysys_mbox;
     DeviceState *adsp;
     DeviceState *gpueb;
+    DeviceState *lvts;
+    DeviceState *cpufreq_hw;
+    DeviceState *dpmaif;
+    DeviceState *mali_gpu;
     MemoryRegion pcie_ecam_alias;
     DeviceState *uart[2];
 

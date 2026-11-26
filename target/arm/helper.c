@@ -7,6 +7,7 @@
  */
 
 #include "qemu/osdep.h"
+#include "qemu/mtk-env.h"
 #include "qemu/log.h"
 #include "trace.h"
 #include "cpu.h"
@@ -9828,27 +9829,19 @@ static void arm_cpu_do_interrupt_aarch64(CPUState *cs)
      * evidence this model can show, and turning the full trace on to get them
      * slows the guest enough to stall it before the interesting phase.
      */
-    {
-        static int mtk_init_log = -1;
+    if (MTK_ENV_CACHED("MTK_INIT_LOG") && arm_current_el(env) == 0 &&
+        (env->exception.syndrome >> 26) == 0x15 && env->xregs[8] == 64) {
+        char b[401] = { 0 };
+        uint64_t len = env->xregs[2];
 
-        if (mtk_init_log < 0) {
-            mtk_init_log = getenv("MTK_INIT_LOG") != NULL;
+        if (env->xregs[1] && len) {
+            cpu_memory_rw_debug(cs, env->xregs[1], (uint8_t *)b,
+                                MIN(len, 400), false);
         }
-        if (mtk_init_log && arm_current_el(env) == 0 &&
-            (env->exception.syndrome >> 26) == 0x15 && env->xregs[8] == 64) {
-            char b[401] = { 0 };
-            uint64_t len = env->xregs[2];
-
-            if (env->xregs[1] && len) {
-                cpu_memory_rw_debug(cs, env->xregs[1], (uint8_t *)b,
-                                    len > 400 ? 400 : len, false);
-            }
-            if (strstr(b, "init: ") || strstr(b, "vold") ||
-                strstr(b, "IBootControl") || strstr(b, "InitFatalReboot") ||
-                strstr(b, "Failed to mount") ||
-                strstr(b, "exited with status")) {
-                fprintf(stderr, "INITLOG %.400s\n", b);
-            }
+        if (strstr(b, "init: ") || strstr(b, "vold") ||
+            strstr(b, "IBootControl") || strstr(b, "InitFatalReboot") ||
+            strstr(b, "Failed to mount") || strstr(b, "exited with status")) {
+            fprintf(stderr, "INITLOG %.400s\n", b);
         }
     }
     {
@@ -9973,7 +9966,7 @@ static void arm_cpu_do_interrupt_aarch64(CPUState *cs)
                          * service lifecycle and the storage/reboot messages
                          * without spending the general syscall-trace budget.
                          */
-                        if (getenv("MTK_INIT_LOG") &&
+                        if (MTK_ENV_CACHED("MTK_INIT_LOG") &&
                             (strstr(buf, "init: ") || strstr(buf, "vold") ||
                              strstr(buf, "IBootControl") ||
                              strstr(buf, "InitFatalReboot") ||

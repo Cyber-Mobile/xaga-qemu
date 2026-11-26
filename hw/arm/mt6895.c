@@ -48,6 +48,10 @@
 #include "hw/misc/mtk_tinysys_mbox.h"
 #include "hw/misc/mtk_adsp.h"
 #include "hw/misc/mtk_gpueb.h"
+#include "hw/misc/mtk_lvts.h"
+#include "hw/misc/mtk_cpufreq_hw.h"
+#include "hw/misc/mtk_dpmaif.h"
+#include "hw/misc/mtk_mali_gpu.h"
 #include "hw/timer/mtk_systimer.h"
 #include "hw/misc/mtk_ufshci.h"
 #include "hw/misc/mtk_ufs.h"
@@ -3101,6 +3105,75 @@ static const MemoryRegionOps mt6895_pdn_ops = {
     .read = mt6895_pdn_read,
     .write = mt6895_pdn_write,
     .endianness = DEVICE_LITTLE_ENDIAN,
+};
+
+/*
+ * MD1 power sequencer (0x1c803000): driven by ccci_md_all.ko during modem
+ * power-on/off/revert (+0x204 control -> +0x310 sequencer status).
+ */
+#define MT6895_MD1_SEQ_CTRL_OFF     0x0204
+#define MT6895_MD1_SEQ_STA_OFF      0x0310
+#define MT6895_MD1_SEQ_ENABLED_STA  0x04040040u
+#define MT6895_MD1_SEQ_DISABLED_STA 0x01010001u
+
+static uint32_t mt6895_md1_seq_regs[MT6895_MD1_SEQ_SIZE / 4];
+
+static void mt6895_md1_seq_reset(void)
+{
+    memset(mt6895_md1_seq_regs, 0, sizeof(mt6895_md1_seq_regs));
+    mt6895_md1_seq_regs[MT6895_MD1_SEQ_STA_OFF / 4] =
+        MT6895_MD1_SEQ_DISABLED_STA;
+}
+
+static uint64_t mt6895_md1_seq_read(void *opaque, hwaddr offset, unsigned size)
+{
+    uint64_t val = 0;
+    unsigned i;
+
+    (void)opaque;
+    for (i = 0; i < size; i++) {
+        hwaddr o = offset + i;
+        if (o < MT6895_MD1_SEQ_SIZE) {
+            uint32_t w = mt6895_md1_seq_regs[o >> 2];
+            val |= (uint64_t)((w >> (8 * (o & 3))) & 0xffu) << (8 * i);
+        }
+    }
+    return val;
+}
+
+static void mt6895_md1_seq_write(void *opaque, hwaddr offset, uint64_t value,
+                                 unsigned size)
+{
+    unsigned i;
+    bool ctrl_touched = false;
+
+    (void)opaque;
+    for (i = 0; i < size; i++) {
+        hwaddr o = offset + i;
+        if (o < MT6895_MD1_SEQ_SIZE) {
+            uint32_t *reg = &mt6895_md1_seq_regs[o >> 2];
+            unsigned shift = 8 * (o & 3);
+            uint32_t mask = 0xffu << shift;
+            *reg = (*reg & ~mask) |
+                   ((((uint32_t)value >> (8 * i)) & 0xffu) << shift);
+            if ((o & ~3ULL) == MT6895_MD1_SEQ_CTRL_OFF) {
+                ctrl_touched = true;
+            }
+        }
+    }
+    if (ctrl_touched) {
+        mt6895_md1_seq_regs[MT6895_MD1_SEQ_STA_OFF / 4] =
+            (mt6895_md1_seq_regs[MT6895_MD1_SEQ_CTRL_OFF / 4] & 1u) ?
+            MT6895_MD1_SEQ_ENABLED_STA : MT6895_MD1_SEQ_DISABLED_STA;
+    }
+}
+
+static const MemoryRegionOps mt6895_md1_seq_ops = {
+    .read = mt6895_md1_seq_read,
+    .write = mt6895_md1_seq_write,
+    .endianness = DEVICE_LITTLE_ENDIAN,
+    .valid = { .min_access_size = 1, .max_access_size = 4 },
+    .impl = { .min_access_size = 1, .max_access_size = 4 },
 };
 
 ;
@@ -9613,6 +9686,7 @@ static void mt6895_machine_reset(MachineState *machine, ResetType type)
     memory_region_set_enabled(&s->gz_ddr_remap, false);
     mt6895_cpc_state_reset();
     mt6895_dsu_pmu_reset();
+    mt6895_md1_seq_reset();
     if (s->direct_boot) {
         return;
     }
@@ -14214,10 +14288,6 @@ static const struct {
         { "mt6895.dev-sleep_reg_md", 0x1000f000ULL, 0x1000 },
         { "mt6895.dev-topmisc", 0x10011000ULL, 0x1000 },
         { "mt6895.dev-mbist_ao", 0x10013000ULL, 0x1000 },
-        { "mt6895.dev-dpmaif", 0x10014000ULL, 0x1000 },
-        { "mt6895.dev-apcldmaout_ao", 0x10014400ULL, 0x400 },
-        { "mt6895.dev-apcldmamisc_ao", 0x10014800ULL, 0x400 },
-        { "mt6895.dev-apcldmamisc_ao", 0x10014c00ULL, 0x400 },
         { "mt6895.dev-devapc_mpu_ao", 0x10015000ULL, 0x1000 },
         { "mt6895.dev-aes_top0", 0x10016000ULL, 0x1000 },
         { "mt6895.dev-modem_temp_share", 0x10018000ULL, 0x1000 },
@@ -14276,7 +14346,6 @@ static const struct {
         { "mt6895.dev-bpi_bsi_slv2", 0x10225000ULL, 0x1000 },
         { "mt6895.dev-emimpu", 0x10226000ULL, 0x1000 },
         { "mt6895.dev-dpmaif", 0x1022c000ULL, 0x1000 },
-        { "mt6895.dev-dpmaif", 0x1022d000ULL, 0x1000 },
         { "mt6895.dev-dpmaif", 0x1022e000ULL, 0x1000 },
         { "mt6895.dev-infra_dpmaif", 0x1022f000ULL, 0x1000 },
         /* dramc and emichn 4-channel holes from mt6895_dramc_wins */
@@ -14312,8 +14381,6 @@ static const struct {
         { "mt6895.dev-sys_cirq", 0x10312000ULL, 0x1000 },
         { "mt6895.dev-sys_cirq", 0x10313000ULL, 0x1000 },
         { "mt6895.dev-sys_cirq", 0x10314000ULL, 0x1000 },
-        { "mt6895.dev-peri_ptp_therm", 0x10315000ULL, 0x1000 },
-        { "mt6895.dev-peri_ptp_therm", 0x10316000ULL, 0x1000 },
         { "mt6895.dev-sys_cirq", 0x10350000ULL, 0x1000 },
         { "mt6895.dev-miu",      0x10351000ULL, 0x1000 },
         { "mt6895.dev-sys_cirq", 0x10352000ULL, 0x1000 },
@@ -14349,7 +14416,6 @@ static const struct {
         { "mt6895.dev-consys", 0x11ea0000ULL, 0xa04 },
         { "mt6895.dev-efuse", 0x11f10000ULL, 0x10000 },
         { "mt6895.dev-mipi_tx_config", 0x11f70000ULL, 0x1000 },
-        { "mt6895.dev-mali", 0x13000000ULL, 0x1000 },
         { "mt6895.dev-g3d_brisket", 0x13bfee00ULL, 0x200 },
         { "mt6895.dev-g3d_mpu", 0x13bff000ULL, 0x1000 },
         { "mt6895.dev-g3d_gpueb", 0x13c40000ULL, 0x20000 },
@@ -14651,9 +14717,6 @@ static const struct {
         { "mt6895.dev-scp", 0x1c7ff000ULL, 0x100 },
         { "mt6895.dev-scp", 0x1c7ff100ULL, 0x1000 },
         { "mt6895.dev-scp", 0x1c7ff10cULL, 0x1000 },
-        { "mt6895.dev-gps", 0x1c805028ULL, 0x1000 },
-        { "mt6895.dev-gps", 0x1c805030ULL, 0x1000 },
-        { "mt6895.dev-gps", 0x1c8050ccULL, 0x28 },
         { "mt6895.dev-apusys_reviser", 0x1d900000ULL, 0x1000 },
         { "mt6895.dev-adspsys", 0x1e000000ULL, 0x6000 },
         { "mt6895.dev-adspsys", 0x1e006000ULL, 0x100 },
@@ -17338,6 +17401,52 @@ static const uint8_t stub_cmd_def[0x80] = {
         sysbus_mmio_get_region(SYS_BUS_DEVICE(s->gpueb), 1), 4);
     sysbus_connect_irq(SYS_BUS_DEVICE(s->gpueb), 0,
                        qdev_get_gpio_in(s->gic, MTK_GPUEB_SPI));
+    s->lvts = qdev_new(TYPE_MTK_LVTS);
+    sysbus_realize_and_unref(SYS_BUS_DEVICE(s->lvts), &error_fatal);
+    memory_region_add_subregion_overlap(
+        sysmem, MTK_LVTS_D0_BASE,
+        sysbus_mmio_get_region(SYS_BUS_DEVICE(s->lvts), 0), 4);
+    memory_region_add_subregion_overlap(
+        sysmem, MTK_LVTS_D1_BASE,
+        sysbus_mmio_get_region(SYS_BUS_DEVICE(s->lvts), 1), 4);
+    memory_region_add_subregion_overlap(
+        sysmem, MTK_TIA_BASE,
+        sysbus_mmio_get_region(SYS_BUS_DEVICE(s->lvts), 2), 4);
+    s->cpufreq_hw = qdev_new(TYPE_MTK_CPUFREQ_HW);
+    sysbus_realize_and_unref(SYS_BUS_DEVICE(s->cpufreq_hw), &error_fatal);
+    memory_region_add_subregion_overlap(
+        sysmem, MTK_CPUFREQ_HW_BASE,
+        sysbus_mmio_get_region(SYS_BUS_DEVICE(s->cpufreq_hw), 0), 1000);
+    memory_region_add_subregion_overlap(
+        sysmem, MTK_CPUFREQ_EAS_LIMIT_BASE,
+        sysbus_mmio_get_region(SYS_BUS_DEVICE(s->cpufreq_hw), 1), 1000);
+    s->dpmaif = qdev_new(TYPE_MTK_DPMAIF);
+    sysbus_realize_and_unref(SYS_BUS_DEVICE(s->dpmaif), &error_fatal);
+    memory_region_add_subregion_overlap(
+        sysmem, MTK_DPMAIF_AO_BASE,
+        sysbus_mmio_get_region(SYS_BUS_DEVICE(s->dpmaif), 0), 4);
+    memory_region_add_subregion_overlap(
+        sysmem, MTK_DPMAIF_PD_BASE,
+        sysbus_mmio_get_region(SYS_BUS_DEVICE(s->dpmaif), 1), 4);
+    s->mali_gpu = qdev_new(TYPE_MTK_MALI_GPU);
+    sysbus_realize_and_unref(SYS_BUS_DEVICE(s->mali_gpu), &error_fatal);
+    memory_region_add_subregion_overlap(
+        sysmem, MTK_MALI_GPU_BASE,
+        sysbus_mmio_get_region(SYS_BUS_DEVICE(s->mali_gpu), 0), 4);
+    sysbus_connect_irq(SYS_BUS_DEVICE(s->mali_gpu), 0,
+                       qdev_get_gpio_in(s->gic, MTK_MALI_GPU_SPI));
+    sysbus_connect_irq(SYS_BUS_DEVICE(s->mali_gpu), 1,
+                       qdev_get_gpio_in(s->gic, MTK_MALI_MMU_SPI));
+    sysbus_connect_irq(SYS_BUS_DEVICE(s->mali_gpu), 2,
+                       qdev_get_gpio_in(s->gic, MTK_MALI_JOB_SPI));
+    {
+        static MemoryRegion md1_seq_mr;
+
+        memory_region_init_io(&md1_seq_mr, OBJECT(s), &mt6895_md1_seq_ops, s,
+                              "mt6895.md1_seq", MT6895_MD1_SEQ_SIZE);
+        memory_region_add_subregion_overlap(sysmem, MT6895_MD1_SEQ_BASE,
+                                            &md1_seq_mr, 4);
+    }
     {
         static MemoryRegion spm_req_mr;
 

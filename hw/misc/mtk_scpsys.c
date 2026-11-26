@@ -111,6 +111,8 @@ OBJECT_DECLARE_SIMPLE_TYPE(MtkScpsysState, MTK_SCPSYS)
 #define SPM_PDN_REQ_OFFSET      0x0c34
 #define SPM_PDN_ACK_OFFSET      0x0c3c
 #define SPM_PDN_MASK            0x00028000      /* BIT(15) | BIT(17) */
+#define SPM_MD_EXT_BUCK_ISO_OFF 0x0404
+#define SPM_MD_EXT_BUCK_ISO_ACK BIT(4)
 
 /*
  * The SPM driver (mtk-vmm-spm.ko) keeps its own semaphores at 0x69c..0x6b8
@@ -392,6 +394,14 @@ static uint64_t mtk_scpsys_read(void *opaque, hwaddr offset, unsigned size)
             if ((o & ~3u) == SPM_PDN_ACK_OFFSET) {
                 /* Acknowledge the zone mask the flow actually requested. */
                 reg |= s->regs[SPM_PDN_REQ_OFFSET / 4] & SPM_PDN_MASK;
+            }
+            if ((o & ~3u) == SPM_MD_EXT_BUCK_ISO_OFF) {
+                /* Bit 4 acknowledges the MD external buck isolation bit 0. */
+                if (reg & 1u) {
+                    reg |= SPM_MD_EXT_BUCK_ISO_ACK;
+                } else {
+                    reg &= ~SPM_MD_EXT_BUCK_ISO_ACK;
+                }
             }
             if (mtk_scpsys_trace_enabled()) {
                 static uint64_t counts[0x1000 / 4];

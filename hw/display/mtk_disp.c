@@ -194,29 +194,6 @@ static uint32_t mtk_disp_px(const uint8_t *p, unsigned fmt, bool bswap,
         g = p[1];
         r = p[bswap ? 0 : 2];
         break;
-    /*
-     * CLRFMT 2 / 3 are byte-order-agnostic formats: the panel data is RGB in
-     * bytes 0..2 (CLRFMT 2) or 1..3 (CLRFMT 3), and the fourth byte is X/A.
-     * The vendor driver selects the byte order with OVL_CON_BYTE_SWAP
-     * (bit 24, ovl_fmt_convert()):
-     *   CLRFMT 2 no swap : DRM XRGB8888/ARGB8888, memory B,G,R,X
-     *   CLRFMT 2 byte swap: DRM XBGR8888/ABGR8888, memory R,G,B,X
-     *   CLRFMT 3 no swap : DRM RGBX8888/RGBA8888, memory X,B,G,R
-     *   CLRFMT 3 byte swap: DRM BGRX8888/BGRA8888, memory X,R,G,B
-     * Extracting from the little-endian word instead of the bytes made the
-     * alpha byte (0xff) land in the blue channel on recovery's XBGR buffer.
-     */
-    case 2:
-        if (!bswap) {          /* memory B,G,R,X */
-            b = p[0];
-            g = p[1];
-            r = p[2];
-        } else {               /* memory R,G,B,X */
-            r = p[0];
-            g = p[1];
-            b = p[2];
-        }
-        break;
     case 3:
         if (!bswap) {          /* memory X,B,G,R */
             b = p[1];
@@ -256,6 +233,7 @@ static void mtk_disp_blit(MtkDispState *s, uint64_t addr, uint32_t pitch,
                           bool iommu)
 {
     unsigned bpp = mtk_disp_bpp(fmt);
+    bool swap_rb = bswap != rgbswap;
     uint32_t y, x;
 
     if (x0 >= s->width || y0 >= s->height) {
@@ -264,13 +242,27 @@ static void mtk_disp_blit(MtkDispState *s, uint64_t addr, uint32_t pitch,
     w = MIN(w, s->width - x0);
     h = MIN(h, s->height - y0);
     for (y = 0; y < h; y++) {
+        uint32_t *dst = s->canvas + (y0 + y) * s->width + x0;
+
         if (!mtk_disp_read(s, addr + (uint64_t)y * pitch, s->line,
                            (size_t)w * bpp, iommu)) {
             memset(s->line, 0, (size_t)w * bpp);
         }
-        for (x = 0; x < w; x++) {
-            s->canvas[(y0 + y) * s->width + x0 + x] =
-                mtk_disp_px(s->line + x * bpp, fmt, bswap, rgbswap);
+        if (fmt == 2) {
+            /* BGRX or RGBX, with the unused high byte excluded. */
+            if (swap_rb) {
+                for (x = 0; x < w; x++) {
+                    dst[x] = bswap32(ldl_le_p(s->line + x * 4)) >> 8;
+                }
+            } else {
+                for (x = 0; x < w; x++) {
+                    dst[x] = ldl_le_p(s->line + x * 4) & 0x00ffffff;
+                }
+            }
+        } else {
+            for (x = 0; x < w; x++) {
+                dst[x] = mtk_disp_px(s->line + x * bpp, fmt, bswap, rgbswap);
+            }
         }
     }
 }
