@@ -25,17 +25,21 @@ vendor firmware stack. This document is a map of the model.
 
 | Model | File | Notes |
 |---|---|---|
-| Main SoC glue, windows, IRQ wiring | `hw/arm/mt6895.c` | BootROM stub, boot-chain integration, DXCC-SEC (AES/SHA), MASP/HACC, secure alias, topckgen |
+| Main SoC glue, windows, IRQ wiring | `hw/arm/mt6895.c` | BootROM stub, boot-chain integration, DXCC-SEC (AES/SHA), MASP/HACC, secure alias, topckgen, DSU PMU system registers, DebugTop/CONSYS MMIO windows |
+| GICv3 interrupt controller | `hw/intc/arm_gicv3*.c` | ARM GICv3 per-group HPPI tracking (`hppi_grp[3]`) so disabled G1NS interrupts do not mask Secure PPIs |
 | Syscon / efuse / clock-controller windows | `hw/misc/mtk_syscon.c` | register files, OTP word map, gate/clock acknowledgements |
 | SPMI PMIC (MT6363/MT6368/MT6319) | `hw/misc/mtk_spmi_pmif.c` | PMIF, regulators, VSEL monitor aliases, OTP windows |
 | Power domains | `hw/misc/mtk_scpsys.c` | SPM/SCPSYS power on/off state, CPC sequencing |
+| Tinysys SCMI v2 mailbox | `hw/misc/mtk_tinysys_mbox.c` | DEN0056 Base (`0x10`) + vendor (`0x80`) protocols with in-place A2P shared-memory replies |
+| ADSP subsystem & 4-channel mailbox | `hw/misc/mtk_adsp.c` | CFG/CFG2 control windows, MBOX0..3 (GIC SPI `644..647`), dual-core DTCM |
+| GPUEB mailbox & gpufreq IPI | `hw/misc/mtk_gpueb.c` | RV33 boot handshake, 160-slot raw-payload `mbox0` SRAM, GIC SPI `516`, `IPI_ID_GPUFREQ` responder |
 | GCE / CMDQ | `hw/misc/mtk_gce.c` | instruction engine, address translation, JUMPC/LOGIC semantics |
-| IOMMU | `hw/misc/mtk_iommu.c` | TLB invalidation completion, fault status |
+| IOMMU | `hw/misc/mtk_iommu.c` | 34-bit ARMv7 short-descriptor + `MTK_EXT` page-table translation, TLB invalidation completion, fault status |
 | UFS | `hw/misc/mtk_ufs{c,lu,hci}.c` | UIC/UTP/UCD SCSI translation, 4 KiB LUs, RPMB |
 | Display | `hw/display/mtk_disp.c` | OVL layers, dual-pipe split/swap, DSI cmd queue, frame dumps |
 | Interrupt router | `hw/misc/mtk_eint.c` | EINT mux from the pinctrl cells the DTB describes |
 | SPI (touch bus) | `hw/ssi/mtk_spi.c`, `hw/ssi/nvt36672c.c` | MTK SPI controller + Novatek NVT36672C client |
-| I2C devices | `hw/i2c/mtk_i2c.c`, `hw/i2c/bq28z610.c` | controller + fuel gauge |
+| I2C devices | `hw/i2c/mtk_i2c.c`, `hw/i2c/bq28z610.c`, `hw/i2c/mt6375.c` | I²C controller + APDMA, fuel gauge, MT6375 sub-PMIC / TCPC / BC1.2 |
 | USB host | `hw/usb/hcd-xhci.c` changes | sysbus xHCI wiring + slot count fix |
 | USB device | `hw/misc/mtk_usbdev.c` + `mtk_usb_glue.c` | mtu3-style UDC, QMU, TCP chardev bridge |
 | Keypad / RTC | `hw/misc/mtk_kpd.c`, RTC windows | KPD, RTC registers |
@@ -44,10 +48,10 @@ vendor firmware stack. This document is a map of the model.
 
 ## Injection policy
 
-The model never patches guest images and never invents guest-visible state to pass a check. Where the
-hardware is not modelled yet, the boot stops; the remaining named bypasses are default-off, print when
-they fire, and are tracked in the injection-debt register (`MTK_GZ_SKIP`, the EL3 plant and the LK
-boot-arg plant are the three still open).
+The model never patches guest images and never invents guest-visible state to pass a check. The
+default normal-boot path runs natively with zero `MTK_*` overrides; where hardware behaviour is
+not yet complete, missing peripherals are modelled as hardware rather than bypassed in the boot
+chain.
 
 ## USB device-mode fastboot bridge
 
