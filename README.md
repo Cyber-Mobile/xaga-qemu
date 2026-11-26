@@ -23,11 +23,14 @@ as clearly named, default-off diagnostics.
 | BROM stub, preloader, BL2_EXT, ATF (TF-A v2.4) — real images, no image patching | ✅ native stage tracking (`MTK_SIP_KERNEL_BOOT` clears `0x4825abd8`), BL33 and Linux kernel `0xc2000xxx` MTK SiP SMCs dispatch cleanly through BL31 |
 | TEE (Soter450 / ISEE450, plaintext BL32) + GICv3 per-group HPPI (`arm_gicv3`) | ✅ calibrates timer, verifies TAs, backs KeyMint / `keystore2`; `hppi_grp[3]` prevents disabled `G1NS` interrupts from starving Secure PPI 29 |
 | GZ (GenieZone hypervisor, EL2) + EMI MPU / MIU (`mtk_syscon`) | ✅ `gz_a`/`gz_b` decrypted in-guest via DXCC AES; MIU end-flag readback and AID selector commit produce `30` regions and `17` hypervisor unmaps matching hardware (keeping `scp_share` mapped) |
-| LK -> Linux 5.10 -> Android userspace (`SystemServer`) | ✅ 7 dynamic partitions mounted, `second_stage_init`, `172` kernel modules (`vendor.all.modules.ready=1`), `keystore2` / `keymint`, `vold` `make_f2fs` `/data` mount, `zygote`, `SurfaceFlinger` / `hwcomposer`, and `SystemServer` (`AMS` / `PMS` / `WMS` / `IMS`) with 0 kernel panics / 0 WDT resets |
+| LK -> Linux 5.10 -> Android userspace | ✅ Seven dynamic partitions, `/data` mount, KeyMint, zygote, SurfaceFlinger and rendered Android boot animation verified in bring-up runs. SetupWizard and Launcher validation are pending. |
 | ARM DSU PMU cluster system registers (`mt6895`) | ✅ `S3_0_C15_C5_0..7` and `S3_0_C15_C6_0..5` allow `arm_dsu_pmu.ko` online init with zero `do_undefinstr` panics |
 | DebugTop DEM/tracer & CONSYS WF/BGF windows (`mt6895`) | ✅ 14 mapped MMIO regions (`0x0d01a000..0x0d100000`, `0x184*`/`0x185*`/`0x188*`/`0x189*`) let connectivity modules (`conninfra`/`bt_drv`/`fmradio_drv`/`gps_drv`/`wlan_drv`) load cleanly without external aborts |
 | GPUEB mailbox & gpufreq IPI (`mtk_gpueb`) | ✅ dedicated SysBus device with RV33 boot handshake, 160-slot raw-payload `mbox0` SRAM, GIC SPI `516`, and `IPI_ID_GPUFREQ` OPP/shared-status replies (`gpufreq_wrapper`, `mtk_gpufreq_mt6895`, `/proc/ged`, `gralloc4` operational) |
 | 8-core SMP bring-up (`MPIDR.MT`, `psci-conduit=disabled`, CPC power-state ordering) | ✅ `8 CPUs` online and activated on the default normal-boot path |
+| CPU frequency and thermal control (`mtk_cpufreq_hw`, `mtk_lvts`) | 🧪 Three CPU frequency domains with descending OPP tables, separate EAS thermal-limit CSRAM, and LVTS/TIA nominal sensor readings. ThermalHAL started and stayed running in the latest timed Windows run. |
+| Modem power and AP-side DPMAIF (`mt6895`, `mtk_scpsys`, `mtk_dpmaif`) | 🧪 MD1 power-sequencer and isolation status, plus DPMAIF AO/PD register and interrupt-mask semantics. The modem boot-timeout dump can read the paired registers. MD1/CCIF handshake is pending. |
+| Mali-G610 control registers (`mtk_mali_gpu`) | 🧪 GPU identification, feature registers, reset, power-ready status and interrupt masking. Vendor CSF firmware bring-up, command execution and host GPU rendering are pending. |
 | Tinysys SCMI v2 mailbox (`mtk_tinysys_mbox`) | ✅ DEN0056 Base (`0x10`) + vendor (`0x80`) protocols with in-place A2P replies (`SSPM platform service is ready`, `qos_ipi_init ready!`, `sspm_v3` clean init) |
 | ADSP subsystem (`mtk_adsp`) + AP<->ADSP 4-channel mailbox | ✅ CFG/CFG2 control windows, MBOX0..3 (GIC SPI `644..647`), per-core DTCM; dual-core `adsp_system_bootup done`, suspend/resume, MPU sharedram, audio probes (`mt6895-mt6368`, `mt6895-audio`, `mt6368-sound`, `snd_scp_ultra`, `mtk_dsp_probe`) |
 | Recovery mode (`MTK_BOOT_MODE=2`) + Xiaomi recovery UI (full screen, no blit artifacts) | ✅ |
@@ -45,9 +48,10 @@ as clearly named, default-off diagnostics.
 | Secure address alias (`0x800000000 + PA`) for TEE/GZ, topckgen ULPOSC control, KPD, RTC | ✅ |
 | Audio (`mtk_afe`) + DSP/codec probe path | 🧪 controller/DSP probes succeed; end-to-end audio playback still to be validated |
 
-## Where the zero-injection boot stands
+## Normal boot progress
 
-With **zero `MTK_*` overrides**, the unmodified firmware ladder runs on `-smp 8`:
+The native firmware ladder runs on `-smp 8`. The Android rendering results below come from
+an isolated LineageOS user-data LUN with ANGLE and SwiftShader configured in userspace.
 
 ```text
 BROM -> preloader -> BL2_EXT -> ATF -> TEE (Soter450) -> GZ (EL2) -> LK -> Linux 5.10.269
@@ -60,7 +64,8 @@ BROM -> preloader -> BL2_EXT -> ATF -> TEE (Soter450) -> GZ (EL2) -> LK -> Linux
 - **Boot, hypervisor, and SMP**: ATF hands off natively via `MTK_SIP_KERNEL_BOOT`, GenieZone unmaps the exact 17 protected regions (keeping `scp_share` at `0x8f000000` mapped), all 8 cores come online, and ARM DSU PMU system registers (`S3_0_C15_C5_0..7`, `S3_0_C15_C6_0..5`) eliminate `arm_dsu_pmu.ko` `do_undefinstr` panics.
 - **TEE & storage encryption**: GICv3 per-group HPPI unblocks Soter450 TEE timer calibration (`PPI 29`), allowing `keystore2` / `vendor.keymint-beanpod` to generate keys and `vold` to format `/dev/block/by-name/userdata` with `make_f2fs`.
 - **Subsystems & modules**: Tinysys SCMI v2 brings up `SSPM`, `mtk_syscon` GPIO MWR passes `scp.ko` mux checks, `mtk-adsp` + native ATF Kernel SiP dispatch bring both ADSP cores and audio probes up cleanly, `DebugTop`/`CONSYS` MMIO windows let connectivity drivers (`conninfra`, `bt_drv`, `fmradio_drv`, `gps_drv`, `wlan_drv`) load without external aborts, and `mtk-gpueb` satisfies `gpufreq_wrapper` / `mtk_gpufreq_mt6895` / `/proc/ged` / `gralloc4` initialization — reaching `vendor.all.modules.ready=1` across all 172 modules with zero panics and zero watchdog resets.
-- **Display & current frontier**: Under isolated software Vulkan/ANGLE rendering on userspace `vendor_a`/`odm_a`, `SurfaceFlinger` -> `hwcomposer` -> `mediatek-drm` / `CMDQ` / `M4U IOMMU` (34-bit IOVA) -> dual-pipe `OVL` scans out real Android `BootAnimation` frames while `SystemServer` completes `ActivityManagerService`, `PackageManagerService`, `WindowManagerService`, and `InputManagerService` startup. Next milestones are full SetupWizard / Launcher desktop completion, fixing remaining hardware-backed HAL issues (such as thermal/backlight/sensors), and implementing virtual Mali-G610 / host GPU acceleration plus MTTCG multi-core performance optimization.
+- **Display** uses software Vulkan through ANGLE and SwiftShader. SurfaceFlinger and hwcomposer submit Android boot animation frames through `mediatek-drm`, CMDQ, the 34-bit M4U IOMMU and dual-pipe OVL. The scanout converts BGRX and RGBX pixels row by row.
+- **Parallel TCG** brought up eight guest CPUs on eight host threads. With the same Windows binary and disk snapshot, zygote started at 371.2 wall-clock seconds with MTTCG, down from 1166.4 seconds with the instruction-counted run. In a later build with model fixes and MTTCG, the first nonblack Android animation frame appeared at 620.6 seconds. That run recorded zero watchdog resets over its 926.2-second window and ended with `sys.boot_completed` still pending.
 
 ## Roadmap
 
@@ -81,8 +86,10 @@ BROM -> preloader -> BL2_EXT -> ATF -> TEE (Soter450) -> GZ (EL2) -> LK -> Linux
 - [x] ARM DSU PMU cluster system registers & DebugTop/CONSYS connectivity MMIO windows (zero-panic 172-module boot)
 - [x] `mtk-gpueb` mailbox & `IPI_ID_GPUFREQ` responder (`/proc/ged` & `gralloc4`)
 - [x] Android second-screen bring-up (`SurfaceFlinger` + `BootAnimation` via `mediatek-drm` / `CMDQ` / `M4U IOMMU` / dual-pipe `OVL`)
+- [x] Optional eight-thread MTTCG normal boot through Android boot animation
+- [ ] MD1/CCIF initial handshake and modem execution
 - [ ] Android SetupWizard / Launcher desktop completion and remaining HAL hardware fixes (e.g. thermal/backlight/sensors)
-- [ ] Virtual Mali-G610 / host GPU acceleration & MTTCG multi-core performance
+- [ ] Mali-G610 CSF firmware interface, queue execution and host Vulkan/OpenGL rendering
 - [ ] `700 MHz` ULPOSC calibration meter
 - [ ] `sideload-host` end to end (unlock chain / `minadbd` taking FunctionFS)
 - [ ] Full LineageOS/Android boot without any diagnostic env
@@ -132,6 +139,12 @@ MTK_BOOT_MODE=2 MTK_TOUCH=1 MTK_USBDEV=1 \
 The kernel's console is muted once it takes over; the model can periodically scan the kernel log ring for
 markers with `MTK_KMEM_SCAN` / `MTK_KMEM_MS` (see below).
 
+Use `MTK_LU2_SNAP=1 scripts/run.sh --mttcg` to run eight vCPU host threads with the
+real-time virtual clock and store guest disk writes in a scratch overlay. The default invocation
+uses instruction-counted time for deterministic bring-up. Compare the same boot milestone on
+the same image. Leave `MTK_KMEM_SCAN` and `MTK_KMEM_MS` unset for a timing run, as full-RAM
+scans can stall guest execution and QMP responses.
+
 ### Environment switches
 
 Platform & test configuration:
@@ -176,14 +189,16 @@ ninja -C build tests/qtest/arm-gicv3-grp-test \
       tests/qtest/mtk-usbdev-test tests/qtest/mtk-pinctrl-test \
       tests/qtest/mtk-scmi-test tests/qtest/mtk-adsp-test \
       tests/qtest/mtk-dsu-pmu-test tests/qtest/mtk-dbg-consys-test \
-      tests/qtest/mtk-gpueb-test
-QTEST_QEMU_BINARY=build/qemu-system-aarch64 build/tests/qtest/mtk-gpueb-test
+      tests/qtest/mtk-gpueb-test tests/qtest/mtk-thermal-mdseq-test \
+      tests/qtest/mtk-cpufreq-dpmaif-mali-test
+QTEST_QEMU_BINARY=build/qemu-system-aarch64 build/tests/qtest/mtk-thermal-mdseq-test
+QTEST_QEMU_BINARY=build/qemu-system-aarch64 build/tests/qtest/mtk-cpufreq-dpmaif-mali-test
 ```
 
-Current suites (23 tests across 12 binaries): GICv3 per-group HPPI (1), MIU range & AID record commit (4),
-PL SRAM neighbour isolation (1), MPIDR board profile (1), MT6375/TCPCI/I²C-APDMA/EINT (2), USB QMU
-stop/restart (1), GPIO bank semantics (4), Tinysys SCMI v2 protocol & reset (3), ADSP bootup/IPI/suspend (3),
-DSU PMU system registers (1), DebugTop/CONSYS MMIO windows (1), and GPUEB mailbox/gpufreq IPI (1).
+The 14 suites contain 29 cases. The two new suites cover LVTS, TIA ADC and MD1 power and isolation
+status (three cases), and CPUfreq/EAS CSRAM, DPMAIF and Mali control registers (three cases). The earlier
+suites cover GICv3, MIU, PL SRAM, MPIDR, MT6375, USB QMU, pinctrl, SCMI, ADSP, DSU PMU,
+DebugTop/CONSYS and GPUEB.
 
 ## Host-side fastboot / adb client
 
